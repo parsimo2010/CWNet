@@ -26,7 +26,7 @@ Input: (batch, 1, T)          ← scalar SNR ratio, ~200 fps (5 ms hop)
 │
 ├─ Linear projection + LayerNorm: 64 → 128
 ├─ GRU: 2 layers × 128 hidden, unidirectional
-└─ Linear → log_softmax: 128 → 64 classes
+└─ Linear → log_softmax: 128 → 52 classes
 
 ~260 K parameters  |  INT8 quantized ≈ 75 KB weights
 ```
@@ -74,8 +74,13 @@ to cover the wide range of real-world operator timing styles.
 
 ## Vocabulary
 
-64-class CTC vocabulary: blank (0), space (1), A–Z, 0–9, punctuation,
-and prosigns AR, SK, BT, KN, SOS, DN, AS, CT.
+52-class CTC vocabulary: blank (0), space (1), A–Z, 0–9,
+punctuation `.,?/(&=+` (5-element sequences, common on air),
+and prosigns AR, SK, BT, KN, AS, CT.
+
+Removed from MorseNeural's original 64-class vocab: `'!):;-_"$@` (6–7 element
+sequences, never/rarely heard in QSOs), `SOS` (9 elements; decodes as S-O-S
+with normal letter spacing), and `DN` (non-standard; code identical to `/`).
 
 ## Installation
 
@@ -96,7 +101,7 @@ python train.py --scenario clean
 
 # Stage 2: resume from clean, full noise envelope
 python train.py --scenario full \
-    --checkpoint_file checkpoints/best_model.pt \
+    --checkpoint_file checkpoints/best_model_clean.pt \
     --additional_epochs 500
 
 # Quick pipeline test (~5 epochs)

@@ -1,5 +1,5 @@
 """
-vocab.py — CTC character vocabulary for MorseNeural.
+vocab.py — CTC character vocabulary for CWNet.
 
 Index 0 is always reserved for the CTC blank token.
 The vocabulary covers:
@@ -7,8 +7,14 @@ The vocabulary covers:
   • space  (index 1)
   • A–Z    (indices 2–27)
   • 0–9    (indices 28–37)
-  • punctuation: .,?'!/()&:;=+-_"$@  (indices 38–55)
-  • prosigns as single tokens: AR SK BT KN SOS DN AS CT  (indices 56–63)
+  • punctuation: .,?/(&=+  (indices 38–45)
+  • prosigns as single tokens: AR SK BT KN AS CT  (indices 46–51)
+
+Punctuation rationale: only 5-element sequences commonly seen on air.
+Removed: ' ! ) : ; - _ " $ @  (6–7 element sequences, never/rarely on air).
+Prosign rationale: standard ITU operating prosigns only.
+Removed: SOS (9 elements, decodes as S-O-S with letter spacing in QSOs),
+         DN (non-standard; code identical to /, creating contradictory labels).
 
 After import the following module-level names are available:
   char_to_idx : Dict[str, int]
@@ -47,8 +53,8 @@ BLANK_IDX: int = 0
 
 LETTERS: List[str] = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 DIGITS: List[str] = [str(d) for d in range(10)]
-PUNCTUATION: List[str] = list(".,?'!/()&:;=+-_\"$@")
-PROSIGNS: List[str] = ["AR", "SK", "BT", "KN", "SOS", "DN", "AS", "CT"]
+PUNCTUATION: List[str] = list(".,?/(&=+")
+PROSIGNS: List[str] = ["AR", "SK", "BT", "KN", "AS", "CT"]
 
 
 # ---------------------------------------------------------------------------
@@ -251,16 +257,16 @@ def beam_search_ctc(
 
     NEG_INF = float("-inf")
 
-    # Convert to numpy once for fast per-element access
-    probs_np: np.ndarray = torch.exp(log_probs).cpu().numpy()  # (T, C)
-    T, C = probs_np.shape
+    # Convert to numpy once for fast per-element access (stay in log space)
+    log_probs_np: np.ndarray = log_probs.cpu().float().numpy()  # (T, C)
+    T, C = log_probs_np.shape
 
     if T == 0:
         return ""
 
     # Token pruning: only expand the top-k non-blank tokens at each timestep.
-    # With beam_width=10 and C=64, using top_k=20 instead of 63 non-blank
-    # tokens gives ~3× speedup with negligible accuracy loss (the remaining
+    # With beam_width=10 and C=52, using top_k=20 instead of 51 non-blank
+    # tokens gives ~2.5× speedup with negligible accuracy loss (the remaining
     # tokens have tiny probability and won't survive beam pruning).
     top_k = min(beam_width * 2, C - 1)
 
@@ -275,8 +281,7 @@ def beam_search_ctc(
             d[key] = (lpb, lpnb)
 
     for t in range(T):
-        p_t = probs_np[t]
-        log_p_t: np.ndarray = np.log(p_t + 1e-30)  # vectorised log, (C,)
+        log_p_t: np.ndarray = log_probs_np[t]  # already in log space, (C,)
 
         # Blank log-prob
         lp_blank = float(log_p_t[blank_idx])

@@ -21,7 +21,7 @@ Architecture overview:
      chunk-by-chunk inference.
 
   4. Output head
-     Linear(hidden_size, num_classes) → log_softmax over 64-class vocab.
+     Linear(hidden_size, num_classes) → log_softmax over 52-class vocab.
 
 Default (~260 K parameters, 100 output fps at 5 ms hop after 2× pool):
     cnn_channels=(32, 64, 64), cnn_time_pools=(2, 1, 1),

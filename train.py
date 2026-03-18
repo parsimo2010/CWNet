@@ -256,9 +256,8 @@ def train(args: argparse.Namespace) -> None:
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch   = ckpt["epoch"] + 1
-        best_val_loss = ckpt.get("best_val_loss", math.inf)
-
         if args.additional_epochs:
+            best_val_loss = math.inf   # reset so full-stage val loss isn't compared to clean-stage
             resume_lr = args.resume_lr if args.resume_lr is not None else config.training.learning_rate
             for pg in optimizer.param_groups:
                 pg["lr"] = resume_lr
@@ -266,9 +265,10 @@ def train(args: argparse.Namespace) -> None:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=args.additional_epochs, eta_min=1e-6
             )
-            print(f"Resumed epoch {start_epoch}  (best_val={best_val_loss:.4f})  "
+            print(f"Resumed epoch {start_epoch}  (best_val reset to inf)  "
                   f"→ {args.additional_epochs} more epochs  lr={resume_lr:.2e}")
         else:
+            best_val_loss = ckpt.get("best_val_loss", math.inf)
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
             end_epoch = config.training.num_epochs
             print(f"Resumed epoch {start_epoch}  (best_val={best_val_loss:.4f})")
@@ -412,7 +412,7 @@ def train(args: argparse.Namespace) -> None:
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            best_path = ckpt_dir / "best_model.pt"
+            best_path = ckpt_dir / f"best_model_{run_name}.pt"
             save_checkpoint(best_path, epoch, model, optimizer, scheduler, best_val_loss, config)
             saved.append(str(best_path))
             print(f"  ✓ new best model  (val={best_val_loss:.4f})")
