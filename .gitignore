@@ -1,3 +1,15 @@
+# analysis outputs
+*.png
+*.txt
+*.wav
+*.csv
+
+# model checkpoints
+*.pt
+
+# debug files
+checkpoints/debug_samples
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
