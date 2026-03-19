@@ -84,7 +84,7 @@ class MorseConfig:
     # Narrowband IF-filter simulation
     # When applied, bandpass-filters the audio around the carrier to simulate
     # a narrowband radio receiver; tests the noise estimator's gap criterion.
-    narrowband_probability: float = 0.0
+    narrowband_probability: float = 1.0
     narrowband_bw_min_hz: float = 150.0
     narrowband_bw_max_hz: float = 500.0
 
@@ -342,7 +342,7 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.02
         cfg.morse.noise_color_probability = 0.0
-        cfg.morse.narrowband_probability = 0.0
+        cfg.morse.narrowband_probability = 1.0
         cfg.morse.tone_drift = 1.0
         cfg.training.num_epochs = 5
         cfg.training.samples_per_epoch = 200
@@ -365,7 +365,7 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.05
         cfg.morse.noise_color_probability = 0.0
-        cfg.morse.narrowband_probability = 0.2    # 20% samples narrowband
+        cfg.morse.narrowband_probability = 1.0    # 20% samples narrowband
         cfg.morse.tone_drift = 3.0
         cfg.training.num_epochs = 200
         cfg.training.samples_per_epoch = 5000
@@ -387,7 +387,7 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.20
         cfg.morse.noise_color_probability = 0.3   # 30% pink/brown noise
-        cfg.morse.narrowband_probability = 0.4    # 40% samples narrowband
+        cfg.morse.narrowband_probability = 1.0    # all samples narrowband
         cfg.morse.tone_drift = 5.0
         cfg.training.num_epochs = 500
         cfg.training.samples_per_epoch = 8000
