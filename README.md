@@ -66,11 +66,28 @@ All training data is synthesised on the fly; no recorded audio is required.
 | `iws_factor` (×7-dit gap) | 0.8–1.5 | 0.5–2.5 |
 | timing jitter | 0–5 % | 0–20 % |
 | noise colour | white | white + 30% pink/brown |
-| narrowband filter | 20% samples | 40% samples |
+| narrowband IF filter | 100% samples, 150–500 Hz BW | 100% samples, 150–500 Hz BW |
 | frequency drift | ±3 Hz | ±5 Hz |
+| AGC simulation | 30% samples, 6–12 dB depth | 70% samples, 6–18 dB depth |
+| impulsive noise | 20% samples, ≤3/s | 50% samples, ≤8/s |
+| QSB fading | disabled | 30% samples, 3–10 dB p-p |
 
 `dah_dit_ratio`, `ics_factor`, and `iws_factor` are sampled **independently** per sample
 to cover the wide range of real-world operator timing styles.
+
+**AGC simulation** models real HF radio automatic gain control: noise amplitude is
+attenuated during marks (fast attack, ~50 ms) and released during spaces (slow release,
+~400 ms).  This reproduces the characteristic noise-floor rise seen between elements in
+real recordings, where the SNR feature baseline drifts upward during inter-word gaps
+rather than remaining flat.
+
+**Impulsive noise** events (static crashes, key clicks from adjacent stations) are
+injected before the narrowband IF filter so each is shaped into a brief tone burst at
+the carrier frequency — matching real HF radio behaviour.  The model must learn to
+ignore these sub-dit-length spikes.
+
+**QSB** adds slow sinusoidal amplitude fading (0.05–0.3 Hz) to capture mark-to-mark
+signal strength variation from HF propagation.
 
 ## Vocabulary
 
@@ -212,7 +229,7 @@ feature extractor and GRU state.
 | File | Purpose |
 |---|---|
 | `config.py` | `MorseConfig`, `FeatureConfig`, `ModelConfig`, `TrainingConfig` |
-| `vocab.py` | 64-class CTC vocabulary + greedy/beam decode utilities |
+| `vocab.py` | 52-class CTC vocabulary + greedy/beam decode utilities |
 | `morse_table.py` | ITU Morse code table + binary trie |
 | `feature.py` | STFT → SNR ratio feature extractor |
 | `morse_generator.py` | Synthetic Morse audio generator |

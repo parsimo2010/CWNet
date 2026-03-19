@@ -10,8 +10,11 @@ Key differences from MorseNeural:
       dah_dit_ratio  — dah duration in units of one dit (ITU = 3.0)
       ics_factor     — multiplier on the standard 3-dit inter-char gap
       iws_factor     — multiplier on the standard 7-dit inter-word gap
-  • No QSB (amplitude fading) or QRM (interfering tone).
-  • No AGC simulation.
+  • AGC simulation: noise amplitude is modulated inversely to the signal
+    envelope, matching the noise-floor drift seen in real HF recordings.
+  • Impulsive noise: Poisson-process static crashes inserted before the IF
+    filter, shaped into brief tone bursts by the filter impulse response.
+  • QSB: slow sinusoidal amplitude fading within a sample.
   • Narrowband bandpass filter retained (tests the noise estimator's
     30 dB gap criterion at inference and training time).
   • Slow sinusoidal frequency drift retained (tests peak-bin tracking).
@@ -117,6 +120,105 @@ def _apply_bandpass(
         high = min(nyq - 10.0, low + 20.0)
     sos = butter(4, [low / nyq, high / nyq], btype="band", output="sos")
     return sosfilt(sos, audio.astype(np.float64)).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Real-world augmentation helpers
+# ---------------------------------------------------------------------------
+
+def _agc_noise_modulation(
+    signal: np.ndarray,
+    noise: np.ndarray,
+    sample_rate: int,
+    attack_ms: float,
+    release_ms: float,
+    depth_db: float,
+) -> np.ndarray:
+    """Scale noise amplitude inversely to signal envelope (AGC simulation).
+
+    During marks the noise is attenuated by *depth_db*.  During spaces it
+    returns to full amplitude with the *release_ms* time constant.
+
+    This replicates the effect of a radio AGC that reduces IF gain when a
+    strong signal is present, causing the noise floor visible between elements
+    to be significantly higher than the noise floor during marks.  The result
+    in the SNR feature is that inter-element and inter-word spaces have an
+    elevated, slowly-decaying noise baseline rather than a flat negative value.
+    """
+    alpha_atk = 1.0 - math.exp(-1.0 / max(1.0, attack_ms  * 1e-3 * sample_rate))
+    alpha_rel = 1.0 - math.exp(-1.0 / max(1.0, release_ms * 1e-3 * sample_rate))
+
+    sig_sq   = signal.astype(np.float64) ** 2
+    envelope = np.empty_like(sig_sq)
+    e = 0.0
+    for i in range(len(sig_sq)):
+        alpha = alpha_atk if sig_sq[i] >= e else alpha_rel
+        e    += alpha * (sig_sq[i] - e)
+        envelope[i] = e
+
+    peak = envelope.max()
+    if peak < 1e-12:
+        return noise      # no signal — AGC has nothing to react to
+
+    envelope /= peak      # normalised: 1.0 at strongest mark, ~0 in deep spaces
+
+    # Noise gain: 1/depth_lin during peak marks, 1.0 during spaces
+    depth_lin  = 10.0 ** (depth_db / 20.0)                # > 1
+    noise_gain = (1.0 / (1.0 + (depth_lin - 1.0) * envelope)).astype(np.float32)
+    return noise * noise_gain
+
+
+def _apply_qsb(
+    signal: np.ndarray,
+    t: np.ndarray,
+    rng: np.random.Generator,
+    depth_db: float,
+) -> np.ndarray:
+    """Apply slow sinusoidal amplitude fading (QSB) to the signal.
+
+    The fading rate is 0.05–0.3 Hz, producing mark-to-mark amplitude
+    variation over several seconds — matching propagation fading on HF.
+    """
+    fade_freq  = rng.uniform(0.05, 0.3)
+    fade_phase = rng.uniform(0.0, 2 * math.pi)
+    fade_db    = (depth_db / 2.0) * np.sin(2 * math.pi * fade_freq * t + fade_phase)
+    fade_lin   = 10.0 ** (fade_db.astype(np.float32) / 20.0)
+    return signal * fade_lin
+
+
+def _add_impulse_noise(
+    audio: np.ndarray,
+    sample_rate: int,
+    rng: np.random.Generator,
+    rate_hz: float,
+    amplitude_relative: float,
+) -> np.ndarray:
+    """Add random impulsive noise events (RF static crashes, key clicks).
+
+    Each impulse is a 1–8 ms decaying burst of white noise.  Inserting
+    impulses *before* the narrowband filter causes each one to be shaped
+    into a brief ring at the carrier frequency — identical to what a real
+    HF radio produces when a static crash passes through the IF filter.
+    The model must learn to ignore these sub-dit-length spikes.
+    """
+    n_samples  = len(audio)
+    n_impulses = int(rng.poisson(rate_hz * n_samples / sample_rate))
+    if n_impulses == 0:
+        return audio
+
+    audio = audio.copy()
+    rms   = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2))) + 1e-9
+    amp   = amplitude_relative * rms
+
+    for _ in range(n_impulses):
+        pos = int(rng.integers(0, n_samples))
+        dur = max(1, min(int(rng.uniform(0.001, 0.008) * sample_rate), n_samples - pos))
+        scale  = rng.uniform(0.3, 1.0) * amp
+        decay  = np.exp(-np.arange(dur, dtype=np.float64) / max(1, dur * 0.3))
+        impulse = (rng.standard_normal(dur) * scale * decay).astype(np.float32)
+        audio[pos:pos + dur] += impulse
+
+    return audio
 
 
 # ---------------------------------------------------------------------------
@@ -275,8 +377,24 @@ def synthesize_audio(
     narrowband_bw_hz: float = 0.0,
     target_amplitude: float = 0.9,
     noise_color: int = 0,
+    agc_depth_db: float = 0.0,
+    agc_attack_ms: float = 50.0,
+    agc_release_ms: float = 400.0,
+    impulse_rate_hz: float = 0.0,
+    impulse_amplitude: float = 3.0,
+    qsb_depth_db: float = 0.0,
 ) -> np.ndarray:
     """Render Morse elements to a float32 audio waveform.
+
+    Pipeline (in order):
+      1. Carrier + key envelope → signal (message length only)
+      2. QSB: slow sinusoidal fading applied to signal
+      3. Noise generated for full length (message + trailing silence)
+      4. AGC: noise amplitude modulated inversely to signal envelope
+      5. Mix signal + noise
+      6. Impulsive noise injected (before IF filter — gets shaped into tone bursts)
+      7. Narrowband IF filter applied
+      8. Normalise to target_amplitude
 
     Parameters
     ----------
@@ -298,32 +416,44 @@ def synthesize_audio(
         Peak amplitude of normalised output.
     noise_color : int
         0 = white AWGN, 1 = pink (1/f), 2 = brown (1/f²).
+    agc_depth_db : float
+        Noise suppression during peak marks (dB); 0 = disabled.
+    agc_attack_ms, agc_release_ms : float
+        AGC attack and release time constants (ms).
+    impulse_rate_hz : float
+        Mean rate of impulsive noise events per second; 0 = disabled.
+    impulse_amplitude : float
+        Impulse amplitude relative to noise RMS.
+    qsb_depth_db : float
+        Peak-to-peak sinusoidal fading range (dB); 0 = disabled.
 
     Returns
     -------
     np.ndarray
         Float32 waveform normalised to target_amplitude.
     """
-    total_duration = sum(d for _, d in elements)
-    total_samples = max(1, int(math.ceil(total_duration * sample_rate)))
+    msg_duration  = sum(d for _, d in elements)
+    msg_samples   = max(1, int(math.ceil(msg_duration * sample_rate)))
+    tail_samples  = max(0, int(trailing_silence_sec * sample_rate))
+    total_samples = msg_samples + tail_samples
 
-    t = np.arange(total_samples, dtype=np.float64) / sample_rate
+    t = np.arange(msg_samples, dtype=np.float64) / sample_rate
 
     # ---- Carrier with slow sinusoidal frequency drift --------------------
-    drift_rate = rng.uniform(0.05, 0.2)
+    drift_rate  = rng.uniform(0.05, 0.2)
     drift_phase = rng.uniform(0.0, 2 * math.pi)
-    freq = base_freq + tone_drift * np.sin(2 * math.pi * drift_rate * t + drift_phase)
+    freq       = base_freq + tone_drift * np.sin(2 * math.pi * drift_rate * t + drift_phase)
     inst_phase = np.cumsum(2 * math.pi * freq / sample_rate)
-    carrier = np.sin(inst_phase)
+    carrier    = np.sin(inst_phase)
 
     # ---- Key envelope with soft 5 ms rise/fall (prevents key clicks) ----
-    envelope = np.zeros(total_samples, dtype=np.float64)
+    envelope     = np.zeros(msg_samples, dtype=np.float64)
     rise_samples = max(2, int(0.005 * sample_rate))
 
     pos = 0
     for is_tone, duration in elements:
-        n = int(round(duration * sample_rate))
-        end = min(pos + n, total_samples)
+        n     = int(round(duration * sample_rate))
+        end   = min(pos + n, msg_samples)
         chunk = end - pos
         if chunk <= 0:
             break
@@ -335,34 +465,42 @@ def synthesize_audio(
                 envelope[pos:pos + r] = ramp
                 envelope[end - r:end] = ramp[::-1]
         pos = end
-        if pos >= total_samples:
+        if pos >= msg_samples:
             break
 
-    signal = carrier * envelope
+    signal = (carrier * envelope).astype(np.float32)
 
-    # ---- Additive noise at target SNR -----------------------------------
+    # ---- Noise level from message signal power (before QSB) -------------
     sig_power = float(np.mean(signal ** 2))
-    if sig_power > 1e-12:
-        snr_lin = 10.0 ** (snr_db / 10.0)
-        noise_std = math.sqrt(sig_power / snr_lin)
-    else:
-        noise_std = 0.01
+    noise_std = math.sqrt(sig_power / (10.0 ** (snr_db / 10.0))) if sig_power > 1e-12 else 0.01
 
+    # ---- Extend signal to full length (trailing silence = zeros) --------
+    if tail_samples > 0:
+        signal = np.concatenate([signal, np.zeros(tail_samples, dtype=np.float32)])
+
+    # ---- QSB: slow sinusoidal signal fading -----------------------------
+    if qsb_depth_db > 0.0:
+        t_full = np.arange(total_samples, dtype=np.float64) / sample_rate
+        signal = _apply_qsb(signal, t_full, rng, qsb_depth_db)
+
+    # ---- Additive noise for full audio ----------------------------------
     if noise_color == 0:
-        noise = rng.normal(0.0, noise_std, total_samples)
+        noise = rng.normal(0.0, noise_std, total_samples).astype(np.float32)
     else:
-        noise = _colored_noise(total_samples, rng, noise_color) * noise_std
+        noise = (_colored_noise(total_samples, rng, noise_color) * noise_std).astype(np.float32)
+
+    # ---- AGC: modulate noise inversely to signal envelope ---------------
+    if agc_depth_db > 0.0:
+        noise = _agc_noise_modulation(
+            signal, noise, sample_rate, agc_attack_ms, agc_release_ms, agc_depth_db,
+        )
+
+    # ---- Mix ------------------------------------------------------------
     audio = signal + noise
 
-    # ---- Trailing silence -----------------------------------------------
-    if trailing_silence_sec > 0.0:
-        tail_samples = int(trailing_silence_sec * sample_rate)
-        if tail_samples > 0:
-            if noise_color == 0:
-                tail = rng.normal(0.0, noise_std, tail_samples)
-            else:
-                tail = _colored_noise(tail_samples, rng, noise_color) * noise_std
-            audio = np.concatenate([audio, tail])
+    # ---- Impulsive noise (before IF filter — shaped into tone bursts) ---
+    if impulse_rate_hz > 0.0:
+        audio = _add_impulse_noise(audio, sample_rate, rng, impulse_rate_hz, impulse_amplitude)
 
     # ---- Narrowband bandpass filter (simulates IF filter) ---------------
     if narrowband_bw_hz > 0.0:
@@ -453,6 +591,23 @@ def generate_sample(
     if config.noise_color_probability > 0.0 and rng.random() < config.noise_color_probability:
         noise_color = int(rng.integers(1, 3))
 
+    # ---- Per-sample AGC decision ----------------------------------------
+    agc_depth_db = 0.0
+    if config.agc_probability > 0.0 and rng.random() < config.agc_probability:
+        agc_depth_db = float(rng.uniform(config.agc_depth_db_min, config.agc_depth_db_max))
+
+    # ---- Per-sample impulse noise decision ------------------------------
+    impulse_rate_hz  = 0.0
+    impulse_amplitude = 0.0
+    if config.impulse_noise_probability > 0.0 and rng.random() < config.impulse_noise_probability:
+        impulse_rate_hz   = float(rng.uniform(0.5, config.impulse_rate_max))
+        impulse_amplitude = float(rng.uniform(1.0, config.impulse_amplitude_max))
+
+    # ---- Per-sample QSB decision ----------------------------------------
+    qsb_depth_db = 0.0
+    if config.qsb_probability > 0.0 and rng.random() < config.qsb_probability:
+        qsb_depth_db = float(rng.uniform(config.qsb_depth_db_min, config.qsb_depth_db_max))
+
     # ---- Text length estimation -----------------------------------------
     # PARIS: 5 chars/word; adjust for ics and iws deviations
     effective_word_dur_factor = (ics_factor * 3 + iws_factor * 7) / (3 + 7)
@@ -496,6 +651,12 @@ def generate_sample(
         narrowband_bw_hz=narrowband_bw_hz,
         target_amplitude=target_amplitude,
         noise_color=noise_color,
+        agc_depth_db=agc_depth_db,
+        agc_attack_ms=config.agc_attack_ms,
+        agc_release_ms=config.agc_release_ms,
+        impulse_rate_hz=impulse_rate_hz,
+        impulse_amplitude=impulse_amplitude,
+        qsb_depth_db=qsb_depth_db,
     )
 
     metadata: Dict = {
@@ -511,6 +672,9 @@ def generate_sample(
         "narrowband_bw_hz": narrowband_bw_hz,
         "target_amplitude": target_amplitude,
         "noise_color": noise_color,
+        "agc_depth_db": agc_depth_db,
+        "impulse_rate_hz": impulse_rate_hz,
+        "qsb_depth_db": qsb_depth_db,
     }
     return audio_f32, text, metadata
 

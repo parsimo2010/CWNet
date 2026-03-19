@@ -42,6 +42,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -113,23 +114,24 @@ def save_checkpoint(
     scheduler: torch.optim.lr_scheduler._LRScheduler,
     best_val_loss: float,
     config: Config,
+    scaler: Optional[GradScaler] = None,
 ) -> None:
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "best_val_loss": best_val_loss,
-            "config": {
-                "morse":    config.morse.to_dict(),
-                "feature":  config.feature.to_dict(),
-                "model":    config.model.to_dict(),
-                "training": config.training.to_dict(),
-            },
+    state = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "best_val_loss": best_val_loss,
+        "config": {
+            "morse":    config.morse.to_dict(),
+            "feature":  config.feature.to_dict(),
+            "model":    config.model.to_dict(),
+            "training": config.training.to_dict(),
         },
-        path,
-    )
+    }
+    if scaler is not None:
+        state["scaler_state_dict"] = scaler.state_dict()
+    torch.save(state, path)
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +192,8 @@ def train(args: argparse.Namespace) -> None:
     print(f"Vocabulary   : {vocab_module.num_classes} tokens  (blank=0)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device       : {device}")
+    scaler = GradScaler(device="cuda") if device.type == "cuda" else None
+    print(f"Device       : {device}  (AMP {'enabled' if scaler else 'disabled'})")
 
     # ---- Debug samples ---------------------------------------------------
     save_debug_samples(config, ckpt_dir / "debug_samples", n=5)
@@ -229,13 +232,18 @@ def train(args: argparse.Namespace) -> None:
         collate_fn=collate_fn,
         num_workers=config.training.num_workers,
         pin_memory=(device.type == "cuda"),
-        prefetch_factor=1 if config.training.num_workers > 0 else None,
+        prefetch_factor=2 if config.training.num_workers > 0 else None,
+        persistent_workers=(config.training.num_workers > 0),
     )
+    val_workers = min(2, config.training.num_workers)
     val_loader = DataLoader(
         val_ds,
         batch_size=config.training.batch_size,
         collate_fn=collate_fn,
-        num_workers=0,
+        num_workers=val_workers,
+        pin_memory=(device.type == "cuda"),
+        prefetch_factor=2 if val_workers > 0 else None,
+        persistent_workers=(val_workers > 0),
     )
 
     # ---- Loss / optimiser / scheduler -----------------------------------
@@ -255,6 +263,8 @@ def train(args: argparse.Namespace) -> None:
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if scaler is not None and "scaler_state_dict" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_epoch   = ckpt["epoch"] + 1
         if args.additional_epochs:
             best_val_loss = math.inf   # reset so full-stage val loss isn't compared to clean-stage
@@ -299,7 +309,7 @@ def train(args: argparse.Namespace) -> None:
             else:
                 print(f"\n  [warn] NaN in weights before epoch {epoch+1} — no safety ckpt")
 
-        save_checkpoint(safety_path, epoch, model, optimizer, scheduler, best_val_loss, config)
+        save_checkpoint(safety_path, epoch, model, optimizer, scheduler, best_val_loss, config, scaler)
 
         model.train()
         epoch_losses: List[float] = []
@@ -319,22 +329,37 @@ def train(args: argparse.Namespace) -> None:
 
             optimizer.zero_grad(set_to_none=True)
 
-            log_probs, out_lens = model(snr, snr_lens)
-            loss = ctc_loss(log_probs, targets, out_lens, tgt_lens)
+            with autocast(device_type=device.type, enabled=(scaler is not None)):
+                log_probs, out_lens = model(snr, snr_lens)
+                loss = ctc_loss(log_probs, targets, out_lens, tgt_lens)
 
             if torch.isfinite(loss):
-                loss.backward()
-                # Guard against NaN/Inf gradients
-                if any(
-                    p.grad is not None and not torch.isfinite(p.grad).all()
-                    for p in model.parameters()
-                ):
-                    optimizer.zero_grad(set_to_none=True)
-                    print(f"\n  [warn] NaN gradient at E{epoch+1} B{batch_idx+1} — skipped")
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    grad_ok = all(
+                        p.grad is None or torch.isfinite(p.grad).all()
+                        for p in model.parameters()
+                    )
+                    if not grad_ok:
+                        print(f"\n  [warn] NaN gradient at E{epoch+1} B{batch_idx+1} — skipped")
+                    else:
+                        nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                        epoch_losses.append(loss.item())
+                    scaler.step(optimizer)   # no-ops internally if grads were inf/nan
+                    scaler.update()
                 else:
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                    optimizer.step()
-                    epoch_losses.append(loss.item())
+                    loss.backward()
+                    if any(
+                        p.grad is not None and not torch.isfinite(p.grad).all()
+                        for p in model.parameters()
+                    ):
+                        optimizer.zero_grad(set_to_none=True)
+                        print(f"\n  [warn] NaN gradient at E{epoch+1} B{batch_idx+1} — skipped")
+                    else:
+                        nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                        optimizer.step()
+                        epoch_losses.append(loss.item())
 
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
@@ -380,8 +405,9 @@ def train(args: argparse.Namespace) -> None:
                 snr_lens = snr_lens.to(device)
                 tgt_lens = tgt_lens.to(device)
 
-                log_probs, out_lens = model(snr, snr_lens)
-                loss = ctc_loss(log_probs, targets, out_lens, tgt_lens)
+                with autocast(device_type=device.type, enabled=(scaler is not None)):
+                    log_probs, out_lens = model(snr, snr_lens)
+                    loss = ctc_loss(log_probs, targets, out_lens, tgt_lens)
                 if torch.isfinite(loss):
                     val_losses.append(loss.item())
 
@@ -413,13 +439,13 @@ def train(args: argparse.Namespace) -> None:
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             best_path = ckpt_dir / f"best_model_{run_name}.pt"
-            save_checkpoint(best_path, epoch, model, optimizer, scheduler, best_val_loss, config)
+            save_checkpoint(best_path, epoch, model, optimizer, scheduler, best_val_loss, config, scaler)
             saved.append(str(best_path))
             print(f"  ✓ new best model  (val={best_val_loss:.4f})")
 
         if (epoch + 1) % 5 == 0:
             periodic_path = ckpt_dir / f"checkpoint_epoch_{epoch+1:04d}.pt"
-            save_checkpoint(periodic_path, epoch, model, optimizer, scheduler, best_val_loss, config)
+            save_checkpoint(periodic_path, epoch, model, optimizer, scheduler, best_val_loss, config, scaler)
             saved.append(str(periodic_path))
 
         append_training_log(

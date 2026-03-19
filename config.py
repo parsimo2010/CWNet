@@ -88,6 +88,32 @@ class MorseConfig:
     narrowband_bw_min_hz: float = 150.0
     narrowband_bw_max_hz: float = 500.0
 
+    # AGC simulation — noise-floor modulation matching real HF radio AGC.
+    # During marks the AGC reduces gain → background noise is suppressed.
+    # During spaces the AGC releases → noise rises to full level over release_ms.
+    # This creates the characteristic noise-floor drift seen between elements in
+    # real recordings.  Noise is modulated *before* the IF filter so the effect
+    # appears in the feature extractor's noise estimate.
+    agc_probability: float = 0.0        # fraction of samples with AGC enabled
+    agc_attack_ms: float = 50.0         # gain reduction time constant (ms)
+    agc_release_ms: float = 400.0       # gain recovery time constant (ms)
+    agc_depth_db_min: float = 6.0       # noise suppression at peak mark (dB, min)
+    agc_depth_db_max: float = 15.0      # noise suppression at peak mark (dB, max)
+
+    # Impulsive noise — RF static crashes and key clicks from adjacent stations.
+    # Each impulse is inserted *before* the IF narrowband filter so it is shaped
+    # into a brief tone burst at the carrier frequency, matching real HF behaviour.
+    # The model must learn to ignore these sub-dit-length spikes.
+    impulse_noise_probability: float = 0.0  # fraction of samples
+    impulse_rate_max: float = 5.0           # max mean impulse rate (per second)
+    impulse_amplitude_max: float = 5.0      # max amplitude relative to noise RMS
+
+    # QSB — slow sinusoidal signal fading within a sample (0.05–0.3 Hz).
+    # Captures mark-to-mark amplitude variation from propagation.
+    qsb_probability: float = 0.0
+    qsb_depth_db_min: float = 3.0      # peak-to-peak fading range (dB, min)
+    qsb_depth_db_max: float = 10.0     # peak-to-peak fading range (dB, max)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -365,13 +391,21 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.05
         cfg.morse.noise_color_probability = 0.0
-        cfg.morse.narrowband_probability = 1.0    # 20% samples narrowband
+        cfg.morse.narrowband_probability = 1.0
         cfg.morse.tone_drift = 3.0
+        cfg.training.batch_size = 96
+        cfg.training.learning_rate = 5e-4   # √3 × 3e-4, scaled for 3× batch
         cfg.training.num_epochs = 200
-        cfg.training.samples_per_epoch = 5000
-        cfg.training.val_samples = 500
-        cfg.training.num_workers = 4
+        cfg.training.samples_per_epoch = 15000
+        cfg.training.val_samples = 1500
+        cfg.training.num_workers = 8
         cfg.training.beam_cer_interval = 50
+        # Real-world augmentations (mild — model learns basic task first)
+        cfg.morse.agc_probability = 0.3
+        cfg.morse.impulse_noise_probability = 0.2
+        cfg.morse.impulse_rate_max = 3.0
+        cfg.morse.impulse_amplitude_max = 4.0
+        # qsb_probability left at 0.0 for clean stage
 
     elif scenario == "full":
         cfg.morse.min_snr_db = 3.0
@@ -389,11 +423,20 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.noise_color_probability = 0.3   # 30% pink/brown noise
         cfg.morse.narrowband_probability = 1.0    # all samples narrowband
         cfg.morse.tone_drift = 5.0
+        cfg.training.batch_size = 96
+        cfg.training.learning_rate = 5e-4   # √3 × 3e-4, scaled for 3× batch
         cfg.training.num_epochs = 500
-        cfg.training.samples_per_epoch = 8000
-        cfg.training.val_samples = 800
-        cfg.training.num_workers = 4
+        cfg.training.samples_per_epoch = 24000
+        cfg.training.val_samples = 2400
+        cfg.training.num_workers = 8
         cfg.training.beam_cer_interval = 50
+        # Real-world augmentations (full strength for curriculum stage 2)
+        cfg.morse.agc_probability = 0.7
+        cfg.morse.agc_depth_db_max = 18.0
+        cfg.morse.impulse_noise_probability = 0.5
+        cfg.morse.impulse_rate_max = 8.0
+        cfg.morse.impulse_amplitude_max = 6.0
+        cfg.morse.qsb_probability = 0.3
 
     else:
         raise ValueError(
