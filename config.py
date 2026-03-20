@@ -218,31 +218,30 @@ class ModelConfig:
       cnn_time_pools = (2, 1, 1)  → 2× downsampling after block 1 → 100 fps
       cnn_kernel_size = 7
       cnn_dilations = (1, 2, 4)   → growing receptive field per block
-      proj_size = 128, hidden_size = 128, n_rnn_layers = 2
+      proj_size = 256, hidden_size = 256, n_rnn_layers = 3
     """
 
     # Number of input channels (1 = energy only, 2 = energy + coherence)
-    # Default 1 for backward compatibility with old checkpoints.
-    in_channels: int = 1
+    in_channels: int = 2
 
     # CNN channel counts (one per block; length = number of blocks)
-    cnn_channels: Tuple[int, ...] = (32, 64, 64)
+    cnn_channels: Tuple[int, ...] = (32, 64, 64, 64)
 
     # Time-axis MaxPool stride per CNN block (1 = no pooling)
-    cnn_time_pools: Tuple[int, ...] = (2, 1, 1)
+    cnn_time_pools: Tuple[int, ...] = (2, 1, 1, 1)
 
     # Dilation per CNN block (expands receptive field without extra params)
-    cnn_dilations: Tuple[int, ...] = (1, 2, 4)
+    cnn_dilations: Tuple[int, ...] = (1, 2, 4, 8)
 
     # Convolution kernel size (same for all blocks)
     cnn_kernel_size: int = 7
 
     # Linear projection from CNN output to GRU input dimension
-    proj_size: int = 128
+    proj_size: int = 192
 
     # GRU hidden size and depth
-    hidden_size: int = 128
-    n_rnn_layers: int = 2
+    hidden_size: int = 192
+    n_rnn_layers: int = 3
 
     # Dropout between GRU layers (0 disables)
     dropout: float = 0.1
@@ -413,8 +412,8 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.noise_color_probability = 0.0
         cfg.morse.narrowband_probability = 1.0
         cfg.morse.tone_drift = 3.0
-        cfg.training.batch_size = 256
-        cfg.training.learning_rate = 8e-4   # √(256/96) × 5e-4, sqrt-scaled
+        cfg.training.batch_size = 128
+        cfg.training.learning_rate = 4e-4   
         cfg.training.num_epochs = 200
         cfg.training.samples_per_epoch = 15000
         cfg.training.val_samples = 1500
@@ -444,8 +443,8 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.noise_color_probability = 0.3   # 30% pink/brown noise
         cfg.morse.narrowband_probability = 1.0    # all samples narrowband
         cfg.morse.tone_drift = 5.0
-        cfg.training.batch_size = 256
-        cfg.training.learning_rate = 8e-4   # √(256/96) × 5e-4, sqrt-scaled
+        cfg.training.batch_size = 128
+        cfg.training.learning_rate = 4e-4   
         cfg.training.num_epochs = 500
         cfg.training.samples_per_epoch = 24000
         cfg.training.val_samples = 2400
