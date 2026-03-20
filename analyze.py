@@ -2,13 +2,17 @@
 """
 analyze.py — Visual analysis of CWNet debug samples and real radio recordings.
 
-For each audio file, produces a 4-panel figure:
+For each audio file, produces a 5-panel figure:
   1. Time-domain waveform
   2. STFT spectrogram (linear Hz axis, power in dB;
      monitored frequency range highlighted)
-  3. Signal power vs noise EMA floor (dB) — how the feature extractor tracks signal
-     Twin y-axis: SNR (dB) in green
-  4. Normalised SNR feature (tanh output) — what the model actually sees
+  3. Peak energy vs adaptive threshold (dB) — how the feature extractor
+     tracks mark/space levels via sliding-window percentiles
+  4. Normalised energy feature (tanh output) — model input channel 0
+  5. Phase coherence R — model input channel 1
+
+Feature extraction is performed by MorseFeatureExtractor from feature.py, so
+any changes to the extractor are automatically reflected here.
 
 Usage::
 
@@ -44,6 +48,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
 from config import FeatureConfig, create_default_config
+from feature import MorseFeatureExtractor
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +88,7 @@ def load_audio(path: Path) -> tuple[np.ndarray, int]:
 
 
 # ---------------------------------------------------------------------------
-# Feature extraction — mirrors feature.py exactly, but saves intermediate values
+# Feature extraction — uses MorseFeatureExtractor with diagnostics enabled
 # ---------------------------------------------------------------------------
 
 def extract_features_verbose(
@@ -93,29 +98,29 @@ def extract_features_verbose(
 ) -> dict:
     """Run the CWNet feature extractor, capturing all intermediate signals.
 
-    Replicates MorseFeatureExtractor._compute_frame() exactly so the output
-    matches what the model receives during training/inference, while also
-    recording the per-frame signal power, instantaneous noise estimate,
-    noise EMA, and raw SNR for diagnostic plotting.
+    Uses MorseFeatureExtractor from feature.py directly so the output is
+    always consistent with what the model receives during training/inference.
 
     Parameters
     ----------
     audio : float32 array at TARGET_SR (8 kHz)
-    cfg   : FeatureConfig (controls window, hop, freq range, EMA alpha, etc.)
+    cfg   : FeatureConfig
     max_frames : if set, stop after this many frames (for display of long files)
 
     Returns dict with keys:
-        full_spec  (n_fft_bins, n_frames) — linear power spectrogram
-        freqs      (n_fft_bins,)          — Hz per FFT bin
-        signal_db  (n_frames,)            — signal (max bin) power in dB
-        noise_db   (n_frames,)            — instantaneous noise estimate in dB
-        ema_db     (n_frames,)            — noise EMA floor in dB
-        snr_db     (n_frames,)            — SNR in dB before tanh
-        snr_norm   (n_frames,)            — tanh-normalised SNR (model input)
-        n_frames   int
-        hop_sec    float
-        freq_lo_hz float  — actual lower edge of monitored range
-        freq_hi_hz float  — actual upper edge of monitored range
+        full_spec       (n_fft_bins, n_frames) — linear power spectrogram
+        freqs           (n_fft_bins,)          — Hz per FFT bin
+        peak_db         (n_frames,)            — peak bin power in dB
+        center_db       (n_frames,)            — adaptive threshold (dB)
+        mark_level_db   (n_frames,)            — 75th percentile (dB)
+        space_level_db  (n_frames,)            — 25th percentile (dB)
+        spread_db       (n_frames,)            — mark-space spread (dB)
+        output          (n_frames,)            — tanh-normalised energy feature
+        coherence       (n_frames,)            — phase coherence R (0–1)
+        n_frames        int
+        hop_sec         float
+        freq_lo_hz      float
+        freq_hi_hz      float
     """
     sr = cfg.sample_rate
     window_samples = max(1, round(sr * cfg.window_ms / 1000.0))
@@ -130,85 +135,58 @@ def extract_features_verbose(
     if freq_hi <= freq_lo:
         freq_hi = freq_lo + 1
 
-    exclude_top_n = max(2, cfg.noise_exclude_top_n)
-    gap_factor    = 10.0 ** (-30.0 / 10.0)   # 30 dB gap criterion
-    alpha         = cfg.noise_ema_alpha
-    norm_center   = cfg.snr_norm_center
-    norm_scale    = cfg.snr_norm_scale
-
+    # Determine how many audio samples we need
     total_frames = max(1, (len(audio) - window_samples) // hop_samples + 1)
-    n_frames     = min(total_frames, max_frames) if max_frames else total_frames
+    n_frames_cap = min(total_frames, max_frames) if max_frames else total_frames
 
-    # Pad so no frame runs past end of audio
-    needed = (n_frames - 1) * hop_samples + window_samples
+    needed = (n_frames_cap - 1) * hop_samples + window_samples
     if len(audio) < needed:
         audio = np.pad(audio, (0, needed - len(audio)))
 
-    full_spec  = np.empty((n_fft_bins, n_frames), dtype=np.float64)
-    signal_db  = np.empty(n_frames, dtype=np.float64)
-    noise_db   = np.empty(n_frames, dtype=np.float64)
-    ema_db     = np.empty(n_frames, dtype=np.float64)
-    snr_db_arr = np.empty(n_frames, dtype=np.float64)
-    snr_norm   = np.empty(n_frames, dtype=np.float32)
-
-    noise_ema   = 1e-12
-    noise_ready = False
-
-    for i in range(n_frames):
+    # ----------------------------------------------------------------
+    # Full STFT spectrogram (for visualization — computed independently
+    # of the feature extractor so we can plot all FFT bins)
+    # ----------------------------------------------------------------
+    full_spec = np.empty((n_fft_bins, n_frames_cap), dtype=np.float64)
+    for i in range(n_frames_cap):
         s0      = i * hop_samples
         frame   = audio[s0: s0 + window_samples].astype(np.float32)
-        windowed = frame * window_fn
-        spectrum = np.fft.rfft(windowed)
-        power    = (np.abs(spectrum) ** 2).astype(np.float64) / (window_samples ** 2)
+        spectrum = np.fft.rfft(frame * window_fn)
+        full_spec[:, i] = (np.abs(spectrum) ** 2).astype(np.float64) / (window_samples ** 2)
 
-        full_spec[:, i] = power
+    # ----------------------------------------------------------------
+    # Feature extraction via MorseFeatureExtractor (record_diagnostics=True)
+    # ----------------------------------------------------------------
+    fe = MorseFeatureExtractor(cfg, record_diagnostics=True)
+    audio_slice = audio[:(n_frames_cap - 1) * hop_samples + window_samples]
+    fe.process_chunk(audio_slice)
+    fe.flush()
 
-        bins         = power[freq_lo:freq_hi]
-        signal_power = float(np.max(bins))
+    diags = fe.diagnostics
+    n_out = min(len(diags), n_frames_cap)
 
-        # --- Noise estimation: mirrors feature.py _estimate_noise() ---
-        n = len(bins)
-        if n <= exclude_top_n:
-            noise_raw = float(max(np.min(bins), 1e-15))
-        else:
-            sorted_desc = np.sort(bins)[::-1]
-            remaining   = sorted_desc[exclude_top_n:]
-            ref         = remaining[0]
-            threshold   = ref * gap_factor
-            noise_bins  = remaining[remaining >= threshold]
-            noise_raw   = (float(np.mean(noise_bins)) if len(noise_bins) > 0
-                           else float(remaining[-1]))
-        noise_raw = max(noise_raw, 1e-15)
-
-        # --- EMA update ---
-        if not noise_ready:
-            noise_ema   = noise_raw
-            noise_ready = True
-        else:
-            noise_ema = alpha * noise_ema + (1.0 - alpha) * noise_raw
-        noise_ema = max(noise_ema, 1e-15)
-
-        snr_db   = 10.0 * math.log10(max(signal_power / noise_ema, 1e-6))
-        norm_val = math.tanh((snr_db - norm_center) / norm_scale)
-
-        signal_db[i]  = 10.0 * math.log10(max(signal_power, 1e-15))
-        noise_db[i]   = 10.0 * math.log10(noise_raw)
-        ema_db[i]     = 10.0 * math.log10(noise_ema)
-        snr_db_arr[i] = snr_db
-        snr_norm[i]   = float(norm_val)
+    peak_db       = np.array([d["peak_db"]        for d in diags[:n_out]], dtype=np.float64)
+    center_db     = np.array([d["center_db"]      for d in diags[:n_out]], dtype=np.float64)
+    mark_level_db = np.array([d["mark_level_db"]  for d in diags[:n_out]], dtype=np.float64)
+    space_level_db= np.array([d["space_level_db"] for d in diags[:n_out]], dtype=np.float64)
+    spread_db     = np.array([d["spread_db"]      for d in diags[:n_out]], dtype=np.float64)
+    output        = np.array([d["output"]          for d in diags[:n_out]], dtype=np.float32)
+    coherence     = np.array([d["coherence"]       for d in diags[:n_out]], dtype=np.float32)
 
     return {
-        "full_spec":  full_spec,
-        "freqs":      freqs,
-        "signal_db":  signal_db,
-        "noise_db":   noise_db,
-        "ema_db":     ema_db,
-        "snr_db":     snr_db_arr,
-        "snr_norm":   snr_norm,
-        "n_frames":   n_frames,
-        "hop_sec":    hop_samples / sr,
-        "freq_lo_hz": float(freqs[freq_lo]),
-        "freq_hi_hz": float(freqs[min(freq_hi, n_fft_bins - 1)]),
+        "full_spec":      full_spec[:, :n_out],
+        "freqs":          freqs,
+        "peak_db":        peak_db,
+        "center_db":      center_db,
+        "mark_level_db":  mark_level_db,
+        "space_level_db": space_level_db,
+        "spread_db":      spread_db,
+        "output":         output,
+        "coherence":      coherence,
+        "n_frames":       n_out,
+        "hop_sec":        hop_samples / sr,
+        "freq_lo_hz":     float(freqs[freq_lo]),
+        "freq_hi_hz":     float(freqs[min(freq_hi, n_fft_bins - 1)]),
     }
 
 
@@ -222,17 +200,19 @@ CHUNK_SEC = 5.0   # seconds per output PNG
 def _slice_feat(feat: dict, f0: int, f1: int) -> dict:
     """Return a shallow copy of feat containing only frame slice [f0, f1)."""
     return {
-        "full_spec":  feat["full_spec"][:, f0:f1],
-        "freqs":      feat["freqs"],
-        "signal_db":  feat["signal_db"][f0:f1],
-        "noise_db":   feat["noise_db"][f0:f1],
-        "ema_db":     feat["ema_db"][f0:f1],
-        "snr_db":     feat["snr_db"][f0:f1],
-        "snr_norm":   feat["snr_norm"][f0:f1],
-        "n_frames":   f1 - f0,
-        "hop_sec":    feat["hop_sec"],
-        "freq_lo_hz": feat["freq_lo_hz"],
-        "freq_hi_hz": feat["freq_hi_hz"],
+        "full_spec":      feat["full_spec"][:, f0:f1],
+        "freqs":          feat["freqs"],
+        "peak_db":        feat["peak_db"][f0:f1],
+        "center_db":      feat["center_db"][f0:f1],
+        "mark_level_db":  feat["mark_level_db"][f0:f1],
+        "space_level_db": feat["space_level_db"][f0:f1],
+        "spread_db":      feat["spread_db"][f0:f1],
+        "output":         feat["output"][f0:f1],
+        "coherence":      feat["coherence"][f0:f1],
+        "n_frames":       f1 - f0,
+        "hop_sec":        feat["hop_sec"],
+        "freq_lo_hz":     feat["freq_lo_hz"],
+        "freq_hi_hz":     feat["freq_hi_hz"],
     }
 
 
@@ -246,7 +226,7 @@ def _plot_chunk(
     spec_vmin: float,
     spec_vmax: float,
 ) -> None:
-    """Render the 4-panel figure for one time chunk and save as PNG."""
+    """Render the 5-panel figure for one time chunk and save as PNG."""
     n_frames  = feat_chunk["n_frames"]
     hop_sec   = feat_chunk["hop_sec"]
     freqs     = feat_chunk["freqs"]
@@ -259,8 +239,8 @@ def _plot_chunk(
     spec_db = np.clip(spec_db, spec_vmin, spec_vmax)
 
     fig, axes = plt.subplots(
-        4, 1, figsize=(16, 12),
-        gridspec_kw={"height_ratios": [1, 2.5, 1.5, 1]},
+        5, 1, figsize=(16, 14),
+        gridspec_kw={"height_ratios": [1, 2.5, 1.5, 1, 1]},
     )
     fig.suptitle(title, fontsize=9, y=0.995)
 
@@ -292,7 +272,7 @@ def _plot_chunk(
     ax.axhspan(
         feat_chunk["freq_lo_hz"], feat_chunk["freq_hi_hz"],
         alpha=0.18, color="lime",
-        label=f"Monitored {cfg.freq_min}–{cfg.freq_max} Hz",
+        label=f"Monitored {cfg.freq_min}\u2013{cfg.freq_max} Hz",
     )
     ax.set_ylabel("Frequency (Hz)")
     ax.set_ylim(freqs[0], freqs[-1])
@@ -306,61 +286,81 @@ def _plot_chunk(
     ax.set_xticklabels([])
 
     # ------------------------------------------------------------------
-    # Panel 3: Signal power vs noise EMA  (left y)  +  SNR dB (right y)
+    # Panel 3: Peak energy vs adaptive threshold
     # ------------------------------------------------------------------
     ax = axes[2]
-    l1, = ax.plot(t_frames, feat_chunk["signal_db"], linewidth=0.6, color="steelblue",
-                  label="Signal power (dB)")
-    l2, = ax.plot(t_frames, feat_chunk["ema_db"],    linewidth=1.4, color="darkorange",
-                  label="Noise EMA floor (dB)")
-    l3, = ax.plot(t_frames, feat_chunk["noise_db"],  linewidth=0.3, color="gray",
-                  alpha=0.55, label="Instant noise estimate (dB)")
+    l1, = ax.plot(t_frames, feat_chunk["peak_db"], linewidth=0.5, color="steelblue",
+                  label="Peak bin energy (dB)")
+    l2, = ax.plot(t_frames, feat_chunk["center_db"], linewidth=1.6, color="darkorange",
+                  label="Adaptive threshold (dB)")
+    l3, = ax.plot(t_frames, feat_chunk["mark_level_db"], linewidth=0.8, color="green",
+                  alpha=0.6, linestyle="--", label="Mark level (p75)")
+    l4, = ax.plot(t_frames, feat_chunk["space_level_db"], linewidth=0.8, color="red",
+                  alpha=0.6, linestyle="--", label="Space level (p25)")
+
     ax.set_ylabel("Power (dB)")
     ax.set_xlim(t_frames[0], t_frames[-1])
     ax.grid(True, alpha=0.25)
-    ax.set_title("Signal power vs noise floor  (feature.py noise estimator)", fontsize=9)
+    ax.set_title("Peak energy vs adaptive threshold  (feature.py MorseFeatureExtractor)",
+                 fontsize=9)
     ax.set_xticklabels([])
 
+    # Right y-axis: spread
     ax2 = ax.twinx()
-    l4, = ax2.plot(t_frames, feat_chunk["snr_db"], linewidth=0.7, color="green",
-                   alpha=0.8, label="SNR (dB)")
-    ax2.axhline(cfg.snr_norm_center, color="green", linewidth=0.8,
-                linestyle="--", alpha=0.5,
-                label=f"tanh zero-cross ({cfg.snr_norm_center} dB)")
-    ax2.axhline(0.0, color="green", linewidth=0.5, linestyle=":", alpha=0.4)
-    ax2.set_ylabel("SNR (dB)", color="green")
-    ax2.tick_params(axis="y", labelcolor="green")
+    l5, = ax2.plot(t_frames, feat_chunk["spread_db"], linewidth=0.7, color="purple",
+                   alpha=0.5, label="Spread (dB)")
+    ax2.set_ylabel("Spread (dB)", color="purple")
+    ax2.tick_params(axis="y", labelcolor="purple")
 
-    lines  = [l1, l2, l3, l4]
+    lines  = [l1, l2, l3, l4, l5]
     labels = [l.get_label() for l in lines]
     ax.legend(lines, labels, loc="upper right", fontsize=7, framealpha=0.7)
 
     # ------------------------------------------------------------------
-    # Panel 4: Normalised SNR feature (tanh output — model input)
+    # Panel 4: Energy feature (tanh output — model input channel 0)
     # ------------------------------------------------------------------
     ax = axes[3]
-    snr_n = feat_chunk["snr_norm"]
-    ax.fill_between(t_frames, 0.0, snr_n, where=snr_n > 0,
-                    color="steelblue", alpha=0.65, label="Tone (SNR > 0)")
-    ax.fill_between(t_frames, snr_n, 0.0, where=snr_n < 0,
-                    color="lightcoral", alpha=0.65, label="Noise / silence")
-    ax.plot(t_frames, snr_n, linewidth=0.4, color="navy")
+    out = feat_chunk["output"]
+    ax.fill_between(t_frames, 0.0, out, where=out > 0,
+                    color="steelblue", alpha=0.65, label="Mark (output > 0)")
+    ax.fill_between(t_frames, out, 0.0, where=out < 0,
+                    color="lightcoral", alpha=0.65, label="Space (output < 0)")
+    ax.plot(t_frames, out, linewidth=0.4, color="navy")
     ax.axhline(0.0, color="black", linewidth=0.6)
     ax.set_ylim(-1.05, 1.05)
-    ax.set_ylabel("tanh(SNR norm)")
-    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Energy feature")
     ax.set_xlim(t_frames[0], t_frames[-1])
     ax.grid(True, alpha=0.25)
     ax.legend(loc="upper right", fontsize=7)
     ax.set_title(
-        f"Normalised SNR feature — model input  "
-        f"[tanh((SNR − {cfg.snr_norm_center}) / {cfg.snr_norm_scale})]", fontsize=9,
+        "Energy feature \u2014 model input ch0  "
+        "[tanh((peak \u2212 center) \u00d7 gain / spread)]", fontsize=9,
+    )
+    ax.set_xticklabels([])
+
+    # ------------------------------------------------------------------
+    # Panel 5: Phase coherence R — model input channel 1
+    # ------------------------------------------------------------------
+    ax = axes[4]
+    coh = feat_chunk["coherence"]
+    ax.fill_between(t_frames, 0.0, coh,
+                    color="mediumseagreen", alpha=0.55)
+    ax.plot(t_frames, coh, linewidth=0.5, color="darkgreen")
+    ax.axhline(0.5, color="gray", linewidth=0.6, linestyle="--", alpha=0.5)
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_ylabel("Coherence R")
+    ax.set_xlabel("Time (s)")
+    ax.set_xlim(t_frames[0], t_frames[-1])
+    ax.grid(True, alpha=0.25)
+    ax.set_title(
+        "Phase coherence \u2014 model input ch1  "
+        "[mean resultant length, K=7 frames]", fontsize=9,
     )
 
     plt.tight_layout(rect=[0, 0, 1, 0.995])
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  → {out_path}")
+    print(f"  -> {out_path}")
 
 
 def plot_file(
@@ -376,11 +376,11 @@ def plot_file(
 ) -> None:
     """Split audio/feature data into chunk_sec windows and save one PNG per chunk."""
 
-    hop_sec         = feat["hop_sec"]
-    frames_per_chunk = max(1, int(chunk_sec / hop_sec))
+    hop_sec           = feat["hop_sec"]
+    frames_per_chunk  = max(1, int(chunk_sec / hop_sec))
     samples_per_chunk = int(chunk_sec * TARGET_SR)
-    n_total_frames   = feat["n_frames"]
-    n_chunks         = max(1, math.ceil(n_total_frames / frames_per_chunk))
+    n_total_frames    = feat["n_frames"]
+    n_chunks          = max(1, math.ceil(n_total_frames / frames_per_chunk))
 
     # Global spectrogram colour scale (consistent across all chunks of one file)
     full_spec_db = 10.0 * np.log10(np.clip(feat["full_spec"], 1e-15, None))
@@ -403,7 +403,7 @@ def plot_file(
             base_title += f"\n\"{transcript[:100]}\""
     else:
         base_title = (
-            f"{path.name}  |  orig SR={orig_sr} Hz → {TARGET_SR} Hz  "
+            f"{path.name}  |  orig SR={orig_sr} Hz -> {TARGET_SR} Hz  "
             f"|  {len(audio)/TARGET_SR:.1f} s total"
         )
 
@@ -416,7 +416,7 @@ def plot_file(
         t_start = ci * chunk_sec
         t_end   = s1 / TARGET_SR
 
-        title    = f"{base_title}  |  chunk {ci+1}/{n_chunks}  [{t_start:.0f}–{t_end:.0f} s]"
+        title    = f"{base_title}  |  chunk {ci+1}/{n_chunks}  [{t_start:.0f}-{t_end:.0f} s]"
         out_path = out_dir / f"analysis_{path.stem}_{ci+1:02d}.png"
 
         _plot_chunk(
@@ -488,8 +488,7 @@ def main(argv=None) -> None:
 
     print(
         f"Feature config: window={cfg.window_ms:.0f} ms  hop={cfg.hop_ms:.0f} ms  "
-        f"freq={cfg.freq_min}–{cfg.freq_max} Hz  "
-        f"alpha={cfg.noise_ema_alpha}  exclude_top={cfg.noise_exclude_top_n}"
+        f"freq={cfg.freq_min}-{cfg.freq_max} Hz"
     )
     if max_frames:
         print(f"Display limit : {args.max_sec:.0f} s ({max_frames} frames)")
@@ -536,8 +535,9 @@ def main(argv=None) -> None:
         feat = extract_features_verbose(display_audio, cfg, max_frames=max_frames)
         print(
             f"  Frames    : {feat['n_frames']}  "
-            f"SNR range: {feat['snr_db'].min():.1f}–{feat['snr_db'].max():.1f} dB  "
-            f"feature: {feat['snr_norm'].min():.3f}–{feat['snr_norm'].max():.3f}"
+            f"spread: {feat['spread_db'].min():.1f}-{feat['spread_db'].max():.1f} dB  "
+            f"energy: {feat['output'].min():.3f} to {feat['output'].max():.3f}  "
+            f"coherence: {feat['coherence'].min():.3f} to {feat['coherence'].max():.3f}"
         )
 
         plot_file(

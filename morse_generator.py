@@ -383,6 +383,7 @@ def synthesize_audio(
     impulse_rate_hz: float = 0.0,
     impulse_amplitude: float = 3.0,
     qsb_depth_db: float = 0.0,
+    thermal_noise_db: float = 0.0,
 ) -> np.ndarray:
     """Render Morse elements to a float32 audio waveform.
 
@@ -394,7 +395,8 @@ def synthesize_audio(
       5. Mix signal + noise
       6. Impulsive noise injected (before IF filter — gets shaped into tone bursts)
       7. Narrowband IF filter applied
-      8. Normalise to target_amplitude
+      8. Thermal noise added (broadband, after filter — models receiver electronics)
+      9. Normalise to target_amplitude
 
     Parameters
     ----------
@@ -426,6 +428,11 @@ def synthesize_audio(
         Impulse amplitude relative to noise RMS.
     qsb_depth_db : float
         Peak-to-peak sinusoidal fading range (dB); 0 = disabled.
+    thermal_noise_db : float
+        Receiver thermal noise level, in dB below the in-band noise
+        power within ``narrowband_bw_hz`` (or full band if no filter).
+        Added broadband after the IF filter to replicate the audio-chain
+        electronics noise present at all output frequencies; 0 = disabled.
 
     Returns
     -------
@@ -505,6 +512,20 @@ def synthesize_audio(
     # ---- Narrowband bandpass filter (simulates IF filter) ---------------
     if narrowband_bw_hz > 0.0:
         audio = _apply_bandpass(audio, sample_rate, base_freq, narrowband_bw_hz)
+
+    # ---- Thermal (receiver) noise added after filter --------------------
+    # Models broadband electronics noise present at all output frequencies.
+    # Level is thermal_noise_db below the in-band noise power so that
+    # out-of-band bins sit ~20 dB below the noise floor in the passband,
+    # matching the -60 dB floor seen in real HF radio recordings.
+    if thermal_noise_db > 0.0:
+        bw = narrowband_bw_hz if narrowband_bw_hz > 0.0 else (sample_rate / 2.0)
+        sigma_thermal = (
+            noise_std
+            * math.sqrt(bw / (sample_rate / 2.0))
+            * 10.0 ** (-thermal_noise_db / 20.0)
+        )
+        audio = audio + rng.normal(0.0, sigma_thermal, len(audio)).astype(np.float32)
 
     # ---- Normalise to target amplitude ----------------------------------
     peak = np.max(np.abs(audio))
@@ -657,6 +678,7 @@ def generate_sample(
         impulse_rate_hz=impulse_rate_hz,
         impulse_amplitude=impulse_amplitude,
         qsb_depth_db=qsb_depth_db,
+        thermal_noise_db=config.thermal_noise_db,
     )
 
     metadata: Dict = {
@@ -675,6 +697,7 @@ def generate_sample(
         "agc_depth_db": agc_depth_db,
         "impulse_rate_hz": impulse_rate_hz,
         "qsb_depth_db": qsb_depth_db,
+        "thermal_noise_db": config.thermal_noise_db,
     }
     return audio_f32, text, metadata
 

@@ -119,13 +119,11 @@ def main(args: argparse.Namespace) -> None:
         checkpoint=args.checkpoint,
         chunk_size_ms=args.chunk_ms,
         device=args.device_torch,
-        noise_ema_alpha=args.noise_ema_alpha,
         beam_width=args.beam_width,
     )
 
     # Apply CLI frequency overrides to the extractor's config
     if args.freq_min is not None or args.freq_max is not None:
-        # Rebuild extractor with updated frequency range
         from config import FeatureConfig as FC
         d = decoder._extractor.config.to_dict()
         if args.freq_min is not None:
@@ -133,9 +131,8 @@ def main(args: argparse.Namespace) -> None:
         if args.freq_max is not None:
             d["freq_max"] = args.freq_max
         new_cfg = FC.from_dict(d)
-        alpha = decoder._extractor.noise_ema_alpha
         from feature import MorseFeatureExtractor as MFE
-        decoder._extractor = MFE(new_cfg, noise_ema_alpha=alpha)
+        decoder._extractor = MFE(new_cfg)
 
     print(
         f"Checkpoint  : {args.checkpoint}\n"
@@ -143,8 +140,6 @@ def main(args: argparse.Namespace) -> None:
         f"Freq range  : {decoder._extractor.config.freq_min}–"
         f"{decoder._extractor.config.freq_max} Hz  "
         f"({decoder._extractor.n_bins} bins)\n"
-        f"Noise alpha : {decoder.noise_ema_alpha:.4f}  "
-        f"(τ ≈ {1.0/(decoder._extractor.fps*(1-decoder.noise_ema_alpha)):.1f} s)\n"
         f"Beam width  : {decoder.beam_width}\n"
     )
 
@@ -230,11 +225,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--freq-max", type=int, default=None, metavar="HZ",
                    dest="freq_max",
                    help="Override monitoring range upper bound (Hz)")
-
-    # Noise EMA
-    p.add_argument("--noise-ema-alpha", type=float, default=None, metavar="ALPHA",
-                   dest="noise_ema_alpha",
-                   help="Noise floor EMA alpha [0–0.9999]; higher = slower tracking")
 
     # Decoding
     p.add_argument("--chunk-ms", type=float, default=100.0, metavar="MS",

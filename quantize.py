@@ -64,6 +64,7 @@ def _load_model(checkpoint: str, device: torch.device) -> tuple:
     model_cfg = ModelConfig.from_dict(cfg["model"])
 
     model = MorseCTCModel(
+        in_channels=model_cfg.in_channels,
         cnn_channels=model_cfg.cnn_channels,
         cnn_time_pools=model_cfg.cnn_time_pools,
         cnn_dilations=model_cfg.cnn_dilations,
@@ -84,12 +85,12 @@ def _make_dummy_snr(
     chunk_sec: float = 0.5,
     device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
-    """Create a representative SNR ratio input for benchmarking."""
+    """Create a representative feature input for benchmarking."""
     hop_ms = feature_cfg.hop_ms
     fps = 1000.0 / hop_ms
     n_frames = max(1, int(chunk_sec * fps))
-    # Shape: (batch=1, channels=1, time)
-    return torch.randn(1, 1, n_frames, device=device)
+    # Shape: (batch=1, in_channels, time)
+    return torch.randn(1, model_cfg.in_channels, n_frames, device=device)
 
 
 def _benchmark(
@@ -186,7 +187,7 @@ def export_onnx(
     fps = 1000.0 / hop_ms
     n_frames = max(1, int(chunk_sec * fps))
 
-    dummy_snr = torch.randn(1, 1, n_frames)
+    dummy_snr = torch.randn(1, model_cfg.in_channels, n_frames)
     dummy_hidden = torch.zeros(model_cfg.n_rnn_layers, 1, model_cfg.hidden_size)
 
     model.eval()

@@ -79,20 +79,21 @@ class StreamingMorseDataset(IterableDataset):
         self.seed = seed
         self.wordlist = load_wordlist()
         self._pool_factor = config.model.pool_factor
+        self._in_channels = config.model.in_channels
 
     # ------------------------------------------------------------------
     # Iteration
     # ------------------------------------------------------------------
 
     def __iter__(self) -> Iterator[Tuple[Tensor, Tensor, str]]:
-        """Yield ``(snr_series, target_tensor, transcript)`` tuples.
+        """Yield ``(features, target_tensor, transcript)`` tuples.
 
-        snr_series    : FloatTensor ``(1, T_frames)`` — single-channel input
+        features      : FloatTensor ``(in_channels, T_frames)``
         target_tensor : LongTensor  ``(target_len,)``
         transcript    : raw text string
         """
         rng = self._make_rng()
-        # One feature extractor per worker (stateful overlap buffer + noise EMA)
+        # One feature extractor per worker (stateful overlap buffer)
         extractor = MorseFeatureExtractor(self.feature_cfg)
 
         worker_info = torch.utils.data.get_worker_info()
@@ -100,6 +101,8 @@ class StreamingMorseDataset(IterableDataset):
             per_worker = math.ceil(self.epoch_size / worker_info.num_workers)
         else:
             per_worker = self.epoch_size
+
+        in_ch = self._in_channels
 
         yielded = 0
         while yielded < per_worker:
@@ -110,12 +113,11 @@ class StreamingMorseDataset(IterableDataset):
             except Exception:
                 continue   # skip rare synthesis failures silently
 
-            # Reset feature extractor between samples so noise EMA from
-            # one sample does not contaminate the next
+            # Reset feature extractor between samples
             extractor.reset()
-            ratios = extractor.process_chunk(audio_f32)   # shape (T_frames,)
+            features = extractor.process_chunk(audio_f32)  # (T_frames, 2)
 
-            if len(ratios) == 0:
+            if len(features) == 0:
                 continue
 
             # ---- Text → target indices ----------------------------------
@@ -126,14 +128,17 @@ class StreamingMorseDataset(IterableDataset):
 
             # ---- CTC feasibility guard ----------------------------------
             # CTC requires: output_frames ≥ target_length
-            t_frames = len(ratios)
+            t_frames = len(features)
             out_frames = max(1, t_frames // self._pool_factor)
             if out_frames < len(target_indices):
                 continue   # audio too short for this transcript — skip
 
-            snr_tensor = torch.from_numpy(ratios).unsqueeze(0)   # (1, T_frames)
+            # (T_frames, 2) → (in_channels, T_frames)
+            feat_tensor = torch.from_numpy(
+                features[:, :in_ch].T.copy()
+            )  # (in_channels, T_frames)
 
-            yield snr_tensor, target_tensor, text
+            yield feat_tensor, target_tensor, text
             yielded += 1
 
     def __len__(self) -> int:
@@ -164,28 +169,29 @@ def collate_fn(
     """Pad a mixed-length batch into fixed tensors for CTC training.
 
     Args:
-        batch: List of ``(snr_series, target_tensor, text)`` tuples as
+        batch: List of ``(features, target_tensor, text)`` tuples as
             yielded by :class:`StreamingMorseDataset`.
 
     Returns:
-        ``(snr_padded, targets_padded, snr_lengths, target_lengths, texts)``
+        ``(feat_padded, targets_padded, feat_lengths, target_lengths, texts)``
 
-        - ``snr_padded``     — ``(B, 1, max_T)``  float32 — padded SNR series
+        - ``feat_padded``    — ``(B, C, max_T)``  float32 — padded feature series
         - ``targets_padded`` — ``(B, max_S)``      int64
-        - ``snr_lengths``    — ``(B,)``            int64  (frames before padding)
+        - ``feat_lengths``   — ``(B,)``            int64  (frames before padding)
         - ``target_lengths`` — ``(B,)``            int64  (chars before padding)
         - ``texts``          — list of raw transcript strings
     """
-    snrs, targets, texts = zip(*batch)
+    feats, targets, texts = zip(*batch)
 
-    snr_lengths    = torch.tensor([s.shape[-1] for s in snrs],    dtype=torch.long)
+    in_ch = feats[0].shape[0]   # number of channels
+    feat_lengths   = torch.tensor([f.shape[-1] for f in feats],   dtype=torch.long)
     target_lengths = torch.tensor([t.shape[0]  for t in targets], dtype=torch.long)
 
-    # Pad SNR series: (B, 1, max_T)
-    max_t = int(snr_lengths.max().item())
-    snr_pad = torch.zeros(len(snrs), 1, max_t, dtype=torch.float32)
-    for i, s in enumerate(snrs):
-        snr_pad[i, :, :s.shape[-1]] = s
+    # Pad feature series: (B, C, max_T)
+    max_t = int(feat_lengths.max().item())
+    feat_pad = torch.zeros(len(feats), in_ch, max_t, dtype=torch.float32)
+    for i, f in enumerate(feats):
+        feat_pad[i, :, :f.shape[-1]] = f
 
     # Pad target sequences: (B, max_S)
     max_s = int(target_lengths.max().item())
@@ -193,7 +199,7 @@ def collate_fn(
     for i, t in enumerate(targets):
         targets_pad[i, :t.shape[0]] = t
 
-    return snr_pad, targets_pad, snr_lengths, target_lengths, list(texts)
+    return feat_pad, targets_pad, feat_lengths, target_lengths, list(texts)
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +213,10 @@ if __name__ == "__main__":
     ds = StreamingMorseDataset(cfg, epoch_size=8)
     loader = DataLoader(ds, batch_size=4, collate_fn=collate_fn, num_workers=0)
 
-    for snr, targets, slens, tlens, texts in loader:
-        print(f"snr    : {snr.shape}   (1 channel, {snr.shape[-1]} frames)")
+    for feat, targets, flens, tlens, texts in loader:
+        print(f"feat   : {feat.shape}   ({feat.shape[1]} channels, {feat.shape[-1]} frames)")
         print(f"targets: {targets.shape}")
-        print(f"slens  : {slens.tolist()}")
+        print(f"flens  : {flens.tolist()}")
         print(f"tlens  : {tlens.tolist()}")
         print(f"texts  : {texts[:2]}")
         fps_out = cfg.feature.fps / cfg.model.pool_factor

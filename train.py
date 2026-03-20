@@ -201,6 +201,7 @@ def train(args: argparse.Namespace) -> None:
     # ---- Model -----------------------------------------------------------
     mcfg = config.model
     model = MorseCTCModel(
+        in_channels=mcfg.in_channels,
         cnn_channels=mcfg.cnn_channels,
         cnn_time_pools=mcfg.cnn_time_pools,
         cnn_dilations=mcfg.cnn_dilations,
@@ -215,6 +216,8 @@ def train(args: argparse.Namespace) -> None:
     fps_out = fps_in / model.pool_factor
     print(
         f"Parameters   : {model.num_params:,}\n"
+        f"Input ch     : {mcfg.in_channels}  "
+        f"({'energy + coherence' if mcfg.in_channels == 2 else 'energy only'})\n"
         f"Frame rate   : {fps_in:.0f} fps in → {fps_out:.0f} fps out  "
         f"(pool×{model.pool_factor})\n"
         f"Hop          : {config.feature.hop_ms:.1f} ms  "
@@ -232,17 +235,17 @@ def train(args: argparse.Namespace) -> None:
         collate_fn=collate_fn,
         num_workers=config.training.num_workers,
         pin_memory=(device.type == "cuda"),
-        prefetch_factor=2 if config.training.num_workers > 0 else None,
+        prefetch_factor=4 if config.training.num_workers > 0 else None,
         persistent_workers=(config.training.num_workers > 0),
     )
-    val_workers = min(2, config.training.num_workers)
+    val_workers = min(4, config.training.num_workers)
     val_loader = DataLoader(
         val_ds,
         batch_size=config.training.batch_size,
         collate_fn=collate_fn,
         num_workers=val_workers,
         pin_memory=(device.type == "cuda"),
-        prefetch_factor=2 if val_workers > 0 else None,
+        prefetch_factor=4 if val_workers > 0 else None,
         persistent_workers=(val_workers > 0),
     )
 

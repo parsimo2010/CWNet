@@ -88,6 +88,13 @@ class MorseConfig:
     narrowband_bw_min_hz: float = 150.0
     narrowband_bw_max_hz: float = 500.0
 
+    # Receiver thermal noise — broadband noise added after the IF filter.
+    # Models audio-chain electronics noise present at all output frequencies.
+    # Level is expressed as dB below the estimated in-band atmospheric noise.
+    # Creates the ~30 dB in-band / out-of-band noise floor difference seen in
+    # real HF radio recordings.  0 = disabled.
+    thermal_noise_db: float = 0.0
+
     # AGC simulation — noise-floor modulation matching real HF radio AGC.
     # During marks the AGC reduces gain → background noise is suppressed.
     # During spaces the AGC releases → noise rises to full level over release_ms.
@@ -128,23 +135,21 @@ class MorseConfig:
 
 @dataclass
 class FeatureConfig:
-    """STFT-based SNR-ratio feature extraction parameters.
+    """STFT-based adaptive threshold feature extraction parameters.
 
     The extractor computes a per-frame scalar:
-      snr_db  = 10*log10(peak_bin_energy / noise_ema)
-      output  = tanh((snr_db - snr_norm_center) / snr_norm_scale)
+      peak_db   = 10*log10(max_bin_energy)
+      threshold = (p25 + p75) / 2   from sliding window of peak energies
+      spread    = max(p75 - p25, 10 dB)
+      output    = tanh((peak_db - threshold) * 3 / spread)
 
-    Noise estimation:
-      1. Sort all monitored bins by energy (descending).
-      2. Exclude the top noise_exclude_top_n bins unconditionally (signal
-         protection — always at least 2).
-      3. Of the remaining bins, keep only those within 30 dB of the strongest
-         remaining bin (eliminates near-zero filter-artifact bins while
-         preserving all real noise bins regardless of SNR).
-      4. Apply EMA smoothing with alpha = noise_ema_alpha.
+    This is inherently AGC-immune: the percentile-based threshold tracks
+    any shifts in absolute amplitude automatically.  No explicit noise
+    floor estimation is required.
 
-    The noise_ema_alpha is exposed as a runtime-settable property so it can
-    be adjusted at inference time without reloading the model.
+    Legacy fields (noise_ema_alpha, snr_norm_center, snr_norm_scale,
+    noise_exclude_top_n) are retained for checkpoint compatibility but
+    are not used by the current feature extractor.
     """
 
     # Must match MorseConfig.sample_rate; audio resampled to this at inference
@@ -165,15 +170,21 @@ class FeatureConfig:
     snr_norm_center: float = 10.0
     snr_norm_scale: float = 8.0
 
-    # Noise EMA alpha (configurable at inference time without reloading)
+    # Noise EMA alpha — controls the RISE direction of the noise floor EMA.
+    # The DROP direction always uses a fast fixed alpha (0.70, τ≈17 ms).
+    # Configurable at inference time without reloading.
     # time_constant_sec ≈ 1 / (fps × (1 − alpha))
-    # alpha=0.990 → τ ≈ 0.50 s at 200 fps  (fast noise tracking)
-    # alpha=0.999 → τ ≈ 5.0 s at 200 fps  (slow noise tracking)
-    noise_ema_alpha: float = 0.995
+    # alpha=0.90  → τ ≈  50 ms at 200 fps  (responsive)
+    # alpha=0.95  → τ ≈ 100 ms at 200 fps  (default; good balance)
+    # alpha=0.97  → τ ≈ 170 ms at 200 fps  (more smoothing)
+    # alpha=0.99  → τ ≈ 500 ms at 200 fps  (slow; stable RF environments)
+    noise_ema_alpha: float = 0.95
 
-    # Number of top-energy bins always excluded from noise estimation
-    # (signal bin + primary leakage bins); minimum 2
-    noise_exclude_top_n: int = 2
+    # Number of top-energy bins always excluded from noise estimation.
+    # A Hann window leaks signal energy to the two adjacent bins (±1) at
+    # -6 dB, so the minimum is 3 (signal + 2 Hann sidelobes).
+    # MorseFeatureExtractor enforces max(3, noise_exclude_top_n).
+    noise_exclude_top_n: int = 3
 
     @property
     def fps(self) -> float:
@@ -196,17 +207,23 @@ class FeatureConfig:
 class ModelConfig:
     """1D causal dilated CNN + GRU model architecture parameters.
 
-    The CNN operates on a single-channel (scalar SNR ratio) time series.
-    Causal left-only padding ensures each output frame depends only on
-    past and current inputs, enabling chunk-by-chunk streaming inference.
+    The CNN operates on a multi-channel time series (energy + phase
+    coherence).  Causal left-only padding ensures each output frame
+    depends only on past and current inputs, enabling chunk-by-chunk
+    streaming inference.
 
     Default (~260 K parameters):
+      in_channels = 1 (backward compat; new training uses 2)
       cnn_channels = (32, 64, 64)
       cnn_time_pools = (2, 1, 1)  → 2× downsampling after block 1 → 100 fps
       cnn_kernel_size = 7
       cnn_dilations = (1, 2, 4)   → growing receptive field per block
       proj_size = 128, hidden_size = 128, n_rnn_layers = 2
     """
+
+    # Number of input channels (1 = energy only, 2 = energy + coherence)
+    # Default 1 for backward compatibility with old checkpoints.
+    in_channels: int = 1
 
     # CNN channel counts (one per block; length = number of blocks)
     cnn_channels: Tuple[int, ...] = (32, 64, 64)
@@ -354,6 +371,9 @@ def create_default_config(scenario: str = "clean") -> Config:
     """
     cfg = Config()
 
+    # All scenarios use 2-channel input (energy + phase coherence)
+    cfg.model.in_channels = 2
+
     if scenario == "test":
         cfg.morse.min_snr_db = 20.0
         cfg.morse.max_snr_db = 40.0
@@ -393,14 +413,15 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.noise_color_probability = 0.0
         cfg.morse.narrowband_probability = 1.0
         cfg.morse.tone_drift = 3.0
-        cfg.training.batch_size = 96
-        cfg.training.learning_rate = 5e-4   # √3 × 3e-4, scaled for 3× batch
+        cfg.training.batch_size = 256
+        cfg.training.learning_rate = 8e-4   # √(256/96) × 5e-4, sqrt-scaled
         cfg.training.num_epochs = 200
         cfg.training.samples_per_epoch = 15000
         cfg.training.val_samples = 1500
-        cfg.training.num_workers = 8
+        cfg.training.num_workers = 12
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (mild — model learns basic task first)
+        cfg.morse.thermal_noise_db = 20.0   # broadband floor ~60 dB below signal peak
         cfg.morse.agc_probability = 0.3
         cfg.morse.impulse_noise_probability = 0.2
         cfg.morse.impulse_rate_max = 3.0
@@ -423,14 +444,15 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.noise_color_probability = 0.3   # 30% pink/brown noise
         cfg.morse.narrowband_probability = 1.0    # all samples narrowband
         cfg.morse.tone_drift = 5.0
-        cfg.training.batch_size = 96
-        cfg.training.learning_rate = 5e-4   # √3 × 3e-4, scaled for 3× batch
+        cfg.training.batch_size = 256
+        cfg.training.learning_rate = 8e-4   # √(256/96) × 5e-4, sqrt-scaled
         cfg.training.num_epochs = 500
         cfg.training.samples_per_epoch = 24000
         cfg.training.val_samples = 2400
-        cfg.training.num_workers = 8
+        cfg.training.num_workers = 12
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (full strength for curriculum stage 2)
+        cfg.morse.thermal_noise_db = 20.0   # broadband floor ~60 dB below signal peak
         cfg.morse.agc_probability = 0.7
         cfg.morse.agc_depth_db_max = 18.0
         cfg.morse.impulse_noise_probability = 0.5

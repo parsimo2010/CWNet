@@ -8,8 +8,8 @@ modelling power of a neural network trained end-to-end with CTC loss.
 
 | Aspect | Decision | Rationale |
 |---|---|---|
-| **Input** | 1D SNR ratio time series | AGC-immune; tracks signal peak bin automatically |
-| **Feature** | `10*log10(peak_bin / noise_ema)` | Same principle as MorseDecode ratio detector |
+| **Input** | 2-channel time series (energy + phase coherence) | AGC-immune; tracks signal peak bin automatically |
+| **Feature** | Adaptive threshold energy + phase coherence R | Percentile-based mark/space + tone confidence |
 | **Model** | 1D causal dilated CNN + unidirectional GRU | Streaming-friendly; ~260 K params |
 | **Loss** | CTC | No pre-segmented labels; learns timing end-to-end |
 | **Deployment** | ONNX + INT8 dynamic quantization | Runs on Raspberry Pi Zero 2W |
@@ -17,9 +17,10 @@ modelling power of a neural network trained end-to-end with CTC loss.
 ## Architecture
 
 ```
-Input: (batch, 1, T)          ← scalar SNR ratio, ~200 fps (5 ms hop)
+Input: (batch, 2, T)          ← 2-channel features, ~200 fps (5 ms hop)
+│                                ch0: energy (mark/space), ch1: phase coherence
 │
-├─ CausalConv1dBlock 1: 1→32,  kernel=7, dilation=1, MaxPool(2×)  → T/2 = 100 fps
+├─ CausalConv1dBlock 1: 2→32,  kernel=7, dilation=1, MaxPool(2×)  → T/2 = 100 fps
 ├─ CausalConv1dBlock 2: 32→64, kernel=7, dilation=2
 ├─ CausalConv1dBlock 3: 64→64, kernel=7, dilation=4
 │   effective receptive field ≈ 405 ms
@@ -34,24 +35,51 @@ Input: (batch, 1, T)          ← scalar SNR ratio, ~200 fps (5 ms hop)
 ## Feature Extraction
 
 The STFT (50 ms window, 5 ms hop) is computed over a configurable frequency range.
-Per frame:
+At the default 8 kHz sample rate this gives a 20 Hz/bin resolution.
 
-1. **Signal power** = energy of the highest bin (auto-tracks frequency drift)
-2. **Noise estimate** = EMA-smoothed mean of remaining bins, after:
-   - Always excluding the top `noise_exclude_top_n` (≥ 2) bins (signal + leakage)
-   - Excluding bins more than 30 dB below the strongest remaining bin (filter artifacts)
-3. **SNR (dB)** = `10 × log10(signal / noise_ema)`
-4. **Normalised output** = `tanh((snr_db − 10) / 8)` → range ≈ (−1, 1)
+### Adaptive threshold mark/space detection
 
-The 30 dB gap criterion correctly handles narrowband IF filters (150–500 Hz) without
-underestimating the noise floor at high SNR.
+The feature extractor uses a sliding-window adaptive threshold that is
+inherently AGC-immune and requires no explicit noise floor estimation:
 
-The `noise_ema_alpha` is **configurable at inference time** without reloading the model:
+1. **Peak bin energy** = max power in the monitored frequency range (dB).
+   Auto-tracks frequency drift.
+2. **Sliding window** (~5 seconds / 1000 frames) of recent peak energies.
+3. **Adaptive threshold** from window percentiles:
+   - p25 = 25th percentile ≈ space level
+   - p75 = 75th percentile ≈ mark level
+   - threshold = (p25 + p75) / 2
+   - spread = max(p75 − p25, 10 dB minimum)
+4. **Normalised output** = `tanh((peak_dB − threshold) × 3 / spread)`
+   → approximately +0.9 during marks, −0.9 during spaces.
 
-```python
-decoder.noise_ema_alpha = 0.999   # slower tracking for stable environments
-decoder.noise_ema_alpha = 0.99    # faster tracking for dynamic noise floors
-```
+| Scenario | Effect |
+|---|---|
+| AGC changes overall level | Percentiles track the shift; output stays centred |
+| Strong signal (high SNR) | Large spread → lower gain; output ≈ ±0.9 |
+| Weak signal (low SNR) | Small spread (clamped to 10 dB) → output ≈ ±0.7 |
+| Long mark or long silence | Percentiles robust; output stays saturated |
+| Noise only (no signal) | Spread ≈ 2–3 dB, clamped to 10 → output fluctuates ±0.3 |
+| Startup (first ~0.5 s) | Percentiles converge as marks/spaces accumulate |
+
+### Phase coherence (channel 1)
+
+The second input channel provides tone confidence via the **mean resultant
+length** R of frame-to-frame phase differences at the peak frequency bin:
+
+1. Extract the phase angle of the peak FFT bin each frame.
+2. Compute the phase difference from the previous frame, wrapped to [-π, π].
+3. Over a sliding window of K=7 frames (35 ms):
+   R = |mean(exp(j × Δφ))| — the mean resultant length.
+
+| Scenario | R value |
+|---|---|
+| Coherent tone (mark) | R ≈ 0.95–1.0 (consistent phase advance) |
+| Noise only (space) | R ≈ 0.2–0.4 (random phase) |
+| Noise spike (impulse) | Brief R rise, but no sustained pattern |
+
+This helps the model distinguish true marks from noise spikes that might
+fool the energy channel alone, particularly at low SNR.
 
 ## Training Data
 
@@ -185,7 +213,6 @@ from inference import CausalStreamingDecoder
 dec = CausalStreamingDecoder(
     "checkpoints/best_model.pt",
     chunk_size_ms=100,
-    noise_ema_alpha=0.995,   # configurable at runtime
     beam_width=1,            # greedy; use 10 for better accuracy
 )
 
@@ -197,9 +224,6 @@ for pcm_chunk in audio_source.stream():
     text = dec.process_chunk(pcm_chunk)
     if text:
         print(text, end="", flush=True)
-
-# Adjust noise tracking speed on the fly
-dec.noise_ema_alpha = 0.999
 ```
 
 ## Deployment (Raspberry Pi)
@@ -231,7 +255,7 @@ feature extractor and GRU state.
 | `config.py` | `MorseConfig`, `FeatureConfig`, `ModelConfig`, `TrainingConfig` |
 | `vocab.py` | 52-class CTC vocabulary + greedy/beam decode utilities |
 | `morse_table.py` | ITU Morse code table + binary trie |
-| `feature.py` | STFT → SNR ratio feature extractor |
+| `feature.py` | STFT → adaptive threshold feature extractor |
 | `morse_generator.py` | Synthetic Morse audio generator |
 | `model.py` | 1D causal CNN + GRU CTC model |
 | `dataset.py` | Streaming on-the-fly training dataset |

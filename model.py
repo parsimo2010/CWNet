@@ -2,11 +2,12 @@
 model.py — 1D causal dilated CNN + GRU model with CTC output for CWNet.
 
 Architecture overview:
-  Input : (batch, 1, T)   — scalar SNR-ratio time series, ~200 fps
+  Input : (batch, C, T)   — C-channel feature time series, ~200 fps
+                             C=2: energy (mark/space) + phase coherence
 
   1. 1D CNN frontend
      Three ``CausalConv1dBlock`` modules with growing dilation:
-       Block 1: channels 1→32,  kernel=7, dilation=1, MaxPool(2×) → T/2
+       Block 1: channels C→32,  kernel=7, dilation=1, MaxPool(2×) → T/2
        Block 2: channels 32→64, kernel=7, dilation=2
        Block 3: channels 64→64, kernel=7, dilation=4
      Causal left-only padding ensures no future frames are accessed.
@@ -119,6 +120,8 @@ class MorseCTCModel(nn.Module):
     """1D causal CNN + GRU model for Morse code CTC decoding.
 
     Args:
+        in_channels: Number of input feature channels (1 = energy only,
+            2 = energy + phase coherence).
         cnn_channels: Output channel counts per CNN block.
         cnn_time_pools: Time-axis MaxPool stride per block.  Length must
             equal ``len(cnn_channels)``.
@@ -134,6 +137,7 @@ class MorseCTCModel(nn.Module):
 
     def __init__(
         self,
+        in_channels: int = 1,
         cnn_channels: Sequence[int] = (32, 64, 64),
         cnn_time_pools: Sequence[int] = (2, 1, 1),
         cnn_dilations: Sequence[int] = (1, 2, 4),
@@ -153,10 +157,11 @@ class MorseCTCModel(nn.Module):
 
         self.causal = True   # always causal; field kept for ONNX / quantize compat
         self.hidden_size = hidden_size
+        self.in_channels = in_channels
 
         # ---- CNN frontend ------------------------------------------------
         blocks: List[nn.Module] = []
-        in_ch = 1
+        in_ch = in_channels
         for out_ch, pool, dil in zip(cnn_channels, cnn_time_pools, cnn_dilations):
             blocks.append(
                 CausalConv1dBlock(
@@ -239,7 +244,7 @@ class MorseCTCModel(nn.Module):
         """Full-sequence forward pass.
 
         Args:
-            x: SNR ratio time series, shape ``(batch, 1, time)``.
+            x: Feature time series, shape ``(batch, in_channels, time)``.
             lengths: Input frame counts before padding, shape ``(batch,)``.
                 If ``None`` all frames are treated as valid.
 
@@ -294,7 +299,7 @@ class MorseCTCModel(nn.Module):
         is negligible (< 5 % of output frames for typical kernel sizes).
 
         Args:
-            x: SNR ratio chunk, shape ``(batch, 1, T_chunk)``.
+            x: Feature chunk, shape ``(batch, in_channels, T_chunk)``.
             hidden: GRU hidden state from the previous call,
                 ``(n_layers, batch, hidden_size)``, or ``None`` to start a
                 new utterance (zeros initialisation).
@@ -329,10 +334,12 @@ class MorseCTCModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from config import ModelConfig
+    from config import ModelConfig, create_default_config
 
-    mcfg = ModelConfig()
+    cfg = create_default_config("clean")
+    mcfg = cfg.model
     model = MorseCTCModel(
+        in_channels=mcfg.in_channels,
         cnn_channels=mcfg.cnn_channels,
         cnn_time_pools=mcfg.cnn_time_pools,
         cnn_dilations=mcfg.cnn_dilations,
@@ -343,6 +350,7 @@ if __name__ == "__main__":
         dropout=mcfg.dropout,
     )
 
+    print(f"in_channels : {model.in_channels}")
     print(f"Parameters  : {model.num_params:,}")
     print(f"pool_factor : {model.pool_factor}")
     fps_in = 1000.0 / 5.0   # 5 ms hop → 200 fps
@@ -350,14 +358,15 @@ if __name__ == "__main__":
 
     # Full forward pass
     B, T = 4, 400   # 400 frames = 2 s at 200 fps
-    x = torch.randn(B, 1, T)
+    C = mcfg.in_channels
+    x = torch.randn(B, C, T)
     lens = torch.tensor([400, 380, 350, 300])
     lp, ol = model(x, lens)
     print(f"\nforward()  log_probs={lp.shape}  out_lens={ol.tolist()}")
 
     # Streaming step
     h = None
-    chunk = torch.randn(1, 1, 40)   # 40 frames = 200 ms at 200 fps
+    chunk = torch.randn(1, C, 40)   # 40 frames = 200 ms at 200 fps
     lp_s, h = model.streaming_step(chunk, h)
     print(f"streaming_step() log_probs={lp_s.shape}  hidden={h.shape}")
 
