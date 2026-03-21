@@ -655,6 +655,11 @@ def generate_sample(
             iws_factor=iws_factor,
         )
 
+    # ---- Calculate noise standard deviation for silence period ----------
+    # This matches the calculation in synthesize_audio() based on signal power and SNR
+    sig_power = 0.5 * target_amplitude ** 2  # Approximate carrier power at target amplitude
+    noise_std = math.sqrt(sig_power / (10.0 ** (snr_db / 10.0))) if sig_power > 1e-12 else 0.01
+
     # ---- Trailing silence -----------------------------------------------
     trailing_sec = 0.0
     if config.trailing_silence_max_sec > 0.0:
@@ -680,6 +685,23 @@ def generate_sample(
         qsb_depth_db=qsb_depth_db,
         thermal_noise_db=config.thermal_noise_db,
     )
+
+    # Prepend 0.75 seconds of noise-only silence before the audio content
+    silence_samples = int(0.75 * config.sample_rate)
+    
+    # Generate noise for the silence period with same parameters as main signal
+    if noise_color == 0:
+        silence_noise = rng.normal(0.0, noise_std, silence_samples).astype(np.float32)
+    else:
+        silence_noise = (_colored_noise(silence_samples, rng, noise_color) * noise_std).astype(np.float32)
+    
+    # Apply AGC modulation to silence (noise should be at full level during silence)
+    if agc_depth_db > 0.0:
+        # During silence, signal envelope is ~0, so noise gain = 1.0 (full amplitude)
+        # No change needed - noise stays at full amplitude
+        pass
+    
+    audio_f32 = np.concatenate([silence_noise, audio_f32])
 
     metadata: Dict = {
         "wpm": wpm,

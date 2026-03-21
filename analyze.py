@@ -115,8 +115,10 @@ def extract_features_verbose(
         mark_level_db   (n_frames,)            — 75th percentile (dB)
         space_level_db  (n_frames,)            — 25th percentile (dB)
         spread_db       (n_frames,)            — mark-space spread (dB)
-        output          (n_frames,)            — tanh-normalised energy feature
+        energy          (n_frames,)            — tanh-normalised energy feature E
         coherence       (n_frames,)            — phase coherence R (0–1)
+        combined        (n_frames,)            — combined mark probability:
+                                                E × (α + β×R) / (α + β)
         n_frames        int
         hop_sec         float
         freq_lo_hz      float
@@ -156,8 +158,10 @@ def extract_features_verbose(
 
     # ----------------------------------------------------------------
     # Feature extraction via MorseFeatureExtractor (record_diagnostics=True)
+    # Note: use_combined=False to get both energy and coherence separately
+    # for computing the combined feature manually.
     # ----------------------------------------------------------------
-    fe = MorseFeatureExtractor(cfg, record_diagnostics=True)
+    fe = MorseFeatureExtractor(cfg, use_combined=False, record_diagnostics=True)
     audio_slice = audio[:(n_frames_cap - 1) * hop_samples + window_samples]
     fe.process_chunk(audio_slice)
     fe.flush()
@@ -170,8 +174,16 @@ def extract_features_verbose(
     mark_level_db = np.array([d["mark_level_db"]  for d in diags[:n_out]], dtype=np.float64)
     space_level_db= np.array([d["space_level_db"] for d in diags[:n_out]], dtype=np.float64)
     spread_db     = np.array([d["spread_db"]      for d in diags[:n_out]], dtype=np.float64)
-    output        = np.array([d["output"]          for d in diags[:n_out]], dtype=np.float32)
+
+    # Extract energy (E) and coherence (R) from diagnostics
+    energy        = np.array([d["energy"]          for d in diags[:n_out]], dtype=np.float32)
     coherence     = np.array([d["coherence"]       for d in diags[:n_out]], dtype=np.float32)
+
+    # Compute combined feature: E × (α + β×R) / (α + β)
+    # α=2.0, β=1.0 gives more weight to energy while still penalizing low coherence
+    alpha = 2.0
+    beta = 1.0
+    combined = energy * (alpha + beta * coherence) / (alpha + beta)
 
     return {
         "full_spec":      full_spec[:, :n_out],
@@ -181,8 +193,9 @@ def extract_features_verbose(
         "mark_level_db":  mark_level_db,
         "space_level_db": space_level_db,
         "spread_db":      spread_db,
-        "output":         output,
+        "energy":         energy,
         "coherence":      coherence,
+        "combined":       combined,
         "n_frames":       n_out,
         "hop_sec":        hop_samples / sr,
         "freq_lo_hz":     float(freqs[freq_lo]),
@@ -199,7 +212,7 @@ CHUNK_SEC = 5.0   # seconds per output PNG
 
 def _slice_feat(feat: dict, f0: int, f1: int) -> dict:
     """Return a shallow copy of feat containing only frame slice [f0, f1)."""
-    return {
+    result = {
         "full_spec":      feat["full_spec"][:, f0:f1],
         "freqs":          feat["freqs"],
         "peak_db":        feat["peak_db"][f0:f1],
@@ -207,13 +220,21 @@ def _slice_feat(feat: dict, f0: int, f1: int) -> dict:
         "mark_level_db":  feat["mark_level_db"][f0:f1],
         "space_level_db": feat["space_level_db"][f0:f1],
         "spread_db":      feat["spread_db"][f0:f1],
-        "output":         feat["output"][f0:f1],
         "coherence":      feat["coherence"][f0:f1],
         "n_frames":       f1 - f0,
         "hop_sec":        feat["hop_sec"],
         "freq_lo_hz":     feat["freq_lo_hz"],
         "freq_hi_hz":     feat["freq_hi_hz"],
     }
+    # Include 'energy' and 'combined' if present (new in updated version)
+    if "energy" in feat:
+        result["energy"] = feat["energy"][f0:f1]
+    if "combined" in feat:
+        result["combined"] = feat["combined"][f0:f1]
+    # Legacy 'output' key for backward compatibility
+    if "output" in feat:
+        result["output"] = feat["output"][f0:f1]
+    return result
 
 
 def _plot_chunk(
@@ -226,7 +247,10 @@ def _plot_chunk(
     spec_vmin: float,
     spec_vmax: float,
 ) -> None:
-    """Render the 5-panel figure for one time chunk and save as PNG."""
+    """Render the figure for one time chunk and save as PNG.
+
+    Shows energy feature, coherence, and combined mark probability features.
+    """
     n_frames  = feat_chunk["n_frames"]
     hop_sec   = feat_chunk["hop_sec"]
     freqs     = feat_chunk["freqs"]
@@ -238,9 +262,14 @@ def _plot_chunk(
     spec_db = 10.0 * np.log10(np.clip(full_spec, 1e-15, None))
     spec_db = np.clip(spec_db, spec_vmin, spec_vmax)
 
+    # Determine number of panels based on available features
+    has_combined = "combined" in feat_chunk or "energy" in feat_chunk
+    n_panels = 6 if has_combined else 5
+    height_ratios = [1, 2.5, 1.5, 1, 1, 1] if has_combined else [1, 2.5, 1.5, 1, 1]
+
     fig, axes = plt.subplots(
-        5, 1, figsize=(16, 14),
-        gridspec_kw={"height_ratios": [1, 2.5, 1.5, 1, 1]},
+        n_panels, 1, figsize=(16, 14) if has_combined else (16, 14),
+        gridspec_kw={"height_ratios": height_ratios},
     )
     fig.suptitle(title, fontsize=9, y=0.995)
 
@@ -317,29 +346,31 @@ def _plot_chunk(
     ax.legend(lines, labels, loc="upper right", fontsize=7, framealpha=0.7)
 
     # ------------------------------------------------------------------
-    # Panel 4: Energy feature (tanh output — model input channel 0)
+    # Panel 4: Energy feature (tanh output)
     # ------------------------------------------------------------------
     ax = axes[3]
-    out = feat_chunk["output"]
-    ax.fill_between(t_frames, 0.0, out, where=out > 0,
-                    color="steelblue", alpha=0.65, label="Mark (output > 0)")
-    ax.fill_between(t_frames, out, 0.0, where=out < 0,
-                    color="lightcoral", alpha=0.65, label="Space (output < 0)")
-    ax.plot(t_frames, out, linewidth=0.4, color="navy")
+    energy = feat_chunk.get("energy", feat_chunk.get("output"))
+    if energy is not None:
+        ax.fill_between(t_frames, 0.0, energy, where=energy > 0,
+                        color="steelblue", alpha=0.65, label="Mark (E > 0)")
+        ax.fill_between(t_frames, energy, 0.0, where=energy < 0,
+                        color="lightcoral", alpha=0.65, label="Space (E < 0)")
+        ax.plot(t_frames, energy, linewidth=0.4, color="navy")
+    else:
+        ax.text(0.5, 0.5, "No energy data", ha="center", va="center", transform=ax.transAxes)
     ax.axhline(0.0, color="black", linewidth=0.6)
     ax.set_ylim(-1.05, 1.05)
-    ax.set_ylabel("Energy feature")
+    ax.set_ylabel("Energy (E)")
     ax.set_xlim(t_frames[0], t_frames[-1])
     ax.grid(True, alpha=0.25)
     ax.legend(loc="upper right", fontsize=7)
     ax.set_title(
-        "Energy feature \u2014 model input ch0  "
-        "[tanh((peak \u2212 center) \u00d7 gain / spread)]", fontsize=9,
+        "Energy feature  [tanh((peak \u2212 center) \u00d7 gain / spread)]", fontsize=9,
     )
     ax.set_xticklabels([])
 
     # ------------------------------------------------------------------
-    # Panel 5: Phase coherence R — model input channel 1
+    # Panel 5: Phase coherence R
     # ------------------------------------------------------------------
     ax = axes[4]
     coh = feat_chunk["coherence"]
@@ -349,12 +380,36 @@ def _plot_chunk(
     ax.axhline(0.5, color="gray", linewidth=0.6, linestyle="--", alpha=0.5)
     ax.set_ylim(-0.05, 1.05)
     ax.set_ylabel("Coherence R")
-    ax.set_xlabel("Time (s)")
     ax.set_xlim(t_frames[0], t_frames[-1])
     ax.grid(True, alpha=0.25)
     ax.set_title(
-        "Phase coherence \u2014 model input ch1  "
-        "[mean resultant length, K=7 frames]", fontsize=9,
+        "Phase coherence  [mean resultant length, K=7 frames]", fontsize=9,
+    )
+    ax.set_xticklabels([])
+
+    # ------------------------------------------------------------------
+    # Panel 6: Combined mark probability (E × (α + β×R) / (α + β))
+    # ------------------------------------------------------------------
+    ax = axes[5]
+    combined = feat_chunk.get("combined")
+    if combined is not None:
+        ax.fill_between(t_frames, 0.0, combined, where=combined > 0,
+                        color="darkorange", alpha=0.65, label="Mark (P > 0)")
+        ax.fill_between(t_frames, combined, 0.0, where=combined < 0,
+                        color="crimson", alpha=0.65, label="Space (P < 0)")
+        ax.plot(t_frames, combined, linewidth=0.4, color="brown")
+    else:
+        ax.text(0.5, 0.5, "No combined data", ha="center", va="center", transform=ax.transAxes)
+    ax.axhline(0.0, color="black", linewidth=0.6)
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_ylabel("Combined P")
+    ax.set_xlabel("Time (s)")
+    ax.set_xlim(t_frames[0], t_frames[-1])
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper right", fontsize=7)
+    ax.set_title(
+        "Combined mark probability  P = E \u00d7 (\u03b1 + \u03b2\u00d7R) / (\u03b1 + \u03b2)\n"
+        "\u03b1=2.0, \u03b2=1.0 (energy-weighted)", fontsize=9,
     )
 
     plt.tight_layout(rect=[0, 0, 1, 0.995])
@@ -536,8 +591,9 @@ def main(argv=None) -> None:
         print(
             f"  Frames    : {feat['n_frames']}  "
             f"spread: {feat['spread_db'].min():.1f}-{feat['spread_db'].max():.1f} dB  "
-            f"energy: {feat['output'].min():.3f} to {feat['output'].max():.3f}  "
-            f"coherence: {feat['coherence'].min():.3f} to {feat['coherence'].max():.3f}"
+            f"energy: {feat['energy'].min():.3f} to {feat['energy'].max():.3f}  "
+            f"coherence: {feat['coherence'].min():.3f} to {feat['coherence'].max():.3f}  "
+            f"combined: {feat['combined'].min():.3f} to {feat['combined'].max():.3f}"
         )
 
         plot_file(

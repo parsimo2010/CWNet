@@ -1,27 +1,25 @@
 """
 feature.py — Adaptive threshold CW feature extraction for CWNet.
 
-Converts streaming mono audio into a 2-channel time series for the
-CWNet CNN+GRU decoder:
+Converts streaming mono audio into a time series of mark probability features:
 
-  Channel 0 — **Energy feature** (mark/space probability):
-    1. STFT with a Hann window (default 50 ms window, 5 ms hop).
-    2. Peak bin energy (dB) in the monitored frequency range.
-    3. Maintain a sliding window of recent peak energies (~5 seconds).
-    4. Adaptive threshold from the window percentiles:
-         p25 = 25th percentile (≈ space level)
-         p75 = 75th percentile (≈ mark level)
-         center = (p25 + p75) / 2
-         spread = max(p75 − p25, 10 dB minimum)
-    5. Normalised output = tanh((peak_dB − center) × 3 / spread)
-       → approximately +0.9 during marks, −0.9 during spaces.
+  Single-channel **Combined mark probability** (tanh-normalised):
+    Combines the energy feature and phase coherence into one unified signal:
+    
+      E = tanh((peak_dB − center) × 3 / spread)   [energy, range [-1,+1]]
+      R = mean resultant length                     [coherence, range [0,1]]
+      
+      combined = E × (α + β×R) / (α + β)
+      
+    Where α=2.0 and β=1.0 give more weight to energy while still penalizing
+    low-coherence regions. The output ranges approximately [-0.95,+0.95] for
+    clean signals, with low coherence suppressing the magnitude regardless of
+    energy level. This helps distinguish true marks (high energy + high coherence)
+    from noise spikes (high energy but low coherence).
 
-  Channel 1 — **Phase coherence** (tone confidence):
-    Mean resultant length R of frame-to-frame phase differences at the
-    peak frequency bin, computed over a sliding window of K=7 frames
-    (35 ms at 5 ms hop).  R ≈ 1.0 for a coherent tone (mark), R ≈ 0.3
-    for noise (space).  This helps the model distinguish true marks from
-    noise spikes.
+  Alternative: Keep both features separate by setting use_combined=False:
+      Channel 0 = Energy feature E (tanh output, range [-1,+1])
+      Channel 1 = Phase coherence R (mean resultant length, range [0,1])
 
 The energy feature is inherently AGC-immune: the percentile-based
 threshold tracks any shifts in absolute amplitude automatically.  No
@@ -32,10 +30,17 @@ Usage::
     from feature import MorseFeatureExtractor
     from config import FeatureConfig
 
-    fe = MorseFeatureExtractor(FeatureConfig())
+    # Combined single-channel output (default)
+    fe = MorseFeatureExtractor(FeatureConfig(), use_combined=True)
     for audio_chunk in source.stream():
-        features = fe.process_chunk(audio_chunk)  # shape (n_frames, 2)
-        # features[:, 0] = energy,  features[:, 1] = coherence
+        features = fe.process_chunk(audio_chunk)  # shape (n_frames, 1)
+        # features[:, 0] = combined mark probability
+
+    # Separate two-channel output (legacy mode)
+    fe2 = MorseFeatureExtractor(FeatureConfig(), use_combined=False)
+    for audio_chunk in source.stream():
+        features = fe2.process_chunk(audio_chunk)  # shape (n_frames, 2)
+        # features[:, 0] = energy E,  features[:, 1] = coherence R
 """
 
 from __future__ import annotations
@@ -52,61 +57,62 @@ from config import FeatureConfig
 class MorseFeatureExtractor:
     """Adaptive threshold CW feature extractor with phase coherence.
 
-    Produces a 2-channel output per frame:
-      - Channel 0: energy-based mark/space probability (tanh-normalised)
-      - Channel 1: phase coherence R (mean resultant length, 0–1)
+    Produces a time series of mark probability features:
 
-    The energy feature detects mark/space signal presence by normalising
-    peak frequency bin energy against a sliding-window adaptive threshold
-    derived from recent peak energy percentiles.  This is inherently
-    AGC-immune.
+      Single-channel **Combined mark probability** (default):
+        Combines energy and coherence into one unified signal:
+          combined = E × (α + β×R) / (α + β)
+        Where E ∈ [-1,+1] is the energy feature, R ∈ [0,1] is coherence,
+        α=2.0 and β=1.0 give more weight to energy while penalizing low
+        coherence regions. Output ranges approximately [-0.95,+0.95].
 
-    The phase coherence feature measures how consistent the frame-to-frame
-    phase advance is at the peak frequency bin.  A coherent tone produces
-    R ≈ 1.0 (consistent phase advance); noise produces R ≈ 0.3 (random
-    phase).  This helps the model distinguish true marks from noise spikes.
+      Two-channel output (use_combined=False):
+        Channel 0: Energy feature E (tanh-normalised, range [-1,+1])
+        Channel 1: Phase coherence R (mean resultant length, range [0,1])
+
+    The energy feature is inherently AGC-immune: the percentile-based
+    threshold tracks any shifts in absolute amplitude automatically.
 
     Parameters
     ----------
     config : FeatureConfig
         Feature extraction configuration (STFT params, frequency range).
+    use_combined : bool, default=True
+        If True, output a single combined feature channel.
+        If False, output two separate channels (energy + coherence).
     noise_ema_alpha : float, optional
         Accepted for API compatibility but not used.
     record_diagnostics : bool
         If True, per-frame intermediate values are appended to
         :attr:`diagnostics` after each :meth:`process_chunk` call.
+
+    Attributes
+    ----------
+    n_channels : int
+        Number of output channels (1 if use_combined=True, 2 otherwise).
     """
 
     # Sliding window duration for adaptive threshold estimation.
-    # Must be long enough to contain both marks and spaces even at
-    # slow WPM (5 WPM: dit = 240 ms, word ≈ 12 s).
     _WINDOW_SEC: float = 5.0
-
-    # Minimum mark-space spread (dB).  When the signal dynamic range
-    # is below this (e.g., noise only, continuous tone), the gain is
-    # clamped to prevent output saturation from random fluctuations.
-    # Noise-only peak energy varies ~2-3 dB (chi-squared statistics);
-    # a 10 dB floor keeps noise output in the ±0.3 range.
     _MIN_SPREAD_DB: float = 10.0
-
-    # tanh gain scaling factor.  At the mark level (p75), the deviation
-    # from center is spread/2, so output ≈ tanh(GAIN_FACTOR / 2).
-    # 3.0 → tanh(1.5) ≈ 0.91 at the mark level.
     _GAIN_FACTOR: float = 3.0
-
-    # Number of recent phase differences used to compute the mean
-    # resultant length R.  At 5 ms hop, K=7 → 35 ms window.
-    # Compromise: fast enough for 50 WPM (dit ≈ 24 ms → 5 frames)
-    # yet enough samples for meaningful statistics.
     _COHERENCE_K: int = 7
+
+    # Combined feature weighting parameters.
+    # α (alpha) controls baseline weight; β (beta) scales coherence contribution.
+    # Higher α gives more weight to energy; higher β emphasizes coherence.
+    _COMBINE_ALPHA: float = 2.0
+    _COMBINE_BETA: float = 1.0
 
     def __init__(
         self,
         config: FeatureConfig,
+        use_combined: bool = True,
         noise_ema_alpha: Optional[float] = None,
         record_diagnostics: bool = False,
     ) -> None:
         self.config = config
+        self._use_combined = use_combined
         self._record_diagnostics = record_diagnostics
 
         sr = config.sample_rate
@@ -152,8 +158,8 @@ class MorseFeatureExtractor:
         # Per-frame diagnostics (populated only when record_diagnostics=True)
         self._diagnostics: list[dict] = []
 
-    #: Number of output channels (energy + coherence).
-    n_channels: int = 2
+        #: Number of output channels (1 if combined, 2 otherwise).
+        self.n_channels: int = 1 if use_combined else 2
 
     # ------------------------------------------------------------------
     # Convenience properties
@@ -208,8 +214,9 @@ class MorseFeatureExtractor:
     def process_chunk(self, chunk: np.ndarray) -> np.ndarray:
         """Process a mono float32 audio chunk.
 
-        Returns two feature values per completed STFT hop:
-        channel 0 = energy feature, channel 1 = phase coherence.
+        Returns feature values per completed STFT hop:
+          - If use_combined=True (default): single channel with combined mark probability
+          - If use_combined=False: two channels [energy, coherence]
 
         Parameters
         ----------
@@ -219,10 +226,11 @@ class MorseFeatureExtractor:
         Returns
         -------
         np.ndarray
-            float32 of shape ``(n_frames, 2)``.
+            float32 of shape ``(n_frames, n_channels)`` where n_channels is
+            1 if use_combined=True, otherwise 2.
         """
         chunk = np.asarray(chunk, dtype=np.float32)
-        frames: list[tuple[float, float]] = []
+        frames: list[tuple[float, ...]] = []
 
         pos = 0
         while pos < len(chunk):
@@ -242,12 +250,12 @@ class MorseFeatureExtractor:
                 self._buf_fill = max(0, overlap)
 
         if frames:
-            return np.array(frames, dtype=np.float32)   # (n_frames, 2)
-        return np.empty((0, 2), dtype=np.float32)
+            return np.array(frames, dtype=np.float32)
+        return np.empty((0, self.n_channels), dtype=np.float32)
 
     def flush(self) -> np.ndarray:
         """No-op; this extractor has no startup buffer."""
-        return np.empty((0, 2), dtype=np.float32)
+        return np.empty((0, self.n_channels), dtype=np.float32)
 
     def reset(self) -> None:
         """Reset all state for a new stream."""
@@ -266,12 +274,20 @@ class MorseFeatureExtractor:
     # Internal
     # ------------------------------------------------------------------
 
-    def _process_frame(self) -> tuple[float, float]:
+    def _process_frame(self) -> tuple[float, ...]:
         """Compute energy feature + phase coherence from the current STFT window.
+
+        If use_combined=True, returns a single combined mark probability value:
+          combined = E × (α + β×R) / (α + β)
+        where E is the energy feature and R is the coherence.
+
+        If use_combined=False, returns (energy_output, coherence_R).
 
         Returns
         -------
-        (energy_output, coherence_R) : tuple[float, float]
+        tuple[float, ...]
+            Either a single-element tuple with combined mark probability, or
+            a two-element tuple (energy, coherence).
         """
         # STFT → power spectrum
         windowed = self._buf * self._window
@@ -301,7 +317,7 @@ class MorseFeatureExtractor:
         gain = self._GAIN_FACTOR / spread
 
         # Normalised energy output: mark ≈ +0.9, space ≈ −0.9
-        output = float(math.tanh((peak_db - center) * gain))
+        E = float(math.tanh((peak_db - center) * gain))
 
         # ---- Phase coherence (mean resultant length R) ----
         # Phase at the peak frequency bin
@@ -332,11 +348,22 @@ class MorseFeatureExtractor:
                 "mark_level_db":  float(p75),
                 "space_level_db": float(p25),
                 "spread_db":      float(spread),
-                "output":         output,
+                "energy":         E,
                 "coherence":      R,
             })
 
-        return output, R
+        if self._use_combined:
+            # Combined mark probability feature.
+            # Formula: combined = E × (α + β×R) / (α + β)
+            # This preserves the sign of E while scaling magnitude by coherence.
+            # When R=1 (perfect coherence), combined ≈ E.
+            # When R≈0 (no coherence), combined ≈ 0 regardless of E.
+            alpha = self._COMBINE_ALPHA
+            beta = self._COMBINE_BETA
+            combined = E * (alpha + beta * R) / (alpha + beta)
+            return (combined,)
+
+        return E, R
 
 
 # ---------------------------------------------------------------------------

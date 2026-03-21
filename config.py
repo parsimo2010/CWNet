@@ -222,7 +222,7 @@ class ModelConfig:
     """
 
     # Number of input channels (1 = energy only, 2 = energy + coherence)
-    in_channels: int = 2
+    in_channels: int = 1
 
     # CNN channel counts (one per block; length = number of blocks)
     cnn_channels: Tuple[int, ...] = (32, 64, 64, 64)
@@ -371,7 +371,7 @@ def create_default_config(scenario: str = "clean") -> Config:
     cfg = Config()
 
     # All scenarios use 2-channel input (energy + phase coherence)
-    cfg.model.in_channels = 2
+    cfg.model.in_channels = 1
 
     if scenario == "test":
         cfg.morse.min_snr_db = 20.0
