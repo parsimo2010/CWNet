@@ -237,11 +237,11 @@ class ModelConfig:
     cnn_kernel_size: int = 7
 
     # Linear projection from CNN output to GRU input dimension
-    proj_size: int = 192
+    proj_size: int = 128
 
     # GRU hidden size and depth
-    hidden_size: int = 192
-    n_rnn_layers: int = 3
+    hidden_size: int = 128
+    n_rnn_layers: int = 4
 
     # Dropout between GRU layers (0 disables)
     dropout: float = 0.1
@@ -417,7 +417,7 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.num_epochs = 200
         cfg.training.samples_per_epoch = 15000
         cfg.training.val_samples = 1500
-        cfg.training.num_workers = 12
+        cfg.training.num_workers = 14
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (mild — model learns basic task first)
         cfg.morse.thermal_noise_db = 20.0   # broadband floor ~60 dB below signal peak
@@ -429,7 +429,7 @@ def create_default_config(scenario: str = "clean") -> Config:
 
     elif scenario == "full":
         cfg.morse.min_snr_db = 3.0
-        cfg.morse.max_snr_db = 25.0
+        cfg.morse.max_snr_db = 30.0
         cfg.morse.min_wpm = 5.0
         cfg.morse.max_wpm = 50.0
         cfg.morse.dah_dit_ratio_min = 1.5
@@ -444,11 +444,11 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.narrowband_probability = 1.0    # all samples narrowband
         cfg.morse.tone_drift = 5.0
         cfg.training.batch_size = 128
-        cfg.training.learning_rate = 4e-4   
+        cfg.training.learning_rate = 6e-4   
         cfg.training.num_epochs = 500
         cfg.training.samples_per_epoch = 24000
         cfg.training.val_samples = 2400
-        cfg.training.num_workers = 12
+        cfg.training.num_workers = 14
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (full strength for curriculum stage 2)
         cfg.morse.thermal_noise_db = 20.0   # broadband floor ~60 dB below signal peak

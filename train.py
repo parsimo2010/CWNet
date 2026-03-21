@@ -17,6 +17,15 @@ Recommended curriculum::
         --checkpoint_file checkpoints/best_model.pt \\
         --additional_epochs 500
 
+Multi-model initial training (when starting from scratch):
+    By default, the first 10 epochs train 10 models sequentially with different
+    random seeds. After epoch 10, the model with lowest validation loss is
+    selected and continues for remaining epochs. This can be customized:
+
+        python train.py --scenario clean \\
+            --num_initial_models 10 \\
+            --initial_epochs 10
+
 Metrics logged per epoch:
     train_loss   — mean CTC loss over training batches
     val_loss     — mean CTC loss over a fresh validation set
@@ -34,6 +43,7 @@ import csv
 import gc
 import json
 import math
+import random
 from pathlib import Path
 from typing import List, Optional
 
@@ -135,6 +145,58 @@ def save_checkpoint(
 
 
 # ---------------------------------------------------------------------------
+# Random seed helpers for multi-model training
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int) -> None:
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def evaluate_model(
+    model: MorseCTCModel,
+    val_loader: DataLoader,
+    device: torch.device,
+    ctc_loss: nn.CTCLoss,
+    scaler: Optional[GradScaler] = None,
+) -> tuple[float, float]:
+    """Evaluate model on validation set and return (val_loss, greedy_cer)."""
+    model.eval()
+    val_losses: List[float] = []
+    greedy_cers: List[float] = []
+
+    with torch.no_grad():
+        for snr, targets, snr_lens, tgt_lens, texts in tqdm(
+            val_loader, desc="  val", unit="batch", leave=False
+        ):
+            snr = snr.to(device)
+            targets = targets.to(device)
+            snr_lens = snr_lens.to(device)
+            tgt_lens = tgt_lens.to(device)
+
+            with autocast(device_type=device.type, enabled=(scaler is not None)):
+                log_probs, out_lens = model(snr, snr_lens)
+                loss = ctc_loss(log_probs, targets, out_lens, tgt_lens)
+            if torch.isfinite(loss):
+                val_losses.append(loss.item())
+
+            for b in range(log_probs.shape[1]):
+                valid_t = out_lens[b].item()
+                sample_lp = log_probs[:valid_t, b, :]
+                pred_greedy = greedy_ctc_decode(sample_lp)
+                greedy_cers.append(jiwer.cer(texts[b], pred_greedy))
+
+    avg_val = float(np.mean(val_losses)) if val_losses else float("inf")
+    avg_g_cer = float(np.mean(greedy_cers)) if greedy_cers else 1.0
+
+    return avg_val, avg_g_cer
+
+
+# ---------------------------------------------------------------------------
 # Training log
 # ---------------------------------------------------------------------------
 
@@ -218,11 +280,11 @@ def train(args: argparse.Namespace) -> None:
         f"Parameters   : {model.num_params:,}\n"
         f"Input ch     : {mcfg.in_channels}  "
         f"({'energy + coherence' if mcfg.in_channels == 2 else 'energy only'})\n"
-        f"Frame rate   : {fps_in:.0f} fps in → {fps_out:.0f} fps out  "
-        f"(pool×{model.pool_factor})\n"
+        f"Frame rate   : {fps_in:.0f} fps in -> {fps_out:.0f} fps out  "
+        f"(pool*{model.pool_factor})\n"
         f"Hop          : {config.feature.hop_ms:.1f} ms  "
         f"Window: {config.feature.window_ms:.0f} ms  "
-        f"Bins: {config.feature.freq_min}–{config.feature.freq_max} Hz"
+        f"Bins: {config.feature.freq_min}-{config.feature.freq_max} Hz"
     )
 
     # ---- Datasets --------------------------------------------------------
@@ -260,9 +322,15 @@ def train(args: argparse.Namespace) -> None:
     start_epoch   = 0
     end_epoch     = config.training.num_epochs
 
-    # ---- Resume from checkpoint ------------------------------------------
+    # ---- Check if starting from scratch or resuming ----------------------
     checkpoint_path = args.checkpoint_file or args.checkpoint
-    if checkpoint_path:
+    is_resumed = bool(checkpoint_path)
+
+    # ---- Resume from checkpoint ------------------------------------------
+    if not is_resumed:
+        print("\n[info] Starting training from scratch with multi-model initial phase")
+        print(f"  num_initial_models={args.num_initial_models}, initial_epochs={args.initial_epochs}")
+    else:
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -285,20 +353,166 @@ def train(args: argparse.Namespace) -> None:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
             end_epoch = config.training.num_epochs
             print(f"Resumed epoch {start_epoch}  (best_val={best_val_loss:.4f})")
-    elif args.additional_epochs:
-        if args.resume_lr is not None:
-            for pg in optimizer.param_groups:
-                pg["lr"] = args.resume_lr
-        end_epoch = args.additional_epochs
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.additional_epochs, eta_min=1e-6
-        )
 
+    # ---- Multi-model initial phase ---------------------------------------
     beam_interval = config.training.beam_cer_interval
     beam_width    = config.training.beam_width
     safety_path   = ckpt_dir / "checkpoint_safety.pt"
 
-    # ---- Training loop ---------------------------------------------------
+    if not is_resumed and args.initial_epochs > 0:
+        num_models = args.num_initial_models
+        print(f"\n[info] Initial multi-model training phase:")
+        print(f"  Training {num_models} models for {args.initial_epochs} epochs")
+
+        # Store best model info from initial phase
+        best_model_weights = None
+        best_val_loss_initial = math.inf
+        best_model_idx = -1
+
+        for epoch in range(args.initial_epochs):
+            print(f"\n{'='*60}")
+            print(f"Initial Phase Epoch {epoch+1}/{args.initial_epochs}")
+            print(f"{'='*60}")
+
+            model_val_losses: List[float] = []
+
+            # Train each model sequentially within this epoch
+            for model_idx in range(num_models):
+                seed = 42 + model_idx * 1000 + epoch * 10000
+                set_seed(seed)
+                print(f"\n[info] Training model {model_idx+1}/{num_models} (seed={seed})")
+
+                # Create fresh model with new random weights
+                mcfg = config.model
+                train_model = MorseCTCModel(
+                    in_channels=mcfg.in_channels,
+                    cnn_channels=mcfg.cnn_channels,
+                    cnn_time_pools=mcfg.cnn_time_pools,
+                    cnn_dilations=mcfg.cnn_dilations,
+                    cnn_kernel_size=mcfg.cnn_kernel_size,
+                    proj_size=mcfg.proj_size,
+                    hidden_size=mcfg.hidden_size,
+                    n_rnn_layers=mcfg.n_rnn_layers,
+                    dropout=mcfg.dropout,
+                ).to(device)
+
+                # Fresh optimizer and scheduler for each model
+                ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+                train_optimizer = torch.optim.Adam(train_model.parameters(), lr=config.training.learning_rate)
+                train_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    train_optimizer, T_max=args.initial_epochs, eta_min=1e-6
+                )
+
+                # Training for this model on current epoch's data
+                train_model.train()
+                epoch_losses: List[float] = []
+
+                pbar = tqdm(
+                    train_loader,
+                    desc=f"  Model {model_idx+1}",
+                    unit="batch",
+                    dynamic_ncols=True,
+                )
+
+                for batch_idx, (snr, targets, snr_lens, tgt_lens, texts) in enumerate(pbar):
+                    snr = snr.to(device)
+                    targets = targets.to(device)
+                    snr_lens = snr_lens.to(device)
+                    tgt_lens = tgt_lens.to(device)
+
+                    train_optimizer.zero_grad(set_to_none=True)
+
+                    with autocast(device_type=device.type, enabled=(scaler is not None)):
+                        log_probs, out_lens = train_model(snr, snr_lens)
+                        loss = ctc_loss(log_probs, targets, out_lens, tgt_lens)
+
+                    if torch.isfinite(loss):
+                        if scaler is not None:
+                            scaler.scale(loss).backward()
+                            scaler.unscale_(train_optimizer)
+                            grad_ok = all(
+                                p.grad is None or torch.isfinite(p.grad).all()
+                                for p in train_model.parameters()
+                            )
+                            if grad_ok:
+                                nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=5.0)
+                                epoch_losses.append(loss.item())
+                            scaler.step(train_optimizer)
+                            scaler.update()
+                        else:
+                            loss.backward()
+                            if any(
+                                p.grad is not None and not torch.isfinite(p.grad).all()
+                                for p in train_model.parameters()
+                            ):
+                                train_optimizer.zero_grad(set_to_none=True)
+                            else:
+                                nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=5.0)
+                                train_optimizer.step()
+                                epoch_losses.append(loss.item())
+
+                    pbar.set_postfix(
+                        loss=f"{loss.item():.4f}",
+                        lr=f"{train_scheduler.get_last_lr()[0]:.2e}",
+                    )
+
+                del pbar
+                train_scheduler.step()
+
+                # Evaluate this model on validation set
+                print(f"\n[info] Evaluating model {model_idx+1}/{num_models}...")
+                val_loss, greedy_cer = evaluate_model(
+                    train_model, val_loader, device, ctc_loss, scaler
+                )
+                print(f"  Model {model_idx+1}: val_loss={val_loss:.4f}, greedy_CER={greedy_cer:.4f}")
+
+                model_val_losses.append(val_loss)
+
+                # Keep track of best model so far in initial phase
+                if val_loss < best_val_loss_initial:
+                    best_val_loss_initial = val_loss
+                    best_model_idx = model_idx
+                    best_model_weights = {k: v.clone() for k, v in train_model.state_dict().items()}
+
+            # End of epoch - print summary
+            avg_val_losses = np.mean(model_val_losses)
+            print(f"\n[info] Epoch {epoch+1}/{args.initial_epochs} summary:")
+            print(f"  Average val_loss: {avg_val_losses:.4f}")
+            print(f"  Best model so far: Model {best_model_idx+1} (val_loss={best_val_loss_initial:.4f})")
+
+        # After initial phase, load best model and continue training
+        if best_model_weights is not None:
+            print(f"\n{'='*60}")
+            print(f"Initial Phase Complete - Selecting Best Model")
+            print(f"{'='*60}")
+            print(f"Best model: {best_model_idx+1} with val_loss={best_val_loss_initial:.4f}")
+
+            # Load best model weights into main model
+            model.load_state_dict(best_model_weights)
+            start_epoch = args.initial_epochs
+            end_epoch = config.training.num_epochs
+            best_val_loss = best_val_loss_initial
+
+            print(f"\n[info] Continuing training from epoch {start_epoch+1} with selected model")
+            print(f"  Remaining epochs: {end_epoch - start_epoch}")
+        else:
+            raise RuntimeError("No valid models produced during initial phase!")
+    else:
+        # Normal single-model training (resumed or multi-model disabled)
+        beam_interval = config.training.beam_cer_interval
+        beam_width    = config.training.beam_width
+        safety_path   = ckpt_dir / "checkpoint_safety.pt"
+
+        if not is_resumed and args.additional_epochs:
+            if args.resume_lr is not None:
+                for pg in optimizer.param_groups:
+                    pg["lr"] = args.resume_lr
+            end_epoch = args.additional_epochs
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=args.additional_epochs, eta_min=1e-6
+            )
+
+    # ---- Main training loop ----------------------------------------------
     for epoch in range(start_epoch, end_epoch):
 
         # NaN weight check: roll back to safety checkpoint if weights corrupted
@@ -489,6 +703,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Run N more epochs with a fresh cosine LR cycle")
     p.add_argument("--resume_lr", type=float, default=None, metavar="LR",
                    help="Peak LR for the fresh cosine cycle (default: config LR)")
+    p.add_argument("--num_initial_models", type=int, default=10, metavar="N",
+                   help="Number of models to train in initial phase (default: 10)")
+    p.add_argument("--initial_epochs", type=int, default=10, metavar="E",
+                   help="Epochs for multi-model training before selecting best (default: 10)")
     return p
 
 
