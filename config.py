@@ -189,14 +189,14 @@ class ModelConfig:
 
     Default (~260 K parameters):
       in_channels = 1 (backward compat; new training uses 2)
-      cnn_channels = (32, 64, 64)
-      cnn_time_pools = (2, 1, 1)  → 2× downsampling after block 1 → 100 fps
+      cnn_channels = (32, 64, 64, 64)
+      cnn_time_pools = (2, 1, 1, 1)  → 2× downsampling after block 1 → 100 fps
       cnn_kernel_size = 7
-      cnn_dilations = (1, 2, 4)   → growing receptive field per block
-      proj_size = 256, hidden_size = 256, n_rnn_layers = 3
+      cnn_dilations = (1, 2, 4, 8)   → growing receptive field per block
+      proj_size = 192, hidden_size = 192, n_rnn_layers = 4
     """
 
-    # Number of input channels (1 = energy only, 2 = energy + coherence)
+    # Number of input channels (1 = combined feature, 2 = energy + coherence)
     in_channels: int = 1
 
     # CNN channel counts (one per block; length = number of blocks)
@@ -212,10 +212,10 @@ class ModelConfig:
     cnn_kernel_size: int = 7
 
     # Linear projection from CNN output to GRU input dimension
-    proj_size: int = 128
+    proj_size: int = 192
 
     # GRU hidden size and depth
-    hidden_size: int = 128
+    hidden_size: int = 192
     n_rnn_layers: int = 4
 
     # Dropout between GRU layers (0 disables)
@@ -383,11 +383,11 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.05
         cfg.morse.tone_drift = 3.0
-        cfg.training.batch_size = 128
-        cfg.training.learning_rate = 6e-4
+        cfg.training.batch_size = 256
+        cfg.training.learning_rate = 8e-4
         cfg.training.num_epochs = 200
-        cfg.training.samples_per_epoch = 15000
-        cfg.training.val_samples = 1500
+        cfg.training.samples_per_epoch = 25000
+        cfg.training.val_samples = 2500
         cfg.training.num_workers = 14
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (mild — model learns basic task first)
@@ -408,11 +408,11 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.20
         cfg.morse.tone_drift = 5.0
-        cfg.training.batch_size = 128
-        cfg.training.learning_rate = 6e-4
+        cfg.training.batch_size = 256
+        cfg.training.learning_rate = 8e-4
         cfg.training.num_epochs = 500
-        cfg.training.samples_per_epoch = 24000
-        cfg.training.val_samples = 2400
+        cfg.training.samples_per_epoch = 25000
+        cfg.training.val_samples = 2500
         cfg.training.num_workers = 14
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (full strength for curriculum stage 2)

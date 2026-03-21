@@ -279,7 +279,7 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"Parameters   : {model.num_params:,}\n"
         f"Input ch     : {mcfg.in_channels}  "
-        f"({'energy + coherence' if mcfg.in_channels == 2 else 'energy only'})\n"
+        f"({'energy + coherence' if mcfg.in_channels == 2 else 'combined feature'})\n"
         f"Frame rate   : {fps_in:.0f} fps in -> {fps_out:.0f} fps out  "
         f"(pool*{model.pool_factor})\n"
         f"Hop          : {config.feature.hop_ms:.1f} ms  "
@@ -362,61 +362,57 @@ def train(args: argparse.Namespace) -> None:
     if not is_resumed and args.initial_epochs > 0:
         num_models = args.num_initial_models
         print(f"\n[info] Initial multi-model training phase:")
-        print(f"  Training {num_models} models for {args.initial_epochs} epochs")
+        print(f"  Training {num_models} models for {args.initial_epochs} epochs each, "
+              f"then selecting the best.")
 
-        # Store best model info from initial phase
         best_model_weights = None
         best_val_loss_initial = math.inf
         best_model_idx = -1
+        init_ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
 
-        for epoch in range(args.initial_epochs):
+        for model_idx in range(num_models):
+            seed = 42 + model_idx * 1000
+            set_seed(seed)
             print(f"\n{'='*60}")
-            print(f"Initial Phase Epoch {epoch+1}/{args.initial_epochs}")
+            print(f"Initial Phase — Model {model_idx+1}/{num_models}  (seed={seed})")
             print(f"{'='*60}")
 
-            model_val_losses: List[float] = []
+            # Fresh model with this seed's random initialisation
+            mcfg = config.model
+            train_model = MorseCTCModel(
+                in_channels=mcfg.in_channels,
+                cnn_channels=mcfg.cnn_channels,
+                cnn_time_pools=mcfg.cnn_time_pools,
+                cnn_dilations=mcfg.cnn_dilations,
+                cnn_kernel_size=mcfg.cnn_kernel_size,
+                proj_size=mcfg.proj_size,
+                hidden_size=mcfg.hidden_size,
+                n_rnn_layers=mcfg.n_rnn_layers,
+                dropout=mcfg.dropout,
+            ).to(device)
 
-            # Train each model sequentially within this epoch
-            for model_idx in range(num_models):
-                seed = 42 + model_idx * 1000 + epoch * 10000
-                set_seed(seed)
-                print(f"\n[info] Training model {model_idx+1}/{num_models} (seed={seed})")
+            train_optimizer = torch.optim.Adam(
+                train_model.parameters(), lr=config.training.learning_rate
+            )
+            train_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                train_optimizer, T_max=config.training.num_epochs, eta_min=1e-6
+            )
 
-                # Create fresh model with new random weights
-                mcfg = config.model
-                train_model = MorseCTCModel(
-                    in_channels=mcfg.in_channels,
-                    cnn_channels=mcfg.cnn_channels,
-                    cnn_time_pools=mcfg.cnn_time_pools,
-                    cnn_dilations=mcfg.cnn_dilations,
-                    cnn_kernel_size=mcfg.cnn_kernel_size,
-                    proj_size=mcfg.proj_size,
-                    hidden_size=mcfg.hidden_size,
-                    n_rnn_layers=mcfg.n_rnn_layers,
-                    dropout=mcfg.dropout,
-                ).to(device)
-
-                # Fresh optimizer and scheduler for each model
-                ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-                train_optimizer = torch.optim.Adam(train_model.parameters(), lr=config.training.learning_rate)
-                train_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    train_optimizer, T_max=args.initial_epochs, eta_min=1e-6
-                )
-
-                # Training for this model on current epoch's data
+            # Train this model for initial_epochs epochs
+            for epoch in range(args.initial_epochs):
                 train_model.train()
                 epoch_losses: List[float] = []
 
                 pbar = tqdm(
                     train_loader,
-                    desc=f"  Model {model_idx+1}",
+                    desc=f"  M{model_idx+1}/{num_models} E{epoch+1}/{args.initial_epochs}",
                     unit="batch",
                     dynamic_ncols=True,
                 )
 
                 for batch_idx, (snr, targets, snr_lens, tgt_lens, texts) in enumerate(pbar):
-                    snr = snr.to(device)
-                    targets = targets.to(device)
+                    snr      = snr.to(device)
+                    targets  = targets.to(device)
                     snr_lens = snr_lens.to(device)
                     tgt_lens = tgt_lens.to(device)
 
@@ -424,7 +420,7 @@ def train(args: argparse.Namespace) -> None:
 
                     with autocast(device_type=device.type, enabled=(scaler is not None)):
                         log_probs, out_lens = train_model(snr, snr_lens)
-                        loss = ctc_loss(log_probs, targets, out_lens, tgt_lens)
+                        loss = init_ctc_loss(log_probs, targets, out_lens, tgt_lens)
 
                     if torch.isfinite(loss):
                         if scaler is not None:
@@ -457,46 +453,57 @@ def train(args: argparse.Namespace) -> None:
                     )
 
                 del pbar
+                avg_train = float(np.mean(epoch_losses)) if epoch_losses else float("inf")
+                print(
+                    f"  M{model_idx+1} E{epoch+1}/{args.initial_epochs}"
+                    f"  train={avg_train:.4f}"
+                    f"  lr={train_scheduler.get_last_lr()[0]:.2e}"
+                )
                 train_scheduler.step()
 
-                # Evaluate this model on validation set
-                print(f"\n[info] Evaluating model {model_idx+1}/{num_models}...")
-                val_loss, greedy_cer = evaluate_model(
-                    train_model, val_loader, device, ctc_loss, scaler
-                )
-                print(f"  Model {model_idx+1}: val_loss={val_loss:.4f}, greedy_CER={greedy_cer:.4f}")
+            # Evaluate after all initial epochs
+            print(f"\n[info] Evaluating model {model_idx+1}/{num_models} ...")
+            val_loss, greedy_cer = evaluate_model(
+                train_model, val_loader, device, init_ctc_loss, scaler
+            )
+            print(f"  Model {model_idx+1}: val_loss={val_loss:.4f}  greedy_CER={greedy_cer:.4f}")
 
-                model_val_losses.append(val_loss)
+            if val_loss < best_val_loss_initial:
+                best_val_loss_initial = val_loss
+                best_model_idx = model_idx
+                # Save weights on CPU to keep GPU memory free during subsequent models
+                best_model_weights = {
+                    k: v.detach().cpu().clone() for k, v in train_model.state_dict().items()
+                }
+                print(f"  *** New best model: M{model_idx+1} (val_loss={best_val_loss_initial:.4f})")
 
-                # Keep track of best model so far in initial phase
-                if val_loss < best_val_loss_initial:
-                    best_val_loss_initial = val_loss
-                    best_model_idx = model_idx
-                    best_model_weights = {k: v.clone() for k, v in train_model.state_dict().items()}
+            del train_model, train_optimizer, train_scheduler
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
-            # End of epoch - print summary
-            avg_val_losses = np.mean(model_val_losses)
-            print(f"\n[info] Epoch {epoch+1}/{args.initial_epochs} summary:")
-            print(f"  Average val_loss: {avg_val_losses:.4f}")
-            print(f"  Best model so far: Model {best_model_idx+1} (val_loss={best_val_loss_initial:.4f})")
-
-        # After initial phase, load best model and continue training
-        if best_model_weights is not None:
-            print(f"\n{'='*60}")
-            print(f"Initial Phase Complete - Selecting Best Model")
-            print(f"{'='*60}")
-            print(f"Best model: {best_model_idx+1} with val_loss={best_val_loss_initial:.4f}")
-
-            # Load best model weights into main model
-            model.load_state_dict(best_model_weights)
-            start_epoch = args.initial_epochs
-            end_epoch = config.training.num_epochs
-            best_val_loss = best_val_loss_initial
-
-            print(f"\n[info] Continuing training from epoch {start_epoch+1} with selected model")
-            print(f"  Remaining epochs: {end_epoch - start_epoch}")
-        else:
+        # Load best model into main model and reset for a full training run
+        if best_model_weights is None:
             raise RuntimeError("No valid models produced during initial phase!")
+
+        print(f"\n{'='*60}")
+        print(f"Initial Phase Complete")
+        print(f"  Winner: Model {best_model_idx+1}  val_loss={best_val_loss_initial:.4f}")
+        print(f"{'='*60}")
+
+        # Move best weights back to device and load into the main model
+        model.load_state_dict({k: v.to(device) for k, v in best_model_weights.items()})
+        best_val_loss = best_val_loss_initial
+
+        # Give the selected model a full cosine LR cycle from epoch 0
+        start_epoch = 0
+        end_epoch   = config.training.num_epochs
+        optimizer   = torch.optim.Adam(model.parameters(), lr=config.training.learning_rate)
+        scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.training.num_epochs, eta_min=1e-6
+        )
+        print(f"[info] Starting main training loop ({end_epoch} epochs) "
+              f"with selected model weights.")
     else:
         # Normal single-model training (resumed or multi-model disabled)
         beam_interval = config.training.beam_cer_interval
