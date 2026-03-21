@@ -3,7 +3,7 @@ dataset.py — On-the-fly streaming dataset for CWNet CTC training.
 
 Every sample is synthesised fresh on each iteration:
   1. morse_generator.generate_sample() → float32 audio + transcript
-  2. MorseFeatureExtractor.process_chunk() → SNR ratio time series
+  2. MorseFeatureExtractor.process_batch() → SNR ratio time series
   3. vocab.encode(transcript) → target indices
   4. CTC feasibility check: output_frames ≥ target_length
 
@@ -113,9 +113,8 @@ class StreamingMorseDataset(IterableDataset):
             except Exception:
                 continue   # skip rare synthesis failures silently
 
-            # Reset feature extractor between samples
-            extractor.reset()
-            features = extractor.process_chunk(audio_f32)  # (T_frames, 2)
+            # Vectorised single-pass extraction (no per-frame Python loop)
+            features = extractor.process_batch(audio_f32)  # (T_frames, n_channels)
 
             if len(features) == 0:
                 continue

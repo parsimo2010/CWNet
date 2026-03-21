@@ -47,7 +47,7 @@ class MorseConfig:
     # Slow sinusoidal frequency drift (Hz peak deviation) — simulates VFO drift
     tone_drift: float = 3.0
 
-    # SNR (dB) — measured against full-band noise before any narrowband filter
+    # SNR (dB) — measured against full-band white AWGN
     min_snr_db: float = 15.0
     max_snr_db: float = 40.0
 
@@ -69,9 +69,6 @@ class MorseConfig:
     iws_factor_min: float = 0.8
     iws_factor_max: float = 1.5
 
-    # Noise color: 0=white; coloured noise applied with this probability
-    noise_color_probability: float = 0.0   # 0 = always white
-
     # Audio sample duration range
     min_duration_sec: float = 2.0
     max_duration_sec: float = 10.0
@@ -80,20 +77,6 @@ class MorseConfig:
     # Signal amplitude variation across samples
     signal_amplitude_min: float = 0.5
     signal_amplitude_max: float = 0.9
-
-    # Narrowband IF-filter simulation
-    # When applied, bandpass-filters the audio around the carrier to simulate
-    # a narrowband radio receiver; tests the noise estimator's gap criterion.
-    narrowband_probability: float = 1.0
-    narrowband_bw_min_hz: float = 150.0
-    narrowband_bw_max_hz: float = 500.0
-
-    # Receiver thermal noise — broadband noise added after the IF filter.
-    # Models audio-chain electronics noise present at all output frequencies.
-    # Level is expressed as dB below the estimated in-band atmospheric noise.
-    # Creates the ~30 dB in-band / out-of-band noise floor difference seen in
-    # real HF radio recordings.  0 = disabled.
-    thermal_noise_db: float = 0.0
 
     # AGC simulation — noise-floor modulation matching real HF radio AGC.
     # During marks the AGC reduces gain → background noise is suppressed.
@@ -106,14 +89,6 @@ class MorseConfig:
     agc_release_ms: float = 400.0       # gain recovery time constant (ms)
     agc_depth_db_min: float = 6.0       # noise suppression at peak mark (dB, min)
     agc_depth_db_max: float = 15.0      # noise suppression at peak mark (dB, max)
-
-    # Impulsive noise — RF static crashes and key clicks from adjacent stations.
-    # Each impulse is inserted *before* the IF narrowband filter so it is shaped
-    # into a brief tone burst at the carrier frequency, matching real HF behaviour.
-    # The model must learn to ignore these sub-dit-length spikes.
-    impulse_noise_probability: float = 0.0  # fraction of samples
-    impulse_rate_max: float = 5.0           # max mean impulse rate (per second)
-    impulse_amplitude_max: float = 5.0      # max amplitude relative to noise RMS
 
     # QSB — slow sinusoidal signal fading within a sample (0.05–0.3 Hz).
     # Captures mark-to-mark amplitude variation from propagation.
@@ -386,8 +361,6 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.iws_factor_max = 1.1
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.02
-        cfg.morse.noise_color_probability = 0.0
-        cfg.morse.narrowband_probability = 1.0
         cfg.morse.tone_drift = 1.0
         cfg.training.num_epochs = 5
         cfg.training.samples_per_epoch = 200
@@ -409,22 +382,16 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.iws_factor_max = 1.5
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.05
-        cfg.morse.noise_color_probability = 0.0
-        cfg.morse.narrowband_probability = 1.0
         cfg.morse.tone_drift = 3.0
         cfg.training.batch_size = 128
-        cfg.training.learning_rate = 4e-4   
+        cfg.training.learning_rate = 6e-4
         cfg.training.num_epochs = 200
         cfg.training.samples_per_epoch = 15000
         cfg.training.val_samples = 1500
         cfg.training.num_workers = 14
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (mild — model learns basic task first)
-        cfg.morse.thermal_noise_db = 20.0   # broadband floor ~60 dB below signal peak
         cfg.morse.agc_probability = 0.3
-        cfg.morse.impulse_noise_probability = 0.2
-        cfg.morse.impulse_rate_max = 3.0
-        cfg.morse.impulse_amplitude_max = 4.0
         # qsb_probability left at 0.0 for clean stage
 
     elif scenario == "full":
@@ -440,23 +407,17 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.iws_factor_max = 2.5
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.20
-        cfg.morse.noise_color_probability = 0.3   # 30% pink/brown noise
-        cfg.morse.narrowband_probability = 1.0    # all samples narrowband
         cfg.morse.tone_drift = 5.0
         cfg.training.batch_size = 128
-        cfg.training.learning_rate = 6e-4   
+        cfg.training.learning_rate = 6e-4
         cfg.training.num_epochs = 500
         cfg.training.samples_per_epoch = 24000
         cfg.training.val_samples = 2400
         cfg.training.num_workers = 14
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (full strength for curriculum stage 2)
-        cfg.morse.thermal_noise_db = 20.0   # broadband floor ~60 dB below signal peak
         cfg.morse.agc_probability = 0.7
         cfg.morse.agc_depth_db_max = 18.0
-        cfg.morse.impulse_noise_probability = 0.5
-        cfg.morse.impulse_rate_max = 8.0
-        cfg.morse.impulse_amplitude_max = 6.0
         cfg.morse.qsb_probability = 0.3
 
     else:

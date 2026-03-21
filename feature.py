@@ -253,6 +253,98 @@ class MorseFeatureExtractor:
             return np.array(frames, dtype=np.float32)
         return np.empty((0, self.n_channels), dtype=np.float32)
 
+    def process_batch(self, audio: np.ndarray) -> np.ndarray:
+        """Process a complete audio buffer in a single vectorized pass.
+
+        Equivalent to ``reset(); process_chunk(audio)`` but eliminates the
+        per-frame Python loop by using a batched STFT and vectorised numpy
+        operations throughout.  Intended for offline training-data generation
+        where the full buffer is available at once.
+
+        State (history, phase buffer) is **not** updated; the method is
+        side-effect-free and can be called multiple times without ``reset()``.
+
+        Parameters
+        ----------
+        audio : np.ndarray
+            1-D float32 PCM at ``config.sample_rate``.
+
+        Returns
+        -------
+        np.ndarray
+            float32 of shape ``(n_frames, n_channels)``.
+        """
+        audio = np.asarray(audio, dtype=np.float32)
+        ws = self._window_samples
+        hs = self._hop_samples
+        n = len(audio)
+        if n < ws:
+            return np.empty((0, self.n_channels), dtype=np.float32)
+
+        n_frames = 1 + (n - ws) // hs
+
+        # 1. Batch STFT ---------------------------------------------------
+        # sliding_window_view gives a zero-copy strided view: (n_frames, ws)
+        frames_view = np.lib.stride_tricks.sliding_window_view(audio, ws)[::hs][:n_frames]
+        windowed = frames_view * self._window          # (n_frames, ws) float32
+        # rfft upcasts to float64; output is complex128
+        spectra = np.fft.rfft(windowed, axis=1)        # (n_frames, ws//2+1)
+
+        # 2. Peak bin energy (dB) per frame --------------------------------
+        band = (
+            np.abs(spectra[:, self._freq_lo:self._freq_hi]) ** 2 / (ws * ws)
+        )  # (n_frames, n_bins)
+        row_idx = np.arange(n_frames)
+        peak_idx_arr = np.argmax(band, axis=1)         # (n_frames,) int
+        peak_power = band[row_idx, peak_idx_arr]       # (n_frames,)
+        peak_db = 10.0 * np.log10(np.maximum(peak_power, 1e-15))  # (n_frames,)
+
+        # 3. Sliding-window adaptive threshold (p25 / p75) ----------------
+        wf = len(self._history)  # window_frames (~1000)
+        # Pre-fill history prefix with the first peak_db value to simulate
+        # the warm-up from the leading silence period.
+        prefix = np.full(wf - 1, peak_db[0])
+        padded_db = np.concatenate([prefix, peak_db])   # len = n_frames + wf - 1
+        # Contiguous (n_frames, wf) copy — needed for fast partition.
+        db_wins = np.ascontiguousarray(
+            np.lib.stride_tricks.sliding_window_view(padded_db, wf)[:n_frames]
+        )
+        # np.partition is O(n) per row — much faster than full sort.
+        k25 = int(round(0.25 * (wf - 1)))
+        k75 = int(round(0.75 * (wf - 1)))
+        db_part = np.partition(db_wins, [k25, k75], axis=1)
+        p25 = db_part[:, k25]
+        p75 = db_part[:, k75]
+        center = (p25 + p75) * 0.5
+        spread = np.maximum(p75 - p25, self._MIN_SPREAD_DB)
+        E = np.tanh((peak_db - center) * (self._GAIN_FACTOR / spread))  # (n_frames,)
+
+        # 4. Phase coherence -----------------------------------------------
+        K = self._COHERENCE_K
+        peak_phase = np.angle(
+            spectra[row_idx, self._freq_lo + peak_idx_arr]
+        )  # (n_frames,)
+        R = np.full(n_frames, 0.5)
+        if n_frames >= 2:
+            diffs = np.diff(peak_phase)                          # (n_frames-1,)
+            diffs = (diffs + np.pi) % (2.0 * np.pi) - np.pi    # wrap to [-π, π]
+            # Pad K-1 zeros so that frame 1 starts with a K-element window.
+            pad_d = np.concatenate([np.zeros(K - 1), diffs])    # len = n_frames+K-2
+            if len(pad_d) >= K:
+                diff_wins = np.ascontiguousarray(
+                    np.lib.stride_tricks.sliding_window_view(pad_d, K)[:n_frames - 1]
+                )  # (n_frames-1, K)
+                R[1:] = np.abs(np.mean(np.exp(1j * diff_wins), axis=1))
+
+        # 5. Output --------------------------------------------------------
+        if self._use_combined:
+            a, b = self._COMBINE_ALPHA, self._COMBINE_BETA
+            out = (E * (a + b * R) / (a + b))[:, np.newaxis]   # (n_frames, 1)
+        else:
+            out = np.stack([E, R], axis=1)                      # (n_frames, 2)
+
+        return out.astype(np.float32)
+
     def flush(self) -> np.ndarray:
         """No-op; this extractor has no startup buffer."""
         return np.empty((0, self.n_channels), dtype=np.float32)
