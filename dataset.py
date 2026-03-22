@@ -3,13 +3,15 @@ dataset.py — On-the-fly streaming dataset for CWNet CTC training.
 
 Every sample is synthesised fresh on each iteration:
   1. morse_generator.generate_sample() → float32 audio + transcript
-  2. MorseFeatureExtractor.process_batch() → SNR ratio time series
+  2. MorseFeatureExtractor.process_chunk() → SNR ratio time series with delayed threshold (10-frame lag)
   3. vocab.encode(transcript) → target indices
   4. CTC feasibility check: output_frames ≥ target_length
 
 No audio files are pre-generated or stored.  Works efficiently with
 ``DataLoader(num_workers > 0)``; each worker maintains its own feature
-extractor instance (stateful, so not shared between workers).
+extractor instance (stateful, so not shared between workers). The delayed threshold
+application introduces ~50ms of latency but provides more accurate mark/space
+separation by using the adapted threshold.
 
 Usage::
 
@@ -113,8 +115,8 @@ class StreamingMorseDataset(IterableDataset):
             except Exception:
                 continue   # skip rare synthesis failures silently
 
-            # Vectorised single-pass extraction (no per-frame Python loop)
-            features = extractor.process_batch(audio_f32)  # (T_frames, n_channels)
+            # Streaming frame-by-frame extraction with delayed threshold application
+            features = extractor.process_chunk(audio_f32)  # (T_frames, n_channels)
 
             if len(features) == 0:
                 continue

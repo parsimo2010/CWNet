@@ -10,6 +10,9 @@
 # debug files
 checkpoints/debug_samples
 
+# plan documents from Roo
+plans/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

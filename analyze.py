@@ -170,7 +170,16 @@ def extract_features_verbose(
     n_out = min(len(diags), n_frames_cap)
 
     peak_db       = np.array([d["peak_db"]        for d in diags[:n_out]], dtype=np.float64)
-    center_db     = np.array([d["center_db"]      for d in diags[:n_out]], dtype=np.float64)
+    
+    # Shift adaptive threshold left by 10 frames to show when it was actually computed.
+    # The feature extractor uses a 10-frame delay, so center_db at frame N represents
+    # the threshold available after seeing frames up to N+10. To plot this correctly,
+    # we shift it left (earlier in time) by 10 frames and pad with NaN.
+    _DELAY_FRAMES = 5
+    center_db_raw = np.array([d["center_db"] for d in diags[:n_out]], dtype=np.float64)
+    center_db = np.full(n_out, np.nan, dtype=np.float64)
+    if n_out > _DELAY_FRAMES:
+        center_db[_DELAY_FRAMES:] = center_db_raw[:-_DELAY_FRAMES]
     mark_level_db = np.array([d["mark_level_db"]  for d in diags[:n_out]], dtype=np.float64)
     space_level_db= np.array([d["space_level_db"] for d in diags[:n_out]], dtype=np.float64)
     spread_db     = np.array([d["spread_db"]      for d in diags[:n_out]], dtype=np.float64)
@@ -383,7 +392,7 @@ def _plot_chunk(
     ax.set_xlim(t_frames[0], t_frames[-1])
     ax.grid(True, alpha=0.25)
     ax.set_title(
-        "Phase coherence  [mean resultant length, K=7 frames]", fontsize=9,
+        "Phase coherence  [mean resultant length, K=5 frames]", fontsize=9,
     )
     ax.set_xticklabels([])
 

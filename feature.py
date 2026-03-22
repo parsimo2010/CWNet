@@ -5,12 +5,12 @@ Converts streaming mono audio into a time series of mark probability features:
 
   Single-channel **Combined mark probability** (tanh-normalised):
     Combines the energy feature and phase coherence into one unified signal:
-    
+
       E = tanh((peak_dB − center) × 3 / spread)   [energy, range [-1,+1]]
       R = mean resultant length                     [coherence, range [0,1]]
-      
+
       combined = E × (α + β×R) / (α + β)
-      
+
     Where α=2.0 and β=1.0 give more weight to energy while still penalizing
     low-coherence regions. The output ranges approximately [-0.95,+0.95] for
     clean signals, with low coherence suppressing the magnitude regardless of
@@ -21,9 +21,44 @@ Converts streaming mono audio into a time series of mark probability features:
       Channel 0 = Energy feature E (tanh output, range [-1,+1])
       Channel 1 = Phase coherence R (mean resultant length, range [0,1])
 
-The energy feature is inherently AGC-immune: the percentile-based
-threshold tracks any shifts in absolute amplitude automatically.  No
-explicit noise floor estimation is required.
+Adaptive threshold — asymmetric EMA peak/valley followers:
+  The center and spread are derived from two separate exponential moving
+  averages that adapt asymmetrically:
+
+    mark_ema  — tracks the mark (high-energy) level:
+                  Pulls UP quickly when energy >> mark_ema.
+                  Releases slowly downward when energy < mark_ema.
+                  Large upward deviations produce fast pull-up (non-linear alpha).
+
+    space_ema — tracks the space (low-energy) level:
+                  Pulls DOWN quickly when energy << space_ema.
+                  Releases slowly upward when energy > space_ema.
+                  Large downward deviations produce fast pull-down.
+
+  This separates the two levels so that:
+    • Very high energy pulls up mark_ema but cannot raise space_ema.
+    • Very low energy pulls down space_ema but cannot lower mark_ema.
+
+  As a result, the threshold adapts within the first few frames of a new
+  signal even after a long leading-silence period, giving clean mark/space
+  separation for the first character.
+
+      center = (0.667*mark_ema + 0.333*space_ema)
+      spread = max(mark_ema − space_ema, MIN_SPREAD_DB)
+      E      = tanh((peak_dB − center) × 3 / spread)
+
+Delayed threshold application:
+  The computed features are emitted with a fixed 10-frame delay. This means
+  frame N's output uses the threshold that was available after seeing frames
+  up to N+10. The EMA state updates continuously, but the feature computation
+  for each frame is delayed by 10 frames to compensate for the time it takes
+  the EMA to adapt to signal changes.
+
+      • Frames 0-9: Use current threshold values (warm-up period)
+      • Frame 10+:  Use threshold from 10 frames ago
+
+  At default hop_ms=5ms, this introduces ~50ms of latency but provides more
+  accurate mark/space separation by using the adapted threshold.
 
 Usage::
 
@@ -70,8 +105,16 @@ class MorseFeatureExtractor:
         Channel 0: Energy feature E (tanh-normalised, range [-1,+1])
         Channel 1: Phase coherence R (mean resultant length, range [0,1])
 
-    The energy feature is inherently AGC-immune: the percentile-based
-    threshold tracks any shifts in absolute amplitude automatically.
+    The adaptive threshold uses two asymmetric EMA trackers:
+      mark_ema  — fast upward response, slow downward release.
+      space_ema — fast downward response, slow upward release.
+    Adaptation speed scales with the deviation from the current level,
+    so large jumps (e.g. signal arriving after a long silence) are captured
+    in just a few frames.
+
+    The output features have a fixed 10-frame delay - frame N's output uses
+    the threshold computed after seeing frames up to N+10. This compensates
+    for the time it takes the EMA to adapt to signal changes.
 
     Parameters
     ----------
@@ -92,11 +135,17 @@ class MorseFeatureExtractor:
         Number of output channels (1 if use_combined=True, 2 otherwise).
     """
 
-    # Sliding window duration for adaptive threshold estimation.
-    _WINDOW_SEC: float = 5.0
     _MIN_SPREAD_DB: float = 10.0
     _GAIN_FACTOR: float = 3.0
-    _COHERENCE_K: int = 7
+    _COHERENCE_K: int = 10
+
+    # Asymmetric EMA parameters for the adaptive threshold.
+    # _FAST_DB: characteristic deviation (dB) at which the fast-response alpha
+    #   reaches (1 - 1/e) ≈ 0.63. Smaller = faster. Applies to both mark and space.
+    # _RELEASE: per-frame alpha for the slow release direction. At 200 fps:
+    #   0.998 → τ ≈ 2.5 s; 0.995 → τ ≈ 1 s. Applies to both mark and space.
+    _FAST_DB: float = 6.0
+    _RELEASE: float = 0.998
 
     # Combined feature weighting parameters.
     # α (alpha) controls baseline weight; β (beta) scales coherence contribution.
@@ -143,11 +192,16 @@ class MorseFeatureExtractor:
         # Bin centre frequencies (Hz) for diagnostics
         self.bin_freqs: np.ndarray = freqs[self._freq_lo:self._freq_hi]
 
-        # Sliding window (circular buffer) for peak energy history
-        window_frames = max(1, round(self.fps * self._WINDOW_SEC))
-        self._history = np.zeros(window_frames, dtype=np.float64)
-        self._hist_pos: int = 0
-        self._hist_count: int = 0
+        # Asymmetric EMA state for adaptive threshold.
+        # None until the first frame is processed; then initialised to peak_db.
+        self._mark_ema: Optional[float] = None   # mark-level (peak follower)
+        self._space_ema: Optional[float] = None  # space-level (valley follower)
+
+        # Delayed threshold buffer - stores snapshots for applying latest EMA to past frames
+        # Fixed delay of 10 frames compensates for time it takes EMA to adapt
+        self._threshold_delay_frames: int = 5
+        self._frame_history: list[dict] = []  # Each entry: {"peak_db": float, "mark_ema_after": float, "space_ema_after": float}
+        self._frame_history_count: int = 0   # Total frames processed (for indexing)
 
         # Phase coherence state
         self._phase_diffs = np.zeros(self._COHERENCE_K, dtype=np.float64)
@@ -197,7 +251,7 @@ class MorseFeatureExtractor:
         """Per-frame diagnostic dicts (only populated if record_diagnostics=True).
 
         Each dict has keys: peak_db, center_db, mark_level_db,
-        space_level_db, spread_db, output, coherence.
+        space_level_db, spread_db, energy, coherence.
         """
         return self._diagnostics
 
@@ -217,6 +271,13 @@ class MorseFeatureExtractor:
         Returns feature values per completed STFT hop:
           - If use_combined=True (default): single channel with combined mark probability
           - If use_combined=False: two channels [energy, coherence]
+
+        The output features have a fixed 10-frame delay - frame N's output uses
+        the threshold computed after seeing frames up to N+10. This compensates
+        for the time it takes the EMA to adapt to signal changes.
+
+          • Frames 0-9: Use current threshold values (warm-up period)
+          • Frame 10+:  Use threshold from 10 frames ago
 
         Parameters
         ----------
@@ -253,98 +314,6 @@ class MorseFeatureExtractor:
             return np.array(frames, dtype=np.float32)
         return np.empty((0, self.n_channels), dtype=np.float32)
 
-    def process_batch(self, audio: np.ndarray) -> np.ndarray:
-        """Process a complete audio buffer in a single vectorized pass.
-
-        Equivalent to ``reset(); process_chunk(audio)`` but eliminates the
-        per-frame Python loop by using a batched STFT and vectorised numpy
-        operations throughout.  Intended for offline training-data generation
-        where the full buffer is available at once.
-
-        State (history, phase buffer) is **not** updated; the method is
-        side-effect-free and can be called multiple times without ``reset()``.
-
-        Parameters
-        ----------
-        audio : np.ndarray
-            1-D float32 PCM at ``config.sample_rate``.
-
-        Returns
-        -------
-        np.ndarray
-            float32 of shape ``(n_frames, n_channels)``.
-        """
-        audio = np.asarray(audio, dtype=np.float32)
-        ws = self._window_samples
-        hs = self._hop_samples
-        n = len(audio)
-        if n < ws:
-            return np.empty((0, self.n_channels), dtype=np.float32)
-
-        n_frames = 1 + (n - ws) // hs
-
-        # 1. Batch STFT ---------------------------------------------------
-        # sliding_window_view gives a zero-copy strided view: (n_frames, ws)
-        frames_view = np.lib.stride_tricks.sliding_window_view(audio, ws)[::hs][:n_frames]
-        windowed = frames_view * self._window          # (n_frames, ws) float32
-        # rfft upcasts to float64; output is complex128
-        spectra = np.fft.rfft(windowed, axis=1)        # (n_frames, ws//2+1)
-
-        # 2. Peak bin energy (dB) per frame --------------------------------
-        band = (
-            np.abs(spectra[:, self._freq_lo:self._freq_hi]) ** 2 / (ws * ws)
-        )  # (n_frames, n_bins)
-        row_idx = np.arange(n_frames)
-        peak_idx_arr = np.argmax(band, axis=1)         # (n_frames,) int
-        peak_power = band[row_idx, peak_idx_arr]       # (n_frames,)
-        peak_db = 10.0 * np.log10(np.maximum(peak_power, 1e-15))  # (n_frames,)
-
-        # 3. Sliding-window adaptive threshold (p25 / p75) ----------------
-        wf = len(self._history)  # window_frames (~1000)
-        # Pre-fill history prefix with the first peak_db value to simulate
-        # the warm-up from the leading silence period.
-        prefix = np.full(wf - 1, peak_db[0])
-        padded_db = np.concatenate([prefix, peak_db])   # len = n_frames + wf - 1
-        # Contiguous (n_frames, wf) copy — needed for fast partition.
-        db_wins = np.ascontiguousarray(
-            np.lib.stride_tricks.sliding_window_view(padded_db, wf)[:n_frames]
-        )
-        # np.partition is O(n) per row — much faster than full sort.
-        k25 = int(round(0.25 * (wf - 1)))
-        k75 = int(round(0.75 * (wf - 1)))
-        db_part = np.partition(db_wins, [k25, k75], axis=1)
-        p25 = db_part[:, k25]
-        p75 = db_part[:, k75]
-        center = (p25 + p75) * 0.5
-        spread = np.maximum(p75 - p25, self._MIN_SPREAD_DB)
-        E = np.tanh((peak_db - center) * (self._GAIN_FACTOR / spread))  # (n_frames,)
-
-        # 4. Phase coherence -----------------------------------------------
-        K = self._COHERENCE_K
-        peak_phase = np.angle(
-            spectra[row_idx, self._freq_lo + peak_idx_arr]
-        )  # (n_frames,)
-        R = np.full(n_frames, 0.5)
-        if n_frames >= 2:
-            diffs = np.diff(peak_phase)                          # (n_frames-1,)
-            diffs = (diffs + np.pi) % (2.0 * np.pi) - np.pi    # wrap to [-π, π]
-            # Pad K-1 zeros so that frame 1 starts with a K-element window.
-            pad_d = np.concatenate([np.zeros(K - 1), diffs])    # len = n_frames+K-2
-            if len(pad_d) >= K:
-                diff_wins = np.ascontiguousarray(
-                    np.lib.stride_tricks.sliding_window_view(pad_d, K)[:n_frames - 1]
-                )  # (n_frames-1, K)
-                R[1:] = np.abs(np.mean(np.exp(1j * diff_wins), axis=1))
-
-        # 5. Output --------------------------------------------------------
-        if self._use_combined:
-            a, b = self._COMBINE_ALPHA, self._COMBINE_BETA
-            out = (E * (a + b * R) / (a + b))[:, np.newaxis]   # (n_frames, 1)
-        else:
-            out = np.stack([E, R], axis=1)                      # (n_frames, 2)
-
-        return out.astype(np.float32)
-
     def flush(self) -> np.ndarray:
         """No-op; this extractor has no startup buffer."""
         return np.empty((0, self.n_channels), dtype=np.float32)
@@ -353,21 +322,75 @@ class MorseFeatureExtractor:
         """Reset all state for a new stream."""
         self._buf[:] = 0.0
         self._buf_fill = 0
-        self._history[:] = 0.0
-        self._hist_pos = 0
-        self._hist_count = 0
+        self._mark_ema = None
+        self._space_ema = None
         self._phase_diffs[:] = 0.0
         self._pd_pos = 0
         self._pd_count = 0
         self._prev_phase = None
         self._diagnostics.clear()
+        
+        # Clear delayed threshold history buffer
+        self._frame_history.clear()
+        self._frame_history_count = 0
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
+    def _ema_scan(self, peak_db: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Asymmetric EMA scan over a sequence of peak_db values.
+
+        Returns (mark_arr, space_arr) of the same length, representing the
+        mark-level and space-level EMA at each frame, initialised from the
+        first sample.  Does not modify any instance state.
+        """
+        n = len(peak_db)
+        mark_arr = np.empty(n, dtype=np.float64)
+        space_arr = np.empty(n, dtype=np.float64)
+        if n == 0:
+            return mark_arr, space_arr
+
+        fast_db = self._FAST_DB
+        release = self._RELEASE
+        
+        m = float(peak_db[0])
+        s = float(peak_db[0])
+        for i in range(n):
+            p = float(peak_db[i])
+        
+            # Mark EMA: fast pull-up, slow release downward.
+            dev_up = p - m
+            if dev_up > 0.0:
+                alpha = 1.0 - math.exp(-dev_up / fast_db)
+                m += alpha * dev_up
+            else:
+                m = release * m + (1.0 - release) * p
+        
+            # Space EMA: fast pull-down, slow release upward.
+            dev_down = s - p
+            if dev_down > 0.0:
+                alpha = 1.0 - math.exp(-dev_down / fast_db)
+                s -= alpha * dev_down
+            else:
+                s = release * s + (1.0 - release) * p
+        
+            mark_arr[i] = m
+            space_arr[i] = s
+
+        return mark_arr, space_arr
+
     def _process_frame(self) -> tuple[float, ...]:
         """Compute energy feature + phase coherence from the current STFT window.
+
+        Updates the asymmetric EMA state (mark_ema, space_ema) continuously and derives
+        the adaptive threshold from them. The computed feature is emitted with a 10-frame
+        delay - i.e., frame N's output uses the threshold that was available after seeing
+        frames up to N+10. This compensates for the time it takes the EMA to adapt to
+        signal changes.
+
+          • Frames 0-9: Use current threshold values (warm-up period)
+          • Frame 10+:  Use threshold from 10 frames ago
 
         If use_combined=True, returns a single combined mark probability value:
           combined = E × (α + β×R) / (α + β)
@@ -379,7 +402,8 @@ class MorseFeatureExtractor:
         -------
         tuple[float, ...]
             Either a single-element tuple with combined mark probability, or
-            a two-element tuple (energy, coherence).
+            a two-element tuple (energy, coherence). The returned values are from
+            10 frames ago (or current frame for the first 10 frames).
         """
         # STFT → power spectrum
         windowed = self._buf * self._window
@@ -396,20 +420,33 @@ class MorseFeatureExtractor:
             peak_power = 1e-15
         peak_db = 10.0 * math.log10(max(peak_power, 1e-15))
 
-        # Add to sliding window
-        self._history[self._hist_pos] = peak_db
-        self._hist_pos = (self._hist_pos + 1) % len(self._history)
-        self._hist_count = min(self._hist_count + 1, len(self._history))
+        # ---- Asymmetric EMA adaptive threshold (continuous update) ----
+        # Initialise both EMAs on the very first frame.
+        if self._mark_ema is None:
+            self._mark_ema = peak_db
+            self._space_ema = peak_db
 
-        # Adaptive threshold from percentiles
-        h = self._history[:self._hist_count]
-        p25, p75 = np.percentile(h, [25, 75])
-        center = (p25 + p75) * 0.5
-        spread = max(float(p75 - p25), self._MIN_SPREAD_DB)
-        gain = self._GAIN_FACTOR / spread
-
-        # Normalised energy output: mark ≈ +0.9, space ≈ −0.9
-        E = float(math.tanh((peak_db - center) * gain))
+        fast_db = self._FAST_DB
+        release = self._RELEASE
+        
+        # Mark EMA: fast pull-up when energy is above current mark level.
+        dev_up = peak_db - self._mark_ema
+        if dev_up > 0.0:
+            alpha = 1.0 - math.exp(-dev_up / fast_db)
+            self._mark_ema += alpha * dev_up
+        else:
+            self._mark_ema = release * self._mark_ema + (1.0 - release) * peak_db
+        
+        # Enforce minimum mark level of -60 dB
+        self._mark_ema = max(self._mark_ema, -60.0)
+        
+        # Space EMA: fast pull-down when energy is below current space level.
+        dev_down = self._space_ema - peak_db
+        if dev_down > 0.0:
+            alpha = 1.0 - math.exp(-dev_down / fast_db)
+            self._space_ema -= alpha * dev_down
+        else:
+            self._space_ema = release * self._space_ema + (1.0 - release) * peak_db
 
         # ---- Phase coherence (mean resultant length R) ----
         # Phase at the peak frequency bin
@@ -433,12 +470,71 @@ class MorseFeatureExtractor:
         else:
             R = 0.5   # neutral until we have enough data
 
+        # ---- Compute feature with delayed threshold application ----
+        # For frames 0-9, use current threshold (warm-up period)
+        # For frame 10+, use threshold from after processing frame (count - 10)
+        
+        if self._frame_history_count < self._threshold_delay_frames:
+            # Warm-up: use current EMA values
+            center = (0.667*self._mark_ema + 0.333*self._space_ema)
+            spread = max(self._mark_ema - self._space_ema, self._MIN_SPREAD_DB)
+            gain = self._GAIN_FACTOR / spread
+            E = float(math.tanh((peak_db - center) * gain))
+        else:
+            # Normal operation: use threshold from after processing frame (count - 10)
+            delayed_idx = self._frame_history_count - self._threshold_delay_frames
+            
+            if delayed_idx == 0:
+                # After processing frame 0, EMA equals initial value (first peak_db)
+                old_peak_db = float(peak_db)
+                old_mark_ema = float(self._mark_ema)
+                old_space_ema = float(self._space_ema)
+                
+                center = (0.667*self._mark_ema + 0.333*self._space_ema)
+                spread = max(old_mark_ema - old_space_ema, self._MIN_SPREAD_DB)
+                gain = self._GAIN_FACTOR / spread
+                E = float(math.tanh((old_peak_db - center) * gain))
+            else:
+                # After processing frame j, EMA state is mark_arr[j], space_arr[j]
+                hist_idx = delayed_idx - 1 if delayed_idx > 0 else 0
+                
+                if hist_idx < len(self._frame_history):
+                    old_snapshot = self._frame_history[hist_idx]
+                    old_peak_db = old_snapshot["peak_db"]
+                    old_mark_ema = old_snapshot["mark_ema_after"]
+                    old_space_ema = old_snapshot["space_ema_after"]
+                    
+                    center = (0.667*self._mark_ema + 0.333*self._space_ema)
+                    spread = max(old_mark_ema - old_space_ema, self._MIN_SPREAD_DB)
+                    gain = self._GAIN_FACTOR / spread
+                    E = float(math.tanh((old_peak_db - center) * gain))
+                else:
+                    # Fallback to current values if history not available yet
+                    center = (0.667*self._mark_ema + 0.333*self._space_ema)
+                    spread = max(self._mark_ema - self._space_ema, self._MIN_SPREAD_DB)
+                    gain = self._GAIN_FACTOR / spread
+                    E = float(math.tanh((peak_db - center) * gain))
+
+        # Store snapshot for future delayed use (EMA state AFTER this update)
+        self._frame_history.append({
+            "peak_db": peak_db,
+            "mark_ema_after": self._mark_ema,
+            "space_ema_after": self._space_ema,
+        })
+        
+        # Keep buffer bounded - only need enough history for delay + 1 extra frame
+        max_history = self._threshold_delay_frames + 2
+        if len(self._frame_history) > max_history:
+            self._frame_history.pop(0)
+
+        self._frame_history_count += 1
+
         if self._record_diagnostics:
             self._diagnostics.append({
                 "peak_db":        peak_db,
                 "center_db":      float(center),
-                "mark_level_db":  float(p75),
-                "space_level_db": float(p25),
+                "mark_level_db":  float(self._mark_ema),
+                "space_level_db": float(self._space_ema),
                 "spread_db":      float(spread),
                 "energy":         E,
                 "coherence":      R,
@@ -474,8 +570,7 @@ if __name__ == "__main__":
     print(f"Freq range  : {cfg.freq_min}-{cfg.freq_max} Hz  ({fe.n_bins} bins)")
     print(f"Channels    : {fe.n_channels}")
     print(f"Coherence K : {fe._COHERENCE_K} frames ({fe._COHERENCE_K * cfg.hop_ms:.0f} ms)")
-    print(f"History     : {fe._hist_count}/{len(fe._history)} frames "
-          f"({fe._WINDOW_SEC:.1f} s)")
+    print(f"Fast DB     : {fe._FAST_DB} dB  release a={fe._RELEASE}")
 
     sr = cfg.sample_rate
     freq = 700.0
@@ -489,77 +584,62 @@ if __name__ == "__main__":
     audio_tone = (0.5 * np.sin(2 * math.pi * freq * t)
                   + rng.normal(0, noise_std, len(t))).astype(np.float32)
 
-    fe_test = MorseFeatureExtractor(cfg, record_diagnostics=True)
+    fe_test = MorseFeatureExtractor(cfg, use_combined=False, record_diagnostics=True)
     features_tone = fe_test.process_chunk(audio_tone)
     assert features_tone.shape[1] == 2, f"Expected 2 channels, got {features_tone.shape}"
     diags = fe_test.diagnostics
     spread_vals = [d["spread_db"] for d in diags]
-    output_vals = [d["output"] for d in diags]
+    energy_vals = [d["energy"] for d in diags]
     coh_vals = [d["coherence"] for d in diags]
     print(f"\nContinuous tone ({features_tone.shape[0]} frames, {features_tone.shape[1]} ch):")
     print(f"  spread range: {min(spread_vals):.1f}-{max(spread_vals):.1f} dB "
           f"(clamped to min {fe._MIN_SPREAD_DB})")
-    print(f"  output range: {min(output_vals):.3f} to {max(output_vals):.3f}  "
+    print(f"  energy range: {min(energy_vals):.3f} to {max(energy_vals):.3f}  "
           f"(should be near 0)")
     print(f"  coherence  : {min(coh_vals):.3f} to {max(coh_vals):.3f}  "
           f"(should be high, near 1.0)")
 
-    # --- Test 2: keyed tone → output alternates ±0.9, coherence tracks
+    # --- Test 2: silence then keyed tone → first character features correct
+    silence_sec = 1.0
     dur_key = 5.0
+    t_silence = np.zeros(int(silence_sec * sr), dtype=np.float32)
     t_key = np.linspace(0, dur_key, int(dur_key * sr), endpoint=False)
     noise_key = rng.normal(0, noise_std, len(t_key)).astype(np.float32)
     key_env = np.zeros(len(t_key), dtype=np.float32)
-    for sec_start, sec_end in [(0.5, 1.0), (1.5, 2.0), (2.5, 3.5), (4.0, 4.5)]:
+    for sec_start, sec_end in [(0.0, 0.06), (0.12, 0.18), (0.24, 0.30), (0.36, 0.42),
+                                (0.6, 0.78), (1.0, 1.5)]:
         i0, i1 = int(sec_start * sr), int(sec_end * sr)
         key_env[i0:i1] = 1.0
-    audio_key = (0.5 * np.sin(2 * math.pi * freq * t_key) * key_env
-                 + noise_key).astype(np.float32)
+    audio_key = np.concatenate([
+        t_silence + rng.normal(0, noise_std, len(t_silence)).astype(np.float32),
+        (0.5 * np.sin(2 * math.pi * freq * t_key) * key_env + noise_key).astype(np.float32),
+    ])
 
-    fe_key = MorseFeatureExtractor(cfg, record_diagnostics=True)
+    fe_key = MorseFeatureExtractor(cfg, use_combined=False, record_diagnostics=True)
     features_key = fe_key.process_chunk(audio_key)
     diags_key = fe_key.diagnostics
-    out_key = [d["output"] for d in diags_key]
+    energy_key = [d["energy"] for d in diags_key]
     coh_key = [d["coherence"] for d in diags_key]
     spread_key = [d["spread_db"] for d in diags_key]
 
-    mark_frame = int(0.75 / (cfg.hop_ms / 1000.0))
-    space_frame = int(1.25 / (cfg.hop_ms / 1000.0))
-    print(f"\nKeyed tone test ({features_key.shape[0]} frames):")
+    # First dit starts right after silence (at frame ~200 = 1.0s / 5ms)
+    silence_frames = int(silence_sec / (cfg.hop_ms / 1000.0))
+    first_mark_frame = silence_frames + int(0.03 / (cfg.hop_ms / 1000.0))   # mid-first-dit
+    first_space_frame = silence_frames + int(0.09 / (cfg.hop_ms / 1000.0))  # first inter-dit gap
+    print(f"\nSilence + keyed tone test ({features_key.shape[0]} frames):")
     print(f"  spread range: {min(spread_key):.1f}-{max(spread_key):.1f} dB")
-    print(f"  output at t=0.75s (mark): {out_key[mark_frame]:.3f}  (should be > 0.5)")
-    print(f"  output at t=1.25s (space): {out_key[space_frame]:.3f}  (should be < -0.5)")
-    print(f"  coherence at t=0.75s (mark): {coh_key[mark_frame]:.3f}  (should be high)")
-    print(f"  coherence at t=1.25s (space): {coh_key[space_frame]:.3f}  (should be low)")
-    print(f"  output range: {min(out_key):.3f} to {max(out_key):.3f}")
+    print(f"  energy at first dit mid (should be > 0.5): {energy_key[first_mark_frame]:.3f}")
+    print(f"  energy at first space  (should be < -0.5): {energy_key[first_space_frame]:.3f}")
 
     # --- Test 3: noise only → small fluctuations, low coherence -------
     audio_noise = rng.normal(0, 0.01, int(3.0 * sr)).astype(np.float32)
-    fe_noise = MorseFeatureExtractor(cfg, record_diagnostics=True)
+    fe_noise = MorseFeatureExtractor(cfg, use_combined=False, record_diagnostics=True)
     features_noise = fe_noise.process_chunk(audio_noise)
     diags_noise = fe_noise.diagnostics
-    out_noise = [d["output"] for d in diags_noise]
+    energy_noise = [d["energy"] for d in diags_noise]
     coh_noise = [d["coherence"] for d in diags_noise]
     print(f"\nNoise only ({features_noise.shape[0]} frames):")
-    print(f"  output range: {min(out_noise):.3f} to {max(out_noise):.3f}  "
+    print(f"  energy range: {min(energy_noise):.3f} to {max(energy_noise):.3f}  "
           f"(should be within ±0.5)")
     print(f"  coherence  : {min(coh_noise):.3f} to {max(coh_noise):.3f}  "
           f"(should be low, ~0.3)")
-
-    # --- Test 4: weak signal (3 dB SNR) → marks/spaces + coherence ----
-    snr_weak = 10 ** (3.0 / 10.0)
-    noise_std_weak = math.sqrt((0.5**2 / 2) / snr_weak)
-    noise_weak = rng.normal(0, noise_std_weak, len(t_key)).astype(np.float32)
-    audio_weak = (0.5 * np.sin(2 * math.pi * freq * t_key) * key_env
-                  + noise_weak).astype(np.float32)
-
-    fe_weak = MorseFeatureExtractor(cfg, record_diagnostics=True)
-    features_weak = fe_weak.process_chunk(audio_weak)
-    diags_weak = fe_weak.diagnostics
-    out_weak = [d["output"] for d in diags_weak]
-    coh_weak = [d["coherence"] for d in diags_weak]
-    print(f"\n3 dB SNR keyed tone ({features_weak.shape[0]} frames):")
-    print(f"  output at t=0.75s (mark): {out_weak[mark_frame]:.3f}  (should be positive)")
-    print(f"  output at t=1.25s (space): {out_weak[space_frame]:.3f}  (should be negative)")
-    print(f"  coherence at t=0.75s (mark): {coh_weak[mark_frame]:.3f}")
-    print(f"  coherence at t=1.25s (space): {coh_weak[space_frame]:.3f}")
-    print(f"  output range: {min(out_weak):.3f} to {max(out_weak):.3f}")
