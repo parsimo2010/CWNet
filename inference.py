@@ -4,16 +4,14 @@ inference.py — Real-time and offline inference for CWNet.
 Two decoder classes:
 
 ``CausalStreamingDecoder`` (default — recommended for all use cases):
-    Chunk-by-chunk decoder for true online streaming.  The feature extractor
-    (STFT → SNR ratio) and the GRU hidden state are both carried forward
-    across chunks so latency equals one chunk duration (default 100 ms).
-    Requires a checkpoint trained with ``causal=True`` (always the case for
-    CWNet checkpoints).
+    Chunk-by-chunk decoder for true online streaming.  The event extractor,
+    featurizer, and LSTM hidden state are all carried forward across chunks
+    so latency equals one chunk duration (default 100 ms).
 
 ``StreamingDecoder`` (sliding window — for offline whole-file decoding):
-    Buffers a 2-second window of SNR ratio values and decodes each window
-    independently.  More accurate at boundaries than causal decoding for
-    offline use; does NOT maintain GRU state across windows.
+    Processes audio in overlapping windows; each window gets a fresh
+    extractor/featurizer and no LSTM state is carried across windows.
+    More accurate at boundaries than causal decoding for offline use.
 
 Usage (Python API)::
 
@@ -37,7 +35,7 @@ import argparse
 import re
 import warnings
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -46,9 +44,9 @@ import torchaudio
 from torch import Tensor
 
 import vocab as vocab_module
-from config import Config, FeatureConfig, ModelConfig
-from feature import MorseFeatureExtractor
-from model import MorseCTCModel
+from config import FeatureConfig, ModelConfig
+from feature import MorseEventExtractor
+from model import MorseEventFeaturizer, MorseEventModel
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +54,7 @@ from model import MorseCTCModel
 # ---------------------------------------------------------------------------
 
 def _to_float32(audio: np.ndarray) -> np.ndarray:
-    """Convert int16 or float64 PCM to float32 in [−1, 1]."""
+    """Convert int16 or float64 PCM to float32 in [-1, 1]."""
     if audio.dtype == np.int16:
         return audio.astype(np.float32) / 32768.0
     return audio.astype(np.float32)
@@ -80,17 +78,12 @@ def _load_checkpoint(checkpoint: str, device: torch.device) -> tuple:
         )
     model_cfg = ModelConfig.from_dict(cfg_dict["model"])
 
-    # Sample rate from morse config (fallback 8000)
-    sample_rate = int(cfg_dict.get("morse", {}).get("sample_rate", 8000))
+    # Sample rate from morse config (fallback 16000)
+    sample_rate = int(cfg_dict.get("morse", {}).get("sample_rate", 16000))
 
     # Build model
-    model = MorseCTCModel(
-        in_channels=model_cfg.in_channels,
-        cnn_channels=model_cfg.cnn_channels,
-        cnn_time_pools=model_cfg.cnn_time_pools,
-        cnn_dilations=model_cfg.cnn_dilations,
-        cnn_kernel_size=model_cfg.cnn_kernel_size,
-        proj_size=model_cfg.proj_size,
+    model = MorseEventModel(
+        in_features=model_cfg.in_features,
         hidden_size=model_cfg.hidden_size,
         n_rnn_layers=model_cfg.n_rnn_layers,
         dropout=0.0,          # no dropout at inference
@@ -100,13 +93,25 @@ def _load_checkpoint(checkpoint: str, device: torch.device) -> tuple:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
             model = torch.quantization.quantize_dynamic(
-                model, {torch.nn.GRU, torch.nn.Linear}, dtype=torch.qint8
+                model, {torch.nn.LSTM, torch.nn.Linear}, dtype=torch.qint8
             )
 
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
     return model, feature_cfg, model_cfg, sample_rate
+
+
+def _events_to_input(
+    featurizer: MorseEventFeaturizer,
+    events: list,
+    device: torch.device,
+) -> Optional[Tensor]:
+    """Featurize events and return a (T, 1, 5) tensor, or None if empty."""
+    if not events:
+        return None
+    feats = np.stack([featurizer.featurize(ev) for ev in events], axis=0)  # (T, 5)
+    return torch.from_numpy(feats).unsqueeze(1).to(device)  # (T, 1, 5)
 
 
 # ---------------------------------------------------------------------------
@@ -116,19 +121,15 @@ def _load_checkpoint(checkpoint: str, device: torch.device) -> tuple:
 class CausalStreamingDecoder:
     """Chunk-by-chunk streaming Morse decoder.
 
-    Audio chunks are processed in order; the feature extractor's overlap
-    buffer + noise EMA and the model's GRU hidden state are carried forward
-    across chunks for true causal streaming inference.
+    Audio chunks are processed in order; the event extractor's adaptive
+    threshold state, the featurizer's log-ratio state, and the model's
+    LSTM hidden state are all carried forward across chunks for true
+    causal streaming inference.
 
     Args:
         checkpoint: Path to a ``best_model.pt`` checkpoint.
         chunk_size_ms: Chunk duration in milliseconds (default 100 ms).
-            Must be long enough to produce at least one output frame
-            (≥ pool_factor × hop_ms).
         device: PyTorch device string (``"cpu"`` or ``"cuda"``).
-        noise_ema_alpha: Override the EMA smoothing factor from the checkpoint
-            config.  Useful for adjusting noise floor tracking speed at
-            inference time without retraining.
         beam_width: CTC beam search width (1 = greedy argmax, faster).
     """
 
@@ -137,42 +138,34 @@ class CausalStreamingDecoder:
         checkpoint: str,
         chunk_size_ms: float = 100.0,
         device: str = "cpu",
-        noise_ema_alpha: Optional[float] = None,
         beam_width: int = 1,
     ) -> None:
         self.device = torch.device(device)
         self.chunk_size_ms = chunk_size_ms
         self.beam_width = beam_width
 
-        self._model, feature_cfg, model_cfg, self.sample_rate = _load_checkpoint(
-            checkpoint, self.device
+        self._model, self._feature_cfg, model_cfg, self.sample_rate = (
+            _load_checkpoint(checkpoint, self.device)
         )
 
-        self._extractor = MorseFeatureExtractor(feature_cfg)
-        self._pool_factor = model_cfg.pool_factor
-        self._in_channels = model_cfg.in_channels
+        self._extractor = MorseEventExtractor(self._feature_cfg)
+        self._featurizer = MorseEventFeaturizer()
 
-        # Chunk size in samples (aligned to hop boundary)
-        hop_samples = max(1, round(self.sample_rate * feature_cfg.hop_ms / 1000.0))
-        chunk_samples_raw = int(chunk_size_ms * self.sample_rate / 1000.0)
-        self._chunk_samples = max(hop_samples, (chunk_samples_raw // hop_samples) * hop_samples)
+        # Chunk size in samples
+        self._chunk_samples = max(1, int(chunk_size_ms * self.sample_rate / 1000.0))
 
         # State
         self._buffer: np.ndarray = np.empty(0, dtype=np.float32)
-        self._gru_hidden: Optional[Tensor] = None
+        self._hidden: Optional[Tuple[Tensor, Tensor]] = None
         self._prev_ctc_token: int = -1
 
     # ------------------------------------------------------------------
-    # Runtime configuration
+    # Properties
     # ------------------------------------------------------------------
 
     @property
-    def noise_ema_alpha(self) -> float:
-        return self._extractor.noise_ema_alpha
-
-    @noise_ema_alpha.setter
-    def noise_ema_alpha(self, value: float) -> None:
-        self._extractor.noise_ema_alpha = value
+    def feature_cfg(self) -> FeatureConfig:
+        return self._feature_cfg
 
     @property
     def latency_ms(self) -> float:
@@ -185,9 +178,10 @@ class CausalStreamingDecoder:
     def reset(self) -> None:
         """Reset all state for a new utterance or stream."""
         self._buffer = np.empty(0, dtype=np.float32)
-        self._gru_hidden = None
+        self._hidden = None
         self._prev_ctc_token = -1
         self._extractor.reset()
+        self._featurizer.reset()
 
     def process_chunk(self, audio: np.ndarray) -> str:
         """Feed raw PCM samples and return newly decoded characters.
@@ -231,7 +225,6 @@ class CausalStreamingDecoder:
         self.reset()
 
         if self.beam_width > 1:
-            # Collect all log-probs then run beam search over full sequence
             all_lp = self._collect_log_probs(audio)
             return vocab_module.beam_search_ctc(
                 all_lp, beam_width=self.beam_width, strip_trailing_space=True
@@ -244,7 +237,7 @@ class CausalStreamingDecoder:
             self._buffer = np.empty(0, dtype=np.float32)
             pad_len = self._chunk_samples - len(tail)
             result += self.process_chunk(np.pad(tail, (0, pad_len)))
-        # Flush feature extractor startup buffer (for short recordings < 1 s)
+        # Flush trailing event from the extractor
         result += self._flush_extractor()
         return result.rstrip(" ")
 
@@ -252,84 +245,75 @@ class CausalStreamingDecoder:
     # Internal
     # ------------------------------------------------------------------
 
+    def _run_events(self, events: list) -> Tensor:
+        """Featurize events, run through model, update hidden state.
+
+        Returns log_probs (T, 1, num_classes) or empty tensor.
+        """
+        x = _events_to_input(self._featurizer, events, self.device)
+        if x is None:
+            return torch.zeros(0, 1, vocab_module.num_classes)
+        with torch.no_grad():
+            log_probs, self._hidden = self._model.streaming_step(x, self._hidden)
+        return log_probs
+
+    def _greedy_decode(self, log_probs: Tensor) -> str:
+        """Incremental greedy CTC decode with duplicate suppression."""
+        if log_probs.shape[0] == 0:
+            return ""
+        indices = torch.argmax(log_probs[:, 0, :], dim=-1).cpu().tolist()
+        new_text = ""
+        for idx in indices:
+            if idx != self._prev_ctc_token:
+                self._prev_ctc_token = idx
+                if idx != 0:
+                    new_text += vocab_module.idx_to_char.get(idx, "")
+        return new_text
+
     def _process_one_chunk(self, chunk: np.ndarray) -> str:
-        """Extract features and run one model step; update GRU state."""
-        features = self._extractor.process_chunk(chunk)  # (T, 2)
-        if len(features) == 0:
+        """Extract events from audio chunk and run through model."""
+        events = self._extractor.process_chunk(chunk)
+        if not events:
             return ""
 
-        with torch.no_grad():
-            # (T, 2) → (1, in_channels, T)
-            x = torch.from_numpy(
-                features[:, :self._in_channels].T.copy()
-            ).unsqueeze(0).to(self.device)
-            log_probs, self._gru_hidden = self._model.streaming_step(x, self._gru_hidden)
+        log_probs = self._run_events(events)
 
         if self.beam_width > 1:
             return vocab_module.beam_search_ctc(
                 log_probs[:, 0, :].cpu(), beam_width=self.beam_width
             )
 
-        indices = torch.argmax(log_probs[:, 0, :], dim=-1).cpu().tolist()
-        new_text = ""
-        for idx in indices:
-            if idx != self._prev_ctc_token:
-                self._prev_ctc_token = idx
-                if idx != 0:
-                    new_text += vocab_module.idx_to_char.get(idx, "")
-        return new_text
+        return self._greedy_decode(log_probs)
 
     def _flush_extractor(self) -> str:
-        """Flush the feature extractor's startup buffer and run the model.
-
-        Only produces output for short recordings (< 1 s) where the
-        startup buffer never filled during normal processing.
-        """
-        features = self._extractor.flush()   # (T, 2)
-        if len(features) == 0:
+        """Flush the event extractor's trailing interval and run the model."""
+        events = self._extractor.flush()
+        if not events:
             return ""
-        with torch.no_grad():
-            x = torch.from_numpy(
-                features[:, :self._in_channels].T.copy()
-            ).unsqueeze(0).to(self.device)
-            log_probs, self._gru_hidden = self._model.streaming_step(x, self._gru_hidden)
-        indices = torch.argmax(log_probs[:, 0, :], dim=-1).cpu().tolist()
-        new_text = ""
-        for idx in indices:
-            if idx != self._prev_ctc_token:
-                self._prev_ctc_token = idx
-                if idx != 0:
-                    new_text += vocab_module.idx_to_char.get(idx, "")
-        return new_text
+        log_probs = self._run_events(events)
+        return self._greedy_decode(log_probs)
 
     def _collect_log_probs(self, audio: np.ndarray) -> Tensor:
-        """Stream *audio* through the model and return all log-probs concatenated."""
+        """Stream audio through the model and return all log-probs concatenated."""
         self.reset()
         all_lp: List[Tensor] = []
-        in_ch = self._in_channels
         pos = 0
         while pos < len(audio):
             chunk = audio[pos: pos + self._chunk_samples]
             if len(chunk) < self._chunk_samples:
                 chunk = np.pad(chunk, (0, self._chunk_samples - len(chunk)))
             pos += self._chunk_samples
-            features = self._extractor.process_chunk(chunk)  # (T, 2)
-            if len(features) == 0:
+            events = self._extractor.process_chunk(chunk)
+            if not events:
                 continue
-            with torch.no_grad():
-                x = torch.from_numpy(
-                    features[:, :in_ch].T.copy()
-                ).unsqueeze(0).to(self.device)
-                log_probs, self._gru_hidden = self._model.streaming_step(x, self._gru_hidden)
+            log_probs = self._run_events(events)
+            if log_probs.shape[0] > 0:
                 all_lp.append(log_probs[:, 0, :].cpu())
-        # Flush feature extractor startup buffer (for short recordings < 1 s)
-        flush_features = self._extractor.flush()   # (T, 2)
-        if len(flush_features) > 0:
-            with torch.no_grad():
-                x = torch.from_numpy(
-                    flush_features[:, :in_ch].T.copy()
-                ).unsqueeze(0).to(self.device)
-                log_probs, self._gru_hidden = self._model.streaming_step(x, self._gru_hidden)
+        # Flush trailing event
+        flush_events = self._extractor.flush()
+        if flush_events:
+            log_probs = self._run_events(flush_events)
+            if log_probs.shape[0] > 0:
                 all_lp.append(log_probs[:, 0, :].cpu())
         if not all_lp:
             return torch.zeros(0, vocab_module.num_classes)
@@ -343,16 +327,16 @@ class CausalStreamingDecoder:
 class StreamingDecoder:
     """Sliding-window offline decoder for whole-file decoding.
 
-    Maintains a ring buffer of SNR ratio values; runs the model on each
-    full window independently.  Useful when GRU state continuity is not
-    needed (e.g., analysing a long recording in post-processing).
+    Each window gets a fresh event extractor and featurizer, and the model
+    runs a full forward pass (no LSTM state carried across windows).
+    Useful for post-processing long recordings where causal state
+    continuity is not needed.
 
     Args:
         checkpoint: Path to checkpoint file.
         window_size: Window length in seconds (default 2.0).
         stride: Hop between windows in seconds (default 0.5).
         device: PyTorch device string.
-        noise_ema_alpha: Override noise floor EMA alpha.
         beam_width: CTC beam search width (1 = greedy).
     """
 
@@ -362,7 +346,6 @@ class StreamingDecoder:
         window_size: float = 2.0,
         stride: float = 0.5,
         device: str = "cpu",
-        noise_ema_alpha: Optional[float] = None,
         beam_width: int = 1,
     ) -> None:
         self.device = torch.device(device)
@@ -370,13 +353,9 @@ class StreamingDecoder:
         self.stride = stride
         self.beam_width = beam_width
 
-        self._model, feature_cfg, model_cfg, self.sample_rate = _load_checkpoint(
-            checkpoint, self.device
+        self._model, self._feature_cfg, model_cfg, self.sample_rate = (
+            _load_checkpoint(checkpoint, self.device)
         )
-        self._feature_cfg = feature_cfg
-        self._noise_ema_alpha = noise_ema_alpha
-        self._pool_factor = model_cfg.pool_factor
-        self._in_channels = model_cfg.in_channels
 
     def decode_file(self, path: str) -> str:
         """Decode an entire file with the sliding-window approach."""
@@ -403,19 +382,21 @@ class StreamingDecoder:
         return _merge_windows(transcripts, self.stride, self.window_size)
 
     def _run_window(self, audio: np.ndarray) -> str:
-        extractor = MorseFeatureExtractor(self._feature_cfg)
-        features = extractor.process_chunk(audio)  # (T, 2)
-        if len(features) == 0:
+        """Process one window: fresh extractor → events → featurize → model."""
+        extractor = MorseEventExtractor(self._feature_cfg)
+        featurizer = MorseEventFeaturizer()
+        events = extractor.process_chunk(audio)
+        events += extractor.flush()
+        if not events:
             return ""
+        feats = featurizer.featurize_sequence(events)  # (T, 5)
+        x = torch.from_numpy(feats).unsqueeze(1).to(self.device)  # (T, 1, 5)
         with torch.no_grad():
-            x = torch.from_numpy(
-                features[:, :self._in_channels].T.copy()
-            ).unsqueeze(0).to(self.device)
             log_probs, _ = self._model(x)
-            lp_1 = log_probs[:, 0, :]
+            lp = log_probs[:, 0, :]
         if self.beam_width > 1:
-            return vocab_module.beam_search_ctc(lp_1.cpu(), beam_width=self.beam_width)
-        return vocab_module.decode_ctc(lp_1, strip_trailing_space=False)
+            return vocab_module.beam_search_ctc(lp.cpu(), beam_width=self.beam_width)
+        return vocab_module.decode_ctc(lp, strip_trailing_space=False)
 
 
 def _merge_windows(transcripts: List[str], stride: float, window_size: float) -> str:
@@ -464,9 +445,6 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Window size for sliding decoder")
     p.add_argument("--stride", type=float, default=0.5, metavar="SEC",
                    help="Stride for sliding decoder")
-    p.add_argument("--noise-ema-alpha", type=float, default=None, metavar="ALPHA",
-                   dest="noise_ema_alpha",
-                   help="Override noise rise EMA alpha (0–0.9999; higher = slower rise)")
     p.add_argument("--beam-width", type=int, default=1, metavar="N",
                    dest="beam_width",
                    help="CTC beam width (1=greedy, 10=balanced, 50=accurate)")
@@ -483,7 +461,6 @@ if __name__ == "__main__":
             window_size=args.window,
             stride=args.stride,
             device=args.device,
-            noise_ema_alpha=args.noise_ema_alpha,
             beam_width=args.beam_width,
         )
         transcript = dec.decode_file(args.input)   # type: ignore[attr-defined]
@@ -492,11 +469,9 @@ if __name__ == "__main__":
             checkpoint=args.checkpoint,
             chunk_size_ms=args.chunk_ms,
             device=args.device,
-            noise_ema_alpha=args.noise_ema_alpha,
             beam_width=args.beam_width,
         )
         print(f"[causal] chunk={dec.latency_ms:.0f} ms  "
-              f"noise_alpha={dec.noise_ema_alpha:.4f}  "
               f"beam={dec.beam_width}")
         transcript = dec.decode_file(args.input)   # type: ignore[attr-defined]
 

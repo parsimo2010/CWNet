@@ -1,5 +1,5 @@
 """
-train.py — Full training loop for the CWNet 1D CTC Morse decoder.
+train.py --Full training loop for the CWNet 1D CTC Morse decoder.
 
 Quick start::
 
@@ -23,14 +23,14 @@ Multi-model initial training (when starting from scratch):
     selected and continues for remaining epochs. This can be customized:
 
         python train.py --scenario clean \\
-            --num_initial_models 10 \\
-            --initial_epochs 10
+            --num_initial_models 5 \\
+            --initial_epochs 5
 
 Metrics logged per epoch:
-    train_loss   — mean CTC loss over training batches
-    val_loss     — mean CTC loss over a fresh validation set
-    greedy_cer   — greedy-decode CER on the validation set (every epoch)
-    beam_cer     — beam-search CER on the validation set (every N epochs;
+    train_loss   --mean CTC loss over training batches
+    val_loss     --mean CTC loss over a fresh validation set
+    greedy_cer   --greedy-decode CER on the validation set (every epoch)
+    beam_cer     --beam-search CER on the validation set (every N epochs;
                    NaN otherwise).  N = training.beam_cer_interval.
 
 CER is computed with jiwer (pip install jiwer).
@@ -59,8 +59,8 @@ from tqdm import tqdm
 import vocab as vocab_module
 from config import Config, ModelConfig, MorseConfig, create_default_config
 from dataset import StreamingMorseDataset, collate_fn
-from feature import MorseFeatureExtractor
-from model import MorseCTCModel
+from feature import MorseEventExtractor
+from model import MorseEventFeaturizer, MorseEventModel
 from morse_generator import generate_sample
 from vocab import save_vocab
 
@@ -92,7 +92,8 @@ def save_debug_samples(
     """Write *n* audio/transcript pairs to *out_dir* for manual inspection."""
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
-    extractor = MorseFeatureExtractor(config.feature)
+    extractor  = MorseEventExtractor(config.feature)
+    featurizer = MorseEventFeaturizer()
 
     for i in range(n):
         audio_f32, text, meta = generate_sample(config.morse, rng=rng)
@@ -102,8 +103,17 @@ def save_debug_samples(
             json.dumps(meta, indent=2), encoding="utf-8"
         )
         extractor.reset()
-        ratios = extractor.process_chunk(audio_f32)
-        np.save(str(out_dir / f"sample_{i:02d}_snr.npy"), ratios)
+        events = extractor.process_chunk(audio_f32) + extractor.flush()
+        feat_array = featurizer.featurize_sequence(events)
+        np.save(str(out_dir / f"sample_{i:02d}_features.npy"), feat_array)
+        events_data = [
+            {"type": e.event_type, "start": e.start_sec,
+             "duration": e.duration_sec, "confidence": e.confidence}
+            for e in events
+        ]
+        (out_dir / f"sample_{i:02d}_events.json").write_text(
+            json.dumps(events_data, indent=2), encoding="utf-8"
+        )
 
     print(f"[debug] Saved {n} samples to {out_dir}")
 
@@ -119,7 +129,7 @@ def _has_nan_params(model: nn.Module) -> bool:
 def save_checkpoint(
     path: Path,
     epoch: int,
-    model: MorseCTCModel,
+    model: MorseEventModel,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler._LRScheduler,
     best_val_loss: float,
@@ -158,7 +168,7 @@ def set_seed(seed: int) -> None:
 
 
 def evaluate_model(
-    model: MorseCTCModel,
+    model: MorseEventModel,
     val_loader: DataLoader,
     device: torch.device,
     ctc_loss: nn.CTCLoss,
@@ -170,16 +180,16 @@ def evaluate_model(
     greedy_cers: List[float] = []
 
     with torch.no_grad():
-        for snr, targets, snr_lens, tgt_lens, texts in tqdm(
+        for feat, targets, feat_lens, tgt_lens, texts in tqdm(
             val_loader, desc="  val", unit="batch", leave=False
         ):
-            snr = snr.to(device)
-            targets = targets.to(device)
-            snr_lens = snr_lens.to(device)
+            feat     = feat.to(device)
+            targets  = targets.to(device)
+            feat_lens = feat_lens.to(device)
             tgt_lens = tgt_lens.to(device)
 
             with autocast(device_type=device.type, enabled=(scaler is not None)):
-                log_probs, out_lens = model(snr, snr_lens)
+                log_probs, out_lens = model(feat, feat_lens)
                 loss = ctc_loss(log_probs, targets, out_lens, tgt_lens)
             if torch.isfinite(loss):
                 val_losses.append(loss.item())
@@ -187,7 +197,7 @@ def evaluate_model(
             for b in range(log_probs.shape[1]):
                 valid_t = out_lens[b].item()
                 sample_lp = log_probs[:valid_t, b, :]
-                pred_greedy = greedy_ctc_decode(sample_lp)
+                pred_greedy = greedy_ctc_decode(sample_lp).strip()
                 greedy_cers.append(jiwer.cer(texts[b], pred_greedy))
 
     avg_val = float(np.mean(val_losses)) if val_losses else float("inf")
@@ -262,34 +272,36 @@ def train(args: argparse.Namespace) -> None:
 
     # ---- Model -----------------------------------------------------------
     mcfg = config.model
-    model = MorseCTCModel(
-        in_channels=mcfg.in_channels,
-        cnn_channels=mcfg.cnn_channels,
-        cnn_time_pools=mcfg.cnn_time_pools,
-        cnn_dilations=mcfg.cnn_dilations,
-        cnn_kernel_size=mcfg.cnn_kernel_size,
-        proj_size=mcfg.proj_size,
+    model = MorseEventModel(
+        in_features=mcfg.in_features,
         hidden_size=mcfg.hidden_size,
         n_rnn_layers=mcfg.n_rnn_layers,
         dropout=mcfg.dropout,
     ).to(device)
 
-    fps_in  = config.feature.fps
-    fps_out = fps_in / model.pool_factor
     print(
         f"Parameters   : {model.num_params:,}\n"
-        f"Input ch     : {mcfg.in_channels}  "
-        f"({'energy + coherence' if mcfg.in_channels == 2 else 'combined feature'})\n"
-        f"Frame rate   : {fps_in:.0f} fps in -> {fps_out:.0f} fps out  "
-        f"(pool*{model.pool_factor})\n"
-        f"Hop          : {config.feature.hop_ms:.1f} ms  "
-        f"Window: {config.feature.window_ms:.0f} ms  "
-        f"Bins: {config.feature.freq_min}-{config.feature.freq_max} Hz"
+        f"Input features: {mcfg.in_features}  "
+        f"(is_mark, log_dur, confidence, log_ratio_mark, log_ratio_space)\n"
+        f"LSTM         : {mcfg.n_rnn_layers} layers x {mcfg.hidden_size} hidden  "
+        f"dropout={mcfg.dropout}"
     )
 
     # ---- Datasets --------------------------------------------------------
-    train_ds = StreamingMorseDataset(config=config, epoch_size=config.training.samples_per_epoch)
-    val_ds   = StreamingMorseDataset(config=config, epoch_size=config.training.val_samples)
+    use_direct = not getattr(args, "use_audio", False)
+    if use_direct:
+        print("Data generation: direct event simulation (fast)")
+    else:
+        print("Data generation: audio synthesis + feature extraction")
+
+    train_ds = StreamingMorseDataset(
+        config=config, epoch_size=config.training.samples_per_epoch,
+        use_direct_events=use_direct,
+    )
+    val_ds = StreamingMorseDataset(
+        config=config, epoch_size=config.training.val_samples, seed=42,
+        use_direct_events=use_direct,
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -347,7 +359,7 @@ def train(args: argparse.Namespace) -> None:
                 optimizer, T_max=args.additional_epochs, eta_min=1e-6
             )
             print(f"Resumed epoch {start_epoch}  (best_val reset to inf)  "
-                  f"→ {args.additional_epochs} more epochs  lr={resume_lr:.2e}")
+                  f"-> {args.additional_epochs} more epochs  lr={resume_lr:.2e}")
         else:
             best_val_loss = ckpt.get("best_val_loss", math.inf)
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -374,18 +386,13 @@ def train(args: argparse.Namespace) -> None:
             seed = 42 + model_idx * 1000
             set_seed(seed)
             print(f"\n{'='*60}")
-            print(f"Initial Phase — Model {model_idx+1}/{num_models}  (seed={seed})")
+            print(f"Initial Phase --Model {model_idx+1}/{num_models}  (seed={seed})")
             print(f"{'='*60}")
 
             # Fresh model with this seed's random initialisation
             mcfg = config.model
-            train_model = MorseCTCModel(
-                in_channels=mcfg.in_channels,
-                cnn_channels=mcfg.cnn_channels,
-                cnn_time_pools=mcfg.cnn_time_pools,
-                cnn_dilations=mcfg.cnn_dilations,
-                cnn_kernel_size=mcfg.cnn_kernel_size,
-                proj_size=mcfg.proj_size,
+            train_model = MorseEventModel(
+                in_features=mcfg.in_features,
                 hidden_size=mcfg.hidden_size,
                 n_rnn_layers=mcfg.n_rnn_layers,
                 dropout=mcfg.dropout,
@@ -410,16 +417,16 @@ def train(args: argparse.Namespace) -> None:
                     dynamic_ncols=True,
                 )
 
-                for batch_idx, (snr, targets, snr_lens, tgt_lens, texts) in enumerate(pbar):
-                    snr      = snr.to(device)
-                    targets  = targets.to(device)
-                    snr_lens = snr_lens.to(device)
-                    tgt_lens = tgt_lens.to(device)
+                for batch_idx, (feat, targets, feat_lens, tgt_lens, texts) in enumerate(pbar):
+                    feat      = feat.to(device)
+                    targets   = targets.to(device)
+                    feat_lens = feat_lens.to(device)
+                    tgt_lens  = tgt_lens.to(device)
 
                     train_optimizer.zero_grad(set_to_none=True)
 
                     with autocast(device_type=device.type, enabled=(scaler is not None)):
-                        log_probs, out_lens = train_model(snr, snr_lens)
+                        log_probs, out_lens = train_model(feat, feat_lens)
                         loss = init_ctc_loss(log_probs, targets, out_lens, tgt_lens)
 
                     if torch.isfinite(loss):
@@ -525,13 +532,13 @@ def train(args: argparse.Namespace) -> None:
         # NaN weight check: roll back to safety checkpoint if weights corrupted
         if _has_nan_params(model):
             if safety_path.exists():
-                print(f"\n  [warn] NaN in weights before epoch {epoch+1} — rolling back")
+                print(f"\n  [warn] NaN in weights before epoch {epoch+1} --rolling back")
                 sc = torch.load(safety_path, map_location=device, weights_only=False)
                 model.load_state_dict(sc["model_state_dict"])
                 optimizer.load_state_dict(sc["optimizer_state_dict"])
                 scheduler.load_state_dict(sc["scheduler_state_dict"])
             else:
-                print(f"\n  [warn] NaN in weights before epoch {epoch+1} — no safety ckpt")
+                print(f"\n  [warn] NaN in weights before epoch {epoch+1} --no safety ckpt")
 
         save_checkpoint(safety_path, epoch, model, optimizer, scheduler, best_val_loss, config, scaler)
 
@@ -545,16 +552,16 @@ def train(args: argparse.Namespace) -> None:
             dynamic_ncols=True,
         )
 
-        for batch_idx, (snr, targets, snr_lens, tgt_lens, texts) in enumerate(pbar):
-            snr      = snr.to(device)
-            targets  = targets.to(device)
-            snr_lens = snr_lens.to(device)
-            tgt_lens = tgt_lens.to(device)
+        for batch_idx, (feat, targets, feat_lens, tgt_lens, texts) in enumerate(pbar):
+            feat      = feat.to(device)
+            targets   = targets.to(device)
+            feat_lens = feat_lens.to(device)
+            tgt_lens  = tgt_lens.to(device)
 
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(device_type=device.type, enabled=(scaler is not None)):
-                log_probs, out_lens = model(snr, snr_lens)
+                log_probs, out_lens = model(feat, feat_lens)
                 loss = ctc_loss(log_probs, targets, out_lens, tgt_lens)
 
             if torch.isfinite(loss):
@@ -566,7 +573,7 @@ def train(args: argparse.Namespace) -> None:
                         for p in model.parameters()
                     )
                     if not grad_ok:
-                        print(f"\n  [warn] NaN gradient at E{epoch+1} B{batch_idx+1} — skipped")
+                        print(f"\n  [warn] NaN gradient at E{epoch+1} B{batch_idx+1} --skipped")
                     else:
                         nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                         epoch_losses.append(loss.item())
@@ -579,7 +586,7 @@ def train(args: argparse.Namespace) -> None:
                         for p in model.parameters()
                     ):
                         optimizer.zero_grad(set_to_none=True)
-                        print(f"\n  [warn] NaN gradient at E{epoch+1} B{batch_idx+1} — skipped")
+                        print(f"\n  [warn] NaN gradient at E{epoch+1} B{batch_idx+1} --skipped")
                     else:
                         nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                         optimizer.step()
@@ -621,16 +628,16 @@ def train(args: argparse.Namespace) -> None:
         run_beam = (beam_interval > 0) and ((epoch + 1) % beam_interval == 0)
 
         with torch.no_grad():
-            for snr, targets, snr_lens, tgt_lens, texts in tqdm(
+            for feat, targets, feat_lens, tgt_lens, texts in tqdm(
                 val_loader, desc="  val", unit="batch", leave=False
             ):
-                snr      = snr.to(device)
-                targets  = targets.to(device)
-                snr_lens = snr_lens.to(device)
-                tgt_lens = tgt_lens.to(device)
+                feat      = feat.to(device)
+                targets   = targets.to(device)
+                feat_lens = feat_lens.to(device)
+                tgt_lens  = tgt_lens.to(device)
 
                 with autocast(device_type=device.type, enabled=(scaler is not None)):
-                    log_probs, out_lens = model(snr, snr_lens)
+                    log_probs, out_lens = model(feat, feat_lens)
                     loss = ctc_loss(log_probs, targets, out_lens, tgt_lens)
                 if torch.isfinite(loss):
                     val_losses.append(loss.item())
@@ -638,11 +645,11 @@ def train(args: argparse.Namespace) -> None:
                 for b in range(log_probs.shape[1]):
                     valid_t = out_lens[b].item()
                     sample_lp = log_probs[:valid_t, b, :]
-                    pred_greedy = greedy_ctc_decode(sample_lp)
+                    pred_greedy = greedy_ctc_decode(sample_lp).strip()
                     greedy_cers.append(jiwer.cer(texts[b], pred_greedy))
 
                     if run_beam:
-                        pred_beam = beam_ctc_decode(sample_lp.cpu(), beam_width)
+                        pred_beam = beam_ctc_decode(sample_lp.cpu(), beam_width).strip()
                         beam_cers.append(jiwer.cer(texts[b], pred_beam))
 
         _n = min(len(epoch_losses), config.training.log_interval)
@@ -665,7 +672,7 @@ def train(args: argparse.Namespace) -> None:
             best_path = ckpt_dir / f"best_model_{run_name}.pt"
             save_checkpoint(best_path, epoch, model, optimizer, scheduler, best_val_loss, config, scaler)
             saved.append(str(best_path))
-            print(f"  ✓ new best model  (val={best_val_loss:.4f})")
+            print(f"  * new best model  (val={best_val_loss:.4f})")
 
         if (epoch + 1) % 5 == 0:
             periodic_path = ckpt_dir / f"checkpoint_epoch_{epoch+1:04d}.pt"
@@ -710,10 +717,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Run N more epochs with a fresh cosine LR cycle")
     p.add_argument("--resume_lr", type=float, default=None, metavar="LR",
                    help="Peak LR for the fresh cosine cycle (default: config LR)")
-    p.add_argument("--num_initial_models", type=int, default=10, metavar="N",
-                   help="Number of models to train in initial phase (default: 10)")
-    p.add_argument("--initial_epochs", type=int, default=10, metavar="E",
-                   help="Epochs for multi-model training before selecting best (default: 10)")
+    p.add_argument("--num_initial_models", type=int, default=1, metavar="N",
+                   help="Number of models to train in initial phase (default: 1)")
+    p.add_argument("--initial_epochs", type=int, default=5, metavar="E",
+                   help="Epochs for multi-model training before selecting best (default: 5)")
+    p.add_argument("--use-audio", action="store_true", default=False,
+                   help="Use audio synthesis pipeline instead of direct event generation")
     return p
 
 

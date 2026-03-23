@@ -19,7 +19,7 @@ Example usage::
     # Live decoding from the default audio device
     python listen.py --checkpoint checkpoints/best_model.pt --device
 
-    # Live decoding from device #2, monitoring 600–900 Hz only
+    # Live decoding from device #2, monitoring 600-900 Hz only
     python listen.py --checkpoint checkpoints/best_model.pt \\
         --device 2 --freq-min 600 --freq-max 900
 
@@ -30,26 +30,18 @@ Example usage::
 
     # List available audio devices
     python listen.py --list-devices
-
-Noise EMA alpha controls how fast the noise floor estimate adapts:
-  --noise-ema-alpha 0.99   → τ ≈ 0.5 s at 200 fps  (fast, noisy environments)
-  --noise-ema-alpha 0.999  → τ ≈ 5.0 s at 200 fps  (slow, stable environments)
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-import time
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import torch
 import torchaudio
 
-from config import Config, FeatureConfig
-from feature import MorseFeatureExtractor
 from inference import CausalStreamingDecoder
 from source import create_source, list_devices
 
@@ -63,9 +55,6 @@ def _make_resampler(orig_sr: int, target_sr: int):
     if orig_sr == target_sr:
         return None
 
-    # torchaudio.transforms.Resample is stateless for each call,
-    # which introduces a tiny boundary artifact per chunk.
-    # For typical chunk sizes (≥ 50 ms) this is negligible.
     resample_fn = torchaudio.transforms.Resample(
         orig_freq=orig_sr, new_freq=target_sr
     )
@@ -76,27 +65,6 @@ def _make_resampler(orig_sr: int, target_sr: int):
         return t.squeeze(0).numpy()
 
     return _resample
-
-
-# ---------------------------------------------------------------------------
-# Override feature config parameters from CLI args
-# ---------------------------------------------------------------------------
-
-def _patch_feature_cfg(feature_cfg: FeatureConfig, args: argparse.Namespace) -> FeatureConfig:
-    """Apply any CLI-level frequency / EMA overrides to the feature config."""
-    from dataclasses import replace
-
-    kwargs = {}
-    if args.freq_min is not None:
-        kwargs["freq_min"] = args.freq_min
-    if args.freq_max is not None:
-        kwargs["freq_max"] = args.freq_max
-    if kwargs:
-        # Recreate with updated fields
-        d = feature_cfg.to_dict()
-        d.update(kwargs)
-        feature_cfg = FeatureConfig.from_dict(d)
-    return feature_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -122,30 +90,32 @@ def main(args: argparse.Namespace) -> None:
         beam_width=args.beam_width,
     )
 
-    # Apply CLI frequency overrides to the extractor's config
+    # Apply CLI frequency overrides: rebuild extractor with patched config
     if args.freq_min is not None or args.freq_max is not None:
-        from config import FeatureConfig as FC
-        d = decoder._extractor.config.to_dict()
+        from config import FeatureConfig
+        from feature import MorseEventExtractor
+
+        d = decoder._feature_cfg.to_dict()
         if args.freq_min is not None:
             d["freq_min"] = args.freq_min
         if args.freq_max is not None:
             d["freq_max"] = args.freq_max
-        new_cfg = FC.from_dict(d)
-        from feature import MorseFeatureExtractor as MFE
-        decoder._extractor = MFE(new_cfg)
+        new_cfg = FeatureConfig.from_dict(d)
+        decoder._feature_cfg = new_cfg
+        decoder._extractor = MorseEventExtractor(new_cfg)
 
     print(
         f"Checkpoint  : {args.checkpoint}\n"
         f"Chunk       : {decoder.latency_ms:.0f} ms\n"
-        f"Freq range  : {decoder._extractor.config.freq_min}–"
-        f"{decoder._extractor.config.freq_max} Hz  "
+        f"Freq range  : {decoder._feature_cfg.freq_min}-"
+        f"{decoder._feature_cfg.freq_max} Hz  "
         f"({decoder._extractor.n_bins} bins)\n"
         f"Beam width  : {decoder.beam_width}\n"
     )
 
     # ---- File mode -------------------------------------------------------
     if args.file:
-        print(f"Decoding {args.file} …")
+        print(f"Decoding {args.file} ...")
         transcript = decoder.decode_file(args.file)
         print(transcript)
         return
@@ -170,15 +140,15 @@ def main(args: argparse.Namespace) -> None:
         )
         source_sr = args.sample_rate
     else:
-        # --device without a value → default device
+        # --device without a value -> default device
         source = create_source(chunk_ms=args.chunk_ms)
         source_sr = source.sample_rate
 
     resampler = _make_resampler(source_sr, decoder.sample_rate)
     if resampler is not None:
-        print(f"Resampling  : {source_sr} Hz → {decoder.sample_rate} Hz")
+        print(f"Resampling  : {source_sr} Hz -> {decoder.sample_rate} Hz")
 
-    print("Listening … (Ctrl-C to stop)\n")
+    print("Listening ... (Ctrl-C to stop)\n")
     decoder.reset()
 
     try:

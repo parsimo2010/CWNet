@@ -1,10 +1,10 @@
 """
-config.py — Configuration for CWNet: 1D SNR-ratio CNN+GRU Morse decoder.
+config.py — Configuration for CWNet: event-stream LSTM Morse decoder.
 
 Four dataclasses cover the full pipeline:
   MorseConfig    — synthetic audio generation parameters
-  FeatureConfig  — STFT → SNR-ratio feature extraction
-  ModelConfig    — 1D causal dilated CNN + GRU architecture
+  FeatureConfig  — STFT → asymmetric EMA adaptive threshold → MorseEvent stream
+  ModelConfig    — LSTM event-stream CTC architecture
   TrainingConfig — training hyperparameters and curriculum settings
 
 Use create_default_config(scenario) to get pre-built configs for:
@@ -34,7 +34,7 @@ class MorseConfig:
     """
 
     # Internal sample rate; all audio inputs are resampled to this at inference
-    sample_rate: int = 8000
+    sample_rate: int = 16000
 
     # WPM range
     min_wpm: float = 10.0
@@ -69,10 +69,9 @@ class MorseConfig:
     iws_factor_min: float = 0.8
     iws_factor_max: float = 1.5
 
-    # Audio sample duration range
-    min_duration_sec: float = 2.0
-    max_duration_sec: float = 10.0
-    trailing_silence_max_sec: float = 0.5
+    # Text length range (characters, including spaces)
+    min_chars: int = 20
+    max_chars: int = 120
 
     # Signal amplitude variation across samples
     signal_amplitude_min: float = 0.5
@@ -112,27 +111,25 @@ class MorseConfig:
 class FeatureConfig:
     """STFT-based adaptive threshold feature extraction parameters.
 
-    The extractor computes a per-frame scalar:
-      peak_db   = 10*log10(max_bin_energy)
-      threshold = (p25 + p75) / 2   from sliding window of peak energies
-      spread    = max(p75 - p25, 10 dB)
-      output    = tanh((peak_db - threshold) * 3 / spread)
-
-    This is inherently AGC-immune: the percentile-based threshold tracks
-    any shifts in absolute amplitude automatically.  No explicit noise
-    floor estimation is required.
-
-    Legacy fields (noise_ema_alpha, snr_norm_center, snr_norm_scale,
-    noise_exclude_top_n) are retained for checkpoint compatibility but
-    are not used by the current feature extractor.
+    MorseEventExtractor uses these parameters to compute per-frame E values
+    and emit MorseEvent objects (mark/space intervals with duration +
+    confidence).  The asymmetric EMA threshold is AGC-immune and requires
+    no explicit noise floor estimation.
     """
 
     # Must match MorseConfig.sample_rate; audio resampled to this at inference
-    sample_rate: int = 8000
+    sample_rate: int = 16000
 
     # STFT window and hop size (determines freq resolution and frame rate)
-    # window=50ms → 20 Hz/bin at 8 kHz; hop=5ms → 200 fps input to CNN
-    window_ms: float = 50.0
+    # window=20ms → 50 Hz/bin at 16 kHz (320 samples); hop=5ms → 200 fps (80 samples)
+    # 20ms window chosen for time resolution: at 40 WPM a dit/space is ~30ms,
+    # so the window clears within 4 hops (20ms) of a transition — enabling
+    # clean inter-element space detection. Cost: -4 dB peak-bin SNR vs 50ms.
+    # 18 bins cover 300-1200 Hz at 50 Hz/bin — adequate for tone detection.
+    # 16 kHz gives 8 kHz Nyquist; audio that arrives at 8 kHz is upsampled
+    # (no new information above 4 kHz, but monitoring range is 300-1200 Hz
+    # so this is irrelevant for signal detection).
+    window_ms: float = 20.0
     hop_ms: float = 5.0
 
     # Frequency range to monitor (Hz)
@@ -140,26 +137,18 @@ class FeatureConfig:
     freq_min: int = 300
     freq_max: int = 1200
 
-    # SNR ratio normalisation: tanh((snr_db - center) / scale)
-    # center=10 dB → 0.0; +8 dB above center (18 dB) → ~0.76
-    snr_norm_center: float = 10.0
-    snr_norm_scale: float = 8.0
-
-    # Noise EMA alpha — controls the RISE direction of the noise floor EMA.
-    # The DROP direction always uses a fast fixed alpha (0.70, τ≈17 ms).
-    # Configurable at inference time without reloading.
-    # time_constant_sec ≈ 1 / (fps × (1 − alpha))
-    # alpha=0.90  → τ ≈  50 ms at 200 fps  (responsive)
-    # alpha=0.95  → τ ≈ 100 ms at 200 fps  (default; good balance)
-    # alpha=0.97  → τ ≈ 170 ms at 200 fps  (more smoothing)
-    # alpha=0.99  → τ ≈ 500 ms at 200 fps  (slow; stable RF environments)
-    noise_ema_alpha: float = 0.95
-
-    # Number of top-energy bins always excluded from noise estimation.
-    # A Hann window leaks signal energy to the two adjacent bins (±1) at
-    # -6 dB, so the minimum is 3 (signal + 2 Hann sidelobes).
-    # MorseFeatureExtractor enforces max(3, noise_exclude_top_n).
-    noise_exclude_top_n: int = 3
+    # Blip filter: state changes that last this many frames or fewer are
+    # absorbed back into the current interval and not emitted as events.
+    # A transition is only confirmed after blip_threshold_frames + 1
+    # consecutive frames in the new state.
+    #
+    # Default 2: rejects transitions ≤ 10 ms (at 5 ms/frame), which is
+    # shorter than a dit at 90 WPM (≈ 13.3 ms).  Any feature of the audio
+    # that cannot last at least 3 frames (15 ms) is treated as noise.
+    #
+    # Set to 1 to restore the original single-frame blip filter.
+    # Set to 0 to disable blip filtering (every frame can cause a transition).
+    blip_threshold_frames: int = 2
 
     @property
     def fps(self) -> float:
@@ -175,77 +164,44 @@ class FeatureConfig:
 
 
 # ---------------------------------------------------------------------------
-# ModelConfig — 1D CNN + GRU architecture
+# ModelConfig — LSTM event-stream architecture
 # ---------------------------------------------------------------------------
 
 @dataclass
 class ModelConfig:
-    """1D causal dilated CNN + GRU model architecture parameters.
+    """LSTM model architecture parameters for MorseEvent-stream CTC decoding.
 
-    The CNN operates on a multi-channel time series (energy + phase
-    coherence).  Causal left-only padding ensures each output frame
-    depends only on past and current inputs, enabling chunk-by-chunk
-    streaming inference.
+    The model consumes a variable-rate sequence of MorseEvent feature vectors
+    (one per detected mark or space interval) rather than a fixed-rate frame
+    array.  There is no CNN frontend and no time-axis downsampling.
 
-    Default (~260 K parameters):
-      in_channels = 1 (backward compat; new training uses 2)
-      cnn_channels = (32, 64, 64, 64)
-      cnn_time_pools = (2, 1, 1, 1)  → 2× downsampling after block 1 → 100 fps
-      cnn_kernel_size = 7
-      cnn_dilations = (1, 2, 4, 8)   → growing receptive field per block
-      proj_size = 192, hidden_size = 192, n_rnn_layers = 4
+    Default (~155 K parameters):
+      in_features = 5   — [is_mark, log_duration, confidence,
+                            log_ratio_prev_mark, log_ratio_prev_space]
+      hidden_size  = 96
+      n_rnn_layers = 2
+      dropout      = 0.1
     """
 
-    # Number of input channels (1 = combined feature, 2 = energy + coherence)
-    in_channels: int = 1
+    # Feature vector dimension produced by MorseEventFeaturizer.
+    # Change only if the featurizer is extended.
+    in_features: int = 5
 
-    # CNN channel counts (one per block; length = number of blocks)
-    cnn_channels: Tuple[int, ...] = (32, 64, 64, 64)
+    # LSTM hidden size
+    hidden_size: int = 96
 
-    # Time-axis MaxPool stride per CNN block (1 = no pooling)
-    cnn_time_pools: Tuple[int, ...] = (2, 1, 1, 1)
+    # Number of stacked LSTM layers
+    n_rnn_layers: int = 2
 
-    # Dilation per CNN block (expands receptive field without extra params)
-    cnn_dilations: Tuple[int, ...] = (1, 2, 4, 8)
-
-    # Convolution kernel size (same for all blocks)
-    cnn_kernel_size: int = 7
-
-    # Linear projection from CNN output to GRU input dimension
-    proj_size: int = 192
-
-    # GRU hidden size and depth
-    hidden_size: int = 192
-    n_rnn_layers: int = 4
-
-    # Dropout between GRU layers (0 disables)
+    # Dropout between LSTM layers (0 disables; auto-disabled for n_rnn_layers=1)
     dropout: float = 0.1
 
-    # Always True: non-causal models cannot stream
-    causal: bool = True
-
-    @property
-    def pool_factor(self) -> int:
-        """Total time-axis downsampling (product of all cnn_time_pools)."""
-        factor = 1
-        for p in self.cnn_time_pools:
-            factor *= p
-        return factor
-
     def to_dict(self) -> dict:
-        d = asdict(self)
-        d["cnn_channels"] = list(self.cnn_channels)
-        d["cnn_time_pools"] = list(self.cnn_time_pools)
-        d["cnn_dilations"] = list(self.cnn_dilations)
-        return d
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "ModelConfig":
-        known = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
-        for key in ("cnn_channels", "cnn_time_pools", "cnn_dilations"):
-            if key in known:
-                known[key] = tuple(known[key])
-        return cls(**known)
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 # ---------------------------------------------------------------------------
@@ -345,14 +301,13 @@ def create_default_config(scenario: str = "clean") -> Config:
     """
     cfg = Config()
 
-    # All scenarios use 2-channel input (energy + phase coherence)
-    cfg.model.in_channels = 1
-
     if scenario == "test":
         cfg.morse.min_snr_db = 20.0
         cfg.morse.max_snr_db = 40.0
         cfg.morse.min_wpm = 15.0
         cfg.morse.max_wpm = 25.0
+        cfg.morse.min_chars = 15
+        cfg.morse.max_chars = 40
         cfg.morse.dah_dit_ratio_min = 2.8
         cfg.morse.dah_dit_ratio_max = 3.2
         cfg.morse.ics_factor_min = 0.9
@@ -363,10 +318,11 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.timing_jitter_max = 0.02
         cfg.morse.tone_drift = 1.0
         cfg.training.num_epochs = 5
-        cfg.training.samples_per_epoch = 200
-        cfg.training.val_samples = 50
+        cfg.training.samples_per_epoch = 500
+        cfg.training.val_samples = 100
         cfg.training.num_workers = 0
-        cfg.training.batch_size = 8
+        cfg.training.batch_size = 16
+        cfg.training.learning_rate = 5e-4
         cfg.training.beam_cer_interval = 5
 
     elif scenario == "clean":
@@ -374,6 +330,8 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.max_snr_db = 40.0
         cfg.morse.min_wpm = 10.0
         cfg.morse.max_wpm = 40.0
+        cfg.morse.min_chars = 30
+        cfg.morse.max_chars = 150
         cfg.morse.dah_dit_ratio_min = 2.5
         cfg.morse.dah_dit_ratio_max = 3.5
         cfg.morse.ics_factor_min = 0.8
@@ -383,14 +341,17 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.05
         cfg.morse.tone_drift = 3.0
-        cfg.training.batch_size = 256
-        cfg.training.learning_rate = 8e-4
+        # Direct event gen is ~74x faster than audio: data gen no longer
+        # bottlenecks, so we increase batch/samples and scale LR accordingly.
+        # sqrt(512/256) * 8e-4 ~ 1e-3.
+        cfg.training.batch_size = 512
+        cfg.training.learning_rate = 1e-3
         cfg.training.num_epochs = 200
-        cfg.training.samples_per_epoch = 25000
-        cfg.training.val_samples = 2500
-        cfg.training.num_workers = 14
+        cfg.training.samples_per_epoch = 100000
+        cfg.training.val_samples = 5000
+        cfg.training.num_workers = 4
         cfg.training.beam_cer_interval = 50
-        # Real-world augmentations (mild — model learns basic task first)
+        # Real-world augmentations (mild -- model learns basic task first)
         cfg.morse.agc_probability = 0.3
         # qsb_probability left at 0.0 for clean stage
 
@@ -399,6 +360,8 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.max_snr_db = 30.0
         cfg.morse.min_wpm = 5.0
         cfg.morse.max_wpm = 50.0
+        cfg.morse.min_chars = 20
+        cfg.morse.max_chars = 200
         cfg.morse.dah_dit_ratio_min = 1.5
         cfg.morse.dah_dit_ratio_max = 4.0
         cfg.morse.ics_factor_min = 0.5
@@ -408,12 +371,13 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.20
         cfg.morse.tone_drift = 5.0
-        cfg.training.batch_size = 256
-        cfg.training.learning_rate = 8e-4
+        # sqrt(512/128) * 6e-4 ~ 1.2e-3; rounded to 1e-3.
+        cfg.training.batch_size = 512
+        cfg.training.learning_rate = 1e-3
         cfg.training.num_epochs = 500
-        cfg.training.samples_per_epoch = 25000
-        cfg.training.val_samples = 2500
-        cfg.training.num_workers = 14
+        cfg.training.samples_per_epoch = 50000
+        cfg.training.val_samples = 5000
+        cfg.training.num_workers = 4
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (full strength for curriculum stage 2)
         cfg.morse.agc_probability = 0.7
@@ -435,15 +399,10 @@ def create_default_config(scenario: str = "clean") -> Config:
 if __name__ == "__main__":
     for s in ("test", "clean", "full"):
         cfg = create_default_config(s)
-        d = cfg.to_dict()
-        cfg2 = Config.load.__func__(Config, "/dev/null") if False else cfg
-        fps_in  = cfg.feature.fps
-        fps_out = fps_in / cfg.model.pool_factor
         print(
             f"[{s:5s}]  SNR={cfg.morse.min_snr_db:.0f}–{cfg.morse.max_snr_db:.0f} dB  "
             f"WPM={cfg.morse.min_wpm:.0f}–{cfg.morse.max_wpm:.0f}  "
             f"dah/dit={cfg.morse.dah_dit_ratio_min:.1f}–{cfg.morse.dah_dit_ratio_max:.1f}  "
-            f"fps {fps_in:.0f}→{fps_out:.0f}  "
-            f"pool×{cfg.model.pool_factor}"
+            f"hidden={cfg.model.hidden_size}  layers={cfg.model.n_rnn_layers}"
         )
     print(f"Vocab size: import vocab; print(vocab.num_classes)")

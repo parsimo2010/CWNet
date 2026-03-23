@@ -449,6 +449,7 @@ def generate_sample(
     wpm: Optional[float] = None,
     rng: Optional[np.random.Generator] = None,
     wordlist: Optional[List[str]] = None,
+    text: Optional[str] = None,
 ) -> Tuple[np.ndarray, str, Dict]:
     """Generate a single synthetic Morse code audio sample.
 
@@ -462,6 +463,8 @@ def generate_sample(
         RNG; a fresh one is created if None.
     wordlist : list of str, optional
         Word list for text generation.
+    text : str, optional
+        Override text; randomly generated if None.
 
     Returns
     -------
@@ -513,15 +516,11 @@ def generate_sample(
     if config.qsb_probability > 0.0 and rng.random() < config.qsb_probability:
         qsb_depth_db = float(rng.uniform(config.qsb_depth_db_min, config.qsb_depth_db_max))
 
-    # ---- Text length estimation -----------------------------------------
-    # PARIS: 5 chars/word; adjust for ics and iws deviations
-    effective_word_dur_factor = (ics_factor * 3 + iws_factor * 7) / (3 + 7)
-    chars_per_sec = wpm * 5.0 / 60.0 / effective_word_dur_factor
-    target_dur = float(rng.uniform(config.min_duration_sec, config.max_duration_sec))
-    max_chars = max(5, int(target_dur * chars_per_sec * 0.80))
-    min_chars = max(3, int(max_chars * 0.30))
-
-    text = generate_text(rng, min_chars=min_chars, max_chars=max_chars, wordlist=wordlist)
+    # ---- Text generation -------------------------------------------------
+    if text is None:
+        text = generate_text(
+            rng, min_chars=config.min_chars, max_chars=config.max_chars, wordlist=wordlist,
+        )
 
     # ---- Build Morse elements -------------------------------------------
     elements = text_to_elements(
@@ -539,15 +538,20 @@ def generate_sample(
             iws_factor=iws_factor,
         )
 
-    # ---- Calculate noise standard deviation for silence period ----------
-    # This matches the calculation in synthesize_audio() based on signal power and SNR
-    sig_power = 0.5 * target_amplitude ** 2  # Approximate carrier power at target amplitude
+    # ---- Noise std for silence periods ----------------------------------
+    # Approximation based on target amplitude; matches synthesize_audio().
+    sig_power = 0.5 * target_amplitude ** 2
     noise_std = math.sqrt(sig_power / (10.0 ** (snr_db / 10.0))) if sig_power > 1e-12 else 0.01
 
-    # ---- Trailing silence -----------------------------------------------
-    trailing_sec = 0.0
-    if config.trailing_silence_max_sec > 0.0:
-        trailing_sec = float(rng.uniform(0.0, config.trailing_silence_max_sec))
+    # ---- WPM-based silence durations ------------------------------------
+    # Both leading and trailing silence are randomised in
+    # [one dah, two inter-word spaces] at the chosen WPM and timing params.
+    # This ensures silence always looks like at least a recognisable space
+    # to the feature extractor but is not excessively long at slow speeds.
+    min_silence_sec = dah_dit_ratio * unit_dur               # one dah
+    max_silence_sec = 2.0 * 7.0 * iws_factor * unit_dur     # two word gaps
+    leading_sec  = float(rng.uniform(min_silence_sec, max_silence_sec))
+    trailing_sec = float(rng.uniform(min_silence_sec, max_silence_sec))
 
     # ---- Synthesise audio -----------------------------------------------
     audio_f32 = synthesize_audio(
@@ -565,11 +569,10 @@ def generate_sample(
         qsb_depth_db=qsb_depth_db,
     )
 
-    # Prepend 0.75 seconds of noise-only silence before the audio content
-    silence_samples = int(0.75 * config.sample_rate)
-    
-    silence_noise = rng.normal(0.0, noise_std, silence_samples).astype(np.float32)
-    audio_f32 = np.concatenate([silence_noise, audio_f32])
+    # ---- Prepend leading silence ----------------------------------------
+    leading_samples = int(leading_sec * config.sample_rate)
+    leading_noise = rng.normal(0.0, noise_std, leading_samples).astype(np.float32)
+    audio_f32 = np.concatenate([leading_noise, audio_f32])
 
     metadata: Dict = {
         "wpm": wpm,
@@ -584,8 +587,287 @@ def generate_sample(
         "target_amplitude": target_amplitude,
         "agc_depth_db": agc_depth_db,
         "qsb_depth_db": qsb_depth_db,
+        "leading_silence_sec": leading_sec,
+        "trailing_silence_sec": trailing_sec,
     }
     return audio_f32, text, metadata
+
+
+# ---------------------------------------------------------------------------
+# Direct event generation (bypasses audio synthesis + STFT + EMA)
+# ---------------------------------------------------------------------------
+
+def _sim_confidence(
+    snr_db: float,
+    is_mark: bool,
+    event_start: float,
+    event_dur: float,
+    rng: np.random.Generator,
+    qsb_depth_db: float = 0.0,
+    qsb_freq: float = 0.0,
+    qsb_phase: float = 0.0,
+    agc_depth_db: float = 0.0,
+    time_since_last_mark: float = 1e6,
+) -> float:
+    """Simulate MorseEvent confidence from SNR and augmentation state.
+
+    Models the steady-state E = tanh((peak_db - center) * 3 / spread) from
+    the real feature extractor.  In steady state with the 2:1 center weighting:
+      mark  deviation = 0.333 × spread  →  |E| = tanh(1.0) ≈ 0.76  (SNR ≥ 10)
+      space deviation = 0.667 × spread  →  |E| = tanh(2.0) ≈ 0.96  (SNR ≥ 10)
+    At low SNR (spread clamped to 10 dB), confidence drops proportionally.
+    """
+    effective_snr = snr_db
+
+    # QSB: slow sinusoidal signal fading affects mark amplitude
+    if qsb_depth_db > 0.0 and is_mark:
+        t_mid = event_start + event_dur / 2
+        effective_snr += (qsb_depth_db / 2.0) * math.sin(
+            2 * math.pi * qsb_freq * t_mid + qsb_phase
+        )
+
+    # AGC: noise floor elevated in spaces after marks (exponential release)
+    if agc_depth_db > 0.0 and not is_mark and time_since_last_mark < 5.0:
+        effective_snr -= agc_depth_db * math.exp(
+            -time_since_last_mark / 0.4  # ~400 ms release
+        )
+
+    effective_snr = max(effective_snr, 1.0)
+    spread = max(effective_snr, 10.0)
+
+    weight = 0.333 if is_mark else 0.667
+    base = abs(math.tanh(weight * effective_snr * 3.0 / spread))
+
+    # Per-event noise: larger at lower SNR
+    noise_std = 0.03 + 0.05 * max(0.0, 1.0 - snr_db / 25.0)
+    conf = base + float(rng.normal(0.0, noise_std))
+    return max(0.05, min(0.99, conf))
+
+
+def generate_events_direct(
+    config: MorseConfig,
+    wpm: Optional[float] = None,
+    rng: Optional[np.random.Generator] = None,
+    wordlist: Optional[List[str]] = None,
+    text: Optional[str] = None,
+) -> Tuple[List, str, Dict]:
+    """Generate a MorseEvent list directly without audio synthesis.
+
+    Produces the same event structure as generate_sample() fed through
+    MorseEventExtractor, but ~100× faster by bypassing audio synthesis,
+    STFT, and frame-by-frame EMA processing.
+
+    Simulates:
+      • Lead-in spurious events (low confidence) from unestablished EMA state
+      • AGC-pumping spurious mark detections during long spaces
+      • Boundary timing perturbation from STFT window / EMA convergence
+      • Confidence variation from SNR, AGC, and QSB effects
+      • Timing jitter and varying spacing ratios (via text_to_elements)
+
+    Parameters
+    ----------
+    text : str, optional
+        Override text; randomly generated if None.
+
+    Returns
+    -------
+    events : list[MorseEvent]
+    text : str
+    metadata : dict
+    """
+    from feature import MorseEvent  # local import avoids circular dependency
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # ---- Sample parameters (mirrors generate_sample exactly) -------------
+    if wpm is None:
+        wpm = float(rng.uniform(config.min_wpm, config.max_wpm))
+    unit_dur = 60.0 / (wpm * 50.0)
+
+    base_freq = float(rng.uniform(config.tone_freq_min, config.tone_freq_max))
+    snr_db = float(rng.uniform(config.min_snr_db, config.max_snr_db))
+
+    dah_dit_ratio = float(rng.uniform(config.dah_dit_ratio_min, config.dah_dit_ratio_max))
+    ics_factor = float(rng.uniform(config.ics_factor_min, config.ics_factor_max))
+    iws_factor = float(rng.uniform(config.iws_factor_min, config.iws_factor_max))
+
+    if config.timing_jitter_max > 0:
+        jitter_val = float(rng.uniform(config.timing_jitter, config.timing_jitter_max))
+    else:
+        jitter_val = config.timing_jitter
+
+    agc_depth_db = 0.0
+    if config.agc_probability > 0.0 and rng.random() < config.agc_probability:
+        agc_depth_db = float(rng.uniform(config.agc_depth_db_min, config.agc_depth_db_max))
+
+    qsb_depth_db = 0.0
+    qsb_freq = 0.0
+    qsb_phase = 0.0
+    if config.qsb_probability > 0.0 and rng.random() < config.qsb_probability:
+        qsb_depth_db = float(rng.uniform(config.qsb_depth_db_min, config.qsb_depth_db_max))
+        qsb_freq = float(rng.uniform(0.05, 0.3))
+        qsb_phase = float(rng.uniform(0.0, 2 * math.pi))
+
+    # ---- Text and elements -----------------------------------------------
+    if text is None:
+        text = generate_text(
+            rng, min_chars=config.min_chars, max_chars=config.max_chars, wordlist=wordlist,
+        )
+
+    elements = text_to_elements(
+        text, unit_dur, jitter_val, rng,
+        dah_dit_ratio=dah_dit_ratio,
+        ics_factor=ics_factor,
+        iws_factor=iws_factor,
+    )
+    if not elements:
+        text = "E"
+        elements = text_to_elements(
+            text, unit_dur, jitter_val, rng,
+            dah_dit_ratio=dah_dit_ratio,
+            ics_factor=ics_factor,
+            iws_factor=iws_factor,
+        )
+
+    # ---- Silence durations -----------------------------------------------
+    min_silence = dah_dit_ratio * unit_dur           # one dah
+    max_silence = 2.0 * 7.0 * iws_factor * unit_dur  # two word gaps
+    leading_sec = float(rng.uniform(min_silence, max_silence))
+    trailing_sec = float(rng.uniform(min_silence, max_silence))
+
+    # ---- Confidence helper (captures per-sample augmentation state) ------
+    def _conf(is_mark: bool, t: float, dur: float, tsm: float = 1e6) -> float:
+        return _sim_confidence(
+            snr_db, is_mark, t, dur, rng,
+            qsb_depth_db=qsb_depth_db, qsb_freq=qsb_freq,
+            qsb_phase=qsb_phase, agc_depth_db=agc_depth_db,
+            time_since_last_mark=tsm,
+        )
+
+    # ---- Build event list ------------------------------------------------
+    events: List[MorseEvent] = []
+    t = 0.0  # time cursor (seconds)
+
+    # -- Lead-in spurious events -------------------------------------------
+    # During initial silence the EMA is unestablished; noise causes rapid
+    # mark/space oscillations with low confidence.  More events at lower SNR.
+    settling = min(float(rng.uniform(0.05, 0.25)), leading_sec * 0.6)
+    snr_factor = max(0.5, min(2.0, 1.5 - snr_db / 40.0))
+    n_spurious = max(2, min(8, int(rng.poisson(3 * snr_factor))))
+
+    if settling > 0.02:
+        is_mark_cur = False  # bootstrap on noise → first state is space
+        for _ in range(n_spurious):
+            dur = float(rng.exponential(0.020)) + 0.010  # mean ~30 ms, min 10 ms
+            dur = min(dur, 0.060, settling - t)
+            if dur < 0.010:
+                break
+            etype = "mark" if is_mark_cur else "space"
+            conf = float(rng.uniform(0.05, 0.30))
+            events.append(MorseEvent(etype, t, dur, conf))
+            t += dur
+            is_mark_cur = not is_mark_cur
+
+    # -- Remaining leading silence as stable space -------------------------
+    remaining = leading_sec - t
+    if remaining > 0.005:
+        if events and events[-1].event_type == "space":
+            # Merge with last spurious space
+            prev = events[-1]
+            new_dur = prev.duration_sec + remaining
+            events[-1] = MorseEvent(
+                "space", prev.start_sec, new_dur,
+                _conf(False, prev.start_sec, new_dur),
+            )
+        else:
+            events.append(MorseEvent("space", t, remaining,
+                                     _conf(False, t, remaining)))
+        t = leading_sec
+
+    # -- Message events from elements --------------------------------------
+    last_mark_end = 0.0
+
+    for is_tone, dur_sec in elements:
+        # Small boundary perturbation (~3 ms std) simulating STFT/EMA delay
+        boundary_noise = float(rng.normal(0.0, 0.003))
+        perturbed_dur = max(dur_sec + boundary_noise, 0.005)
+
+        etype = "mark" if is_tone else "space"
+        tsm = (t - last_mark_end) if not is_tone else 1e6
+
+        events.append(MorseEvent(etype, t, perturbed_dur,
+                                 _conf(is_tone, t, perturbed_dur, tsm)))
+        t += perturbed_dur
+        if is_tone:
+            last_mark_end = t
+
+    # -- AGC pumping: random spurious mark detections in long spaces -------
+    # When AGC releases during long spaces, the rising noise floor can
+    # occasionally trigger brief false mark detections.
+    if agc_depth_db > 0.0:
+        i = 0
+        while i < len(events):
+            ev = events[i]
+            # Only consider long spaces (> 3× inter-word gap)
+            iws_dur = 7.0 * iws_factor * unit_dur
+            if (ev.event_type == "space" and ev.duration_sec > iws_dur * 1.5
+                    and rng.random() < 0.15):
+                # Insert a spurious mark somewhere in the middle of the space
+                space_start = ev.start_sec
+                space_dur = ev.duration_sec
+                # Place the spurious mark in the middle 60% of the space
+                insert_offset = float(rng.uniform(0.2, 0.8)) * space_dur
+                spur_dur = float(rng.exponential(0.015)) + 0.010
+                spur_dur = min(spur_dur, 0.040, space_dur * 0.15)
+
+                spur_conf = float(rng.uniform(0.05, 0.20))
+                spur_time = space_start + insert_offset
+
+                # Split original space into: before_space + spur_mark + after_space
+                before_dur = spur_time - space_start
+                after_dur = space_dur - before_dur - spur_dur
+
+                if before_dur > 0.010 and after_dur > 0.010:
+                    tsm_before = spur_time - last_mark_end if last_mark_end < spur_time else 1e6
+                    events[i] = MorseEvent(
+                        "space", space_start, before_dur,
+                        _conf(False, space_start, before_dur, tsm_before),
+                    )
+                    events.insert(i + 1, MorseEvent(
+                        "mark", spur_time, spur_dur, spur_conf,
+                    ))
+                    events.insert(i + 2, MorseEvent(
+                        "space", spur_time + spur_dur, after_dur,
+                        _conf(False, spur_time + spur_dur, after_dur, spur_dur),
+                    ))
+                    i += 3  # skip past the inserted events
+                    continue
+            i += 1
+
+    # -- Trailing silence --------------------------------------------------
+    if trailing_sec > 0.005:
+        tsm = t - last_mark_end
+        conf = _conf(False, t, trailing_sec, tsm)
+        # Last element is always a mark, so this is a type change — no merge
+        events.append(MorseEvent("space", t, trailing_sec, conf))
+
+    metadata: Dict = {
+        "wpm": wpm,
+        "snr_db": snr_db,
+        "base_frequency_hz": base_freq,
+        "frequency_drift_hz": config.tone_drift,
+        "timing_jitter": jitter_val,
+        "dah_dit_ratio": dah_dit_ratio,
+        "ics_factor": ics_factor,
+        "iws_factor": iws_factor,
+        "agc_depth_db": agc_depth_db,
+        "qsb_depth_db": qsb_depth_db,
+        "leading_silence_sec": leading_sec,
+        "trailing_silence_sec": trailing_sec,
+        "direct_events": True,
+    }
+    return events, text, metadata
 
 
 # ---------------------------------------------------------------------------

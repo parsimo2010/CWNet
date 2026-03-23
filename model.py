@@ -1,197 +1,247 @@
 """
-model.py — 1D causal dilated CNN + GRU model with CTC output for CWNet.
+model.py — LSTM model for MorseEvent-stream CTC decoding (CWNet).
 
-Architecture overview:
-  Input : (batch, C, T)   — C-channel feature time series, ~200 fps
-                             C=2: energy (mark/space) + phase coherence
+Architecture overview
+---------------------
+  Input : variable-rate sequence of MorseEvent feature vectors,
+          one vector per detected mark or space interval.
 
-  1. 1D CNN frontend
-     Three ``CausalConv1dBlock`` modules with growing dilation:
-       Block 1: channels C→32,  kernel=7, dilation=1, MaxPool(2×) → T/2
-       Block 2: channels 32→64, kernel=7, dilation=2
-       Block 3: channels 64→64, kernel=7, dilation=4
-     Causal left-only padding ensures no future frames are accessed.
-     Effective receptive field at the input: ≈ 400 ms (design target).
+  5 features per event:
+    is_mark              — 1.0 (mark) or 0.0 (space)
+    log_duration         — log(duration_sec + eps); captures multiplicative
+                           Morse timing relationships on a linear scale
+    confidence           — mean |E| from the feature extractor, range [0, 1]
+    log_ratio_prev_mark  — log(dur / prev_mark_dur) if this is a mark, else 0.0
+                           Encodes dit/dah ratio relative to the last mark;
+                           speed-invariant (always log(3) for a dah after a dit)
+    log_ratio_prev_space — log(dur / prev_space_dur) if this is a space, else 0.0
+                           Encodes intra-char vs inter-char vs inter-word ratio;
+                           speed-invariant regardless of WPM
 
-  2. Linear projection + LayerNorm
-     Flattened CNN output (64 channels) → proj_size (default 128).
+  1. Input projection
+       Linear(in_features → hidden_size, no bias) + LayerNorm + ReLU
+       Normalises the heterogeneous feature dimensions before entering the LSTM.
 
-  3. Unidirectional GRU
-     n_rnn_layers (default 2), hidden_size (default 128).
-     Persistent hidden state passed through ``streaming_step()`` for
-     chunk-by-chunk inference.
+  2. Unidirectional LSTM
+       n_rnn_layers (default 2), hidden_size (default 96).
+       Processes events one at a time; persistent (h, c) state carries speed
+       context forward across the stream.
 
-  4. Output head
-     Linear(hidden_size, num_classes) → log_softmax over 52-class vocab.
+  3. Output head
+       Linear(hidden_size → num_classes) → log_softmax
+       52-class vocabulary (same as before): blank + space + A-Z + 0-9 +
+       punctuation + prosigns.
 
-Default (~260 K parameters, 100 output fps at 5 ms hop after 2× pool):
-    cnn_channels=(32, 64, 64), cnn_time_pools=(2, 1, 1),
-    cnn_dilations=(1, 2, 4), cnn_kernel_size=7,
-    proj_size=128, hidden_size=128, n_rnn_layers=2, dropout=0.1
+Default (~155 K parameters):
+    in_features=5, hidden_size=96, n_rnn_layers=2, dropout=0.1
 
-Streaming inference:
-    ``streaming_step(x_chunk, hidden)`` processes one chunk with the GRU
-    hidden state carried from the previous call.  The CNN uses causal padding
-    (zeros on the left) so no future samples are needed.  For chunk sizes
-    ≥ 200 ms the boundary padding artifact is negligible (< 5 % of frames).
+Design rationale — log scale
+-----------------------------
+Morse timing is multiplicative: dah = 3× dit, inter-letter = 3× dit,
+inter-word = 7× dit, regardless of WPM.  In log space these ratios become
+additive constants, so the log_ratio features are SPEED-INVARIANT — the
+same pattern appears at any WPM, just shifted by log(dit_duration).  The
+LSTM learns one set of patterns and handles all speeds through its hidden
+state, without any explicit WPM estimation.
+
+Streaming / re-decode pattern
+------------------------------
+    featurizer = MorseEventFeaturizer()
+    model      = MorseEventModel(...)
+    hidden     = None
+    lp_buffer  = []
+
+    for event in feature_extractor.stream():
+        feat = featurizer.featurize(event)                  # (5,) ndarray
+        x    = torch.tensor(feat).unsqueeze(0).unsqueeze(0) # (1, 1, 5)
+        lp, hidden = model.streaming_step(x, hidden)
+        lp_buffer.append(lp.squeeze(1))                     # (1, num_classes)
+
+    # Re-decode the whole buffer at any time — earlier decisions improve
+    # as the LSTM accumulates speed context.
+    all_lp = torch.cat(lp_buffer, dim=0)   # (T, num_classes)
+    text   = vocab.beam_search_ctc(all_lp)
 """
 
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 import vocab
+from feature import MorseEvent
 
 
 # ---------------------------------------------------------------------------
-# 1D causal convolutional block
+# Event featurizer
 # ---------------------------------------------------------------------------
 
-class CausalConv1dBlock(nn.Module):
-    """Causal dilated 1D convolution → BatchNorm → ReLU → optional MaxPool.
+class MorseEventFeaturizer:
+    """Convert MorseEvent objects to 5-dimensional feature vectors.
 
-    Left-only padding of ``(kernel_size − 1) × dilation`` ensures each output
-    frame depends only on current and previous input frames.  This is required
-    for streaming inference with bounded latency.
+    Maintains running state (previous mark/space log-durations) across calls
+    to compute speed-invariant log-ratio features.  Call :meth:`reset` when
+    starting a new stream.
 
-    The effective receptive field contributed by this block (in input frames
-    of this block's time axis) is ``(kernel_size − 1) × dilation + 1``.
+    Parameters
+    ----------
+    eps : float
+        Added to duration before taking log, preventing log(0).
+        Default 1e-4 s (0.1 ms) — well below the minimum detectable
+        event duration (~10 ms at 200 fps).
 
-    Args:
-        in_ch: Input channel count.
-        out_ch: Output channel count.
-        kernel_size: Convolution kernel length.
-        dilation: Dilation factor (1 = standard conv, 2 = skip every other).
-        time_pool: MaxPool stride along the time axis.  1 = no pooling.
-        dropout: Dropout probability applied after ReLU (0 = disabled).
+    Attributes
+    ----------
+    in_features : int
+        Always 5.  Feature layout:
+        ``[is_mark, log_duration, confidence,
+           log_ratio_prev_mark, log_ratio_prev_space]``
     """
 
-    def __init__(
-        self,
-        in_ch: int,
-        out_ch: int,
-        kernel_size: int = 7,
-        dilation: int = 1,
-        time_pool: int = 1,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        # Causal left-only padding: (K-1)*D samples on the left, none on right
-        self._causal_pad = (kernel_size - 1) * dilation
+    in_features: int = 5
 
-        self.conv = nn.Conv1d(
-            in_ch, out_ch,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            padding=0,          # handled manually below
-            bias=False,
+    def __init__(self, eps: float = 1e-4) -> None:
+        self._eps = eps
+        self._prev_mark_log_dur: Optional[float] = None
+        self._prev_space_log_dur: Optional[float] = None
+
+    def reset(self) -> None:
+        """Clear state for a new stream."""
+        self._prev_mark_log_dur = None
+        self._prev_space_log_dur = None
+
+    def featurize(self, event: MorseEvent) -> np.ndarray:
+        """Return a ``(5,)`` float32 feature vector for a single event.
+
+        Updates internal log-duration state so the next event's log-ratio
+        is computed relative to this one.
+
+        Parameters
+        ----------
+        event : MorseEvent
+            A mark or space interval from :class:`~feature.MorseEventExtractor`.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(5,)`` float32:
+            ``[is_mark, log_duration, confidence,
+               log_ratio_prev_mark, log_ratio_prev_space]``
+        """
+        is_mark = 1.0 if event.event_type == "mark" else 0.0
+        log_dur = math.log(max(event.duration_sec, 0.0) + self._eps)
+        conf = float(event.confidence)
+
+        if event.event_type == "mark":
+            log_ratio_mark = (
+                log_dur - self._prev_mark_log_dur
+                if self._prev_mark_log_dur is not None
+                else 0.0
+            )
+            log_ratio_space = 0.0
+            self._prev_mark_log_dur = log_dur
+        else:
+            log_ratio_mark = 0.0
+            log_ratio_space = (
+                log_dur - self._prev_space_log_dur
+                if self._prev_space_log_dur is not None
+                else 0.0
+            )
+            self._prev_space_log_dur = log_dur
+
+        return np.array(
+            [is_mark, log_dur, conf, log_ratio_mark, log_ratio_space],
+            dtype=np.float32,
         )
-        self.bn = nn.BatchNorm1d(out_ch)
-        self.act = nn.ReLU(inplace=True)
-        self.drop = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
 
-        self.pool: nn.Module = (
-            nn.MaxPool1d(kernel_size=time_pool, stride=time_pool)
-            if time_pool > 1
-            else nn.Identity()
-        )
+    def featurize_sequence(self, events: List[MorseEvent]) -> np.ndarray:
+        """Convert a complete event sequence to a ``(T, 5)`` feature array.
 
-    def forward(self, x: Tensor) -> Tensor:
-        # x: (B, C, T)
-        x = F.pad(x, (self._causal_pad, 0))   # left-pad with zeros
-        x = self.conv(x)                        # (B, out_ch, T)
-        x = self.act(self.bn(x))
-        x = self.drop(x)
-        x = self.pool(x)                        # (B, out_ch, T // time_pool)
-        return x
+        Resets log-ratio state before processing, so this is suitable for
+        converting a full training sample from scratch.
+
+        Parameters
+        ----------
+        events : list of MorseEvent
+            Complete event sequence for one training sample.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(T, 5)`` float32, one row per event.
+        """
+        self.reset()
+        if not events:
+            return np.empty((0, self.in_features), dtype=np.float32)
+        return np.stack([self.featurize(e) for e in events], axis=0)
 
 
 # ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
 
-class MorseCTCModel(nn.Module):
-    """1D causal CNN + GRU model for Morse code CTC decoding.
+class MorseEventModel(nn.Module):
+    """Unidirectional LSTM model for Morse CTC decoding from MorseEvent streams.
 
-    Args:
-        in_channels: Number of input feature channels (1 = energy only,
-            2 = energy + phase coherence).
-        cnn_channels: Output channel counts per CNN block.
-        cnn_time_pools: Time-axis MaxPool stride per block.  Length must
-            equal ``len(cnn_channels)``.
-        cnn_dilations: Dilation per block.  Length must equal ``len(cnn_channels)``.
-        cnn_kernel_size: Convolution kernel size (shared across all blocks).
-        proj_size: Hidden dimension after the CNN → GRU projection.
-        hidden_size: GRU hidden size (per direction; model is unidirectional).
-        n_rnn_layers: Number of stacked GRU layers.
-        dropout: Dropout between GRU layers and after each CNN block
-            (0 = disabled).
-        causal: Must be True; provided for API compatibility with export tools.
+    Processes a variable-rate sequence of MorseEvent feature vectors — one
+    per detected mark or space interval — and outputs per-event
+    log-probabilities over the CTC vocabulary.
+
+    There is no fixed sequence-length cap: the LSTM processes one event at a
+    time via :meth:`streaming_step` with constant memory (hidden state size),
+    and the CTC log-probs buffer grows until the caller chooses to decode.
+
+    Parameters
+    ----------
+    in_features : int
+        Input feature dimension.  Must match
+        :attr:`MorseEventFeaturizer.in_features` (default 5).
+    hidden_size : int
+        LSTM hidden dimension (default 96).
+    n_rnn_layers : int
+        Number of stacked LSTM layers (default 2).
+    dropout : float
+        Dropout probability between LSTM layers (default 0.1).
+        Disabled automatically when ``n_rnn_layers == 1``.
     """
 
     def __init__(
         self,
-        in_channels: int = 1,
-        cnn_channels: Sequence[int] = (32, 64, 64),
-        cnn_time_pools: Sequence[int] = (2, 1, 1),
-        cnn_dilations: Sequence[int] = (1, 2, 4),
-        cnn_kernel_size: int = 7,
-        proj_size: int = 128,
-        hidden_size: int = 128,
+        in_features: int = 5,
+        hidden_size: int = 96,
         n_rnn_layers: int = 2,
         dropout: float = 0.1,
-        causal: bool = True,         # always True; kept for API compat
     ) -> None:
         super().__init__()
 
-        if not (len(cnn_channels) == len(cnn_time_pools) == len(cnn_dilations)):
-            raise ValueError(
-                "cnn_channels, cnn_time_pools, and cnn_dilations must have the same length."
-            )
-
-        self.causal = True   # always causal; field kept for ONNX / quantize compat
+        self.in_features = in_features
         self.hidden_size = hidden_size
-        self.in_channels = in_channels
+        self.n_rnn_layers = n_rnn_layers
 
-        # ---- CNN frontend ------------------------------------------------
-        blocks: List[nn.Module] = []
-        in_ch = in_channels
-        for out_ch, pool, dil in zip(cnn_channels, cnn_time_pools, cnn_dilations):
-            blocks.append(
-                CausalConv1dBlock(
-                    in_ch, out_ch,
-                    kernel_size=cnn_kernel_size,
-                    dilation=dil,
-                    time_pool=pool,
-                    dropout=dropout,
-                )
-            )
-            in_ch = out_ch
-        self.cnn = nn.Sequential(*blocks)
-
-        #: Total time-axis downsampling (product of all time pools).
-        self.pool_factor: int = 1
-        for p in cnn_time_pools:
-            self.pool_factor *= p
-
-        last_ch = int(cnn_channels[-1])
-
-        # ---- Linear projection -------------------------------------------
+        # ---- Input projection -----------------------------------------------
+        # Normalises the heterogeneous feature dimensions (binary is_mark,
+        # log-scale durations, [0,1] confidence, unbounded log-ratios) into
+        # a common hidden-size representation before entering the LSTM.
+        # No bias on the Linear because LayerNorm has its own learnable
+        # offset.
         self.proj = nn.Sequential(
-            nn.Linear(last_ch, proj_size, bias=False),
-            nn.LayerNorm(proj_size),
+            nn.Linear(in_features, hidden_size, bias=False),
+            nn.LayerNorm(hidden_size),
             nn.ReLU(inplace=True),
         )
 
-        # ---- Unidirectional GRU ------------------------------------------
-        self.rnn = nn.GRU(
-            input_size=proj_size,
+        # ---- Unidirectional LSTM --------------------------------------------
+        # batch_first=False → layout is (T, B, H) throughout, matching the
+        # CTC loss convention (input_lengths refer to the T axis).
+        self.rnn = nn.LSTM(
+            input_size=hidden_size,
             hidden_size=hidden_size,
             num_layers=n_rnn_layers,
             batch_first=False,
@@ -199,7 +249,7 @@ class MorseCTCModel(nn.Module):
             dropout=dropout if n_rnn_layers > 1 else 0.0,
         )
 
-        # ---- Output head -------------------------------------------------
+        # ---- Output head ----------------------------------------------------
         self.fc = nn.Linear(hidden_size, vocab.num_classes)
 
         self._init_weights()
@@ -210,30 +260,28 @@ class MorseCTCModel(nn.Module):
 
     def _init_weights(self) -> None:
         for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1.0)
-                nn.init.constant_(m.bias, 0.0)
-            elif isinstance(m, nn.Linear):
+            if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.GRU):
+            elif isinstance(m, nn.LSTM):
                 for name, param in m.named_parameters():
                     if "weight_ih" in name:
                         nn.init.xavier_uniform_(param.data)
                     elif "weight_hh" in name:
+                        # Orthogonal init for recurrent weights reduces
+                        # vanishing/exploding gradient risk.
                         nn.init.orthogonal_(param.data)
                     elif "bias" in name:
                         nn.init.zeros_(param.data)
 
     @property
     def num_params(self) -> int:
+        """Total trainable parameter count."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     # ------------------------------------------------------------------
-    # Forward (full sequence — training and offline inference)
+    # Forward — full sequence (training and offline inference)
     # ------------------------------------------------------------------
 
     def forward(
@@ -243,89 +291,90 @@ class MorseCTCModel(nn.Module):
     ) -> Tuple[Tensor, Tensor]:
         """Full-sequence forward pass.
 
-        Args:
-            x: Feature time series, shape ``(batch, in_channels, time)``.
-            lengths: Input frame counts before padding, shape ``(batch,)``.
-                If ``None`` all frames are treated as valid.
+        Parameters
+        ----------
+        x : Tensor
+            Feature sequences, shape ``(time, batch, in_features)``.
+            Each time step is one MorseEvent feature vector produced by
+            :class:`MorseEventFeaturizer`.
+        lengths : Tensor, optional
+            Number of valid events per sample, shape ``(batch,)``.
+            If ``None`` all time steps are treated as valid.
 
-        Returns:
-            ``(log_probs, output_lengths)``
-
-            - ``log_probs``: ``(time_out, batch, num_classes)``
-            - ``output_lengths``: ``(batch,)``
+        Returns
+        -------
+        log_probs : Tensor
+            ``(time, batch, num_classes)`` — per-event log-probabilities.
+        output_lengths : Tensor
+            ``(batch,)`` — equal to ``lengths`` (no time-axis downsampling).
         """
-        B, _, T = x.shape
+        T, B, _ = x.shape
 
-        # ---- 1D CNN -------------------------------------------------------
-        out = self.cnn(x)          # (B, last_ch, T_out)
+        out = self.proj(x)                # (T, B, hidden_size)
 
-        _, C, T_out = out.shape
-
-        # ---- Project: (B, T_out, C) → (B, T_out, proj_size) -------------
-        out = out.permute(0, 2, 1)    # (B, T_out, C)
-        out = self.proj(out)           # (B, T_out, proj_size)
-
-        # ---- GRU ---------------------------------------------------------
-        out = out.permute(1, 0, 2)    # (T_out, B, proj_size)
-        out, _ = self.rnn(out)        # (T_out, B, hidden_size)
-
-        # ---- Output head -------------------------------------------------
-        logits = self.fc(out)                         # (T_out, B, num_classes)
-        log_probs = F.log_softmax(logits, dim=-1)     # (T_out, B, num_classes)
-
-        # ---- Output lengths ----------------------------------------------
         if lengths is not None:
-            out_lens = torch.div(lengths, self.pool_factor, rounding_mode="floor")
-            out_lens = out_lens.clamp(min=1)
+            # Pack so the LSTM sees only valid events per sample — padded
+            # positions are skipped entirely rather than receiving zero input.
+            packed = pack_padded_sequence(out, lengths.cpu(), enforce_sorted=False)
+            packed_out, _ = self.rnn(packed)
+            out, _ = pad_packed_sequence(packed_out, total_length=T)
+            # pad_packed_sequence fills padded positions with 0; CTC loss
+            # ignores them via input_lengths, so this is safe.
         else:
-            out_lens = torch.full((B,), T_out, dtype=torch.long, device=x.device)
+            out, _ = self.rnn(out)        # (T, B, hidden_size)
+
+        logits = self.fc(out)             # (T, B, num_classes)
+        log_probs = F.log_softmax(logits, dim=-1)
+
+        if lengths is not None:
+            out_lens = lengths.clamp(min=1)
+        else:
+            out_lens = torch.full((B,), T, dtype=torch.long, device=x.device)
 
         return log_probs, out_lens
 
     # ------------------------------------------------------------------
-    # streaming_step — chunk-by-chunk causal inference
+    # streaming_step — event-by-event causal inference
     # ------------------------------------------------------------------
 
     def streaming_step(
         self,
         x: Tensor,
-        hidden: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
-        """Process one audio chunk with a persistent GRU hidden state.
+        hidden: Optional[Tuple[Tensor, Tensor]] = None,
+    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+        """Process one or more events with a persistent LSTM hidden state.
 
-        The CNN uses causal (left-only) padding, so each output frame depends
-        only on current and past input frames; no future samples are needed.
-        For chunk sizes ≥ 200 ms the zero-padding artifact at the left edge
-        is negligible (< 5 % of output frames for typical kernel sizes).
+        The model is fully causal: each output depends only on the current
+        and all previous events encoded in *hidden*.  Call this once per
+        :class:`~feature.MorseEvent` as it arrives from the feature
+        extractor; buffer the returned ``log_probs`` slices and re-run CTC
+        decode on the growing buffer at any time.  Earlier character
+        decisions improve as the LSTM accumulates speed context.
 
-        Args:
-            x: Feature chunk, shape ``(batch, in_channels, T_chunk)``.
-            hidden: GRU hidden state from the previous call,
-                ``(n_layers, batch, hidden_size)``, or ``None`` to start a
-                new utterance (zeros initialisation).
+        There is no maximum sequence length: the LSTM hidden state occupies
+        constant memory regardless of how many events have been processed.
 
-        Returns:
-            ``(log_probs, new_hidden)``
+        Parameters
+        ----------
+        x : Tensor
+            Event feature chunk, shape ``(T_chunk, batch, in_features)``.
+            Typically ``T_chunk = 1`` (one event at a time).
+        hidden : tuple of Tensor, optional
+            ``(h_n, c_n)`` from the previous call, each shape
+            ``(n_layers, batch, hidden_size)``.  Pass ``None`` to start a
+            new utterance (zero initialisation).
 
-            - ``log_probs``  — ``(T_out, batch, num_classes)``
-            - ``new_hidden`` — ``(n_layers, batch, hidden_size)``
-              Pass back as *hidden* on the next call.
+        Returns
+        -------
+        log_probs : Tensor
+            ``(T_chunk, batch, num_classes)``
+        new_hidden : tuple of Tensor
+            Updated ``(h_n, c_n)`` — pass back as *hidden* on the next call.
         """
-        B, _, T_chunk = x.shape
-
-        # CNN (fully causal — no future frames needed)
-        out = self.cnn(x)          # (B, last_ch, T_out)
-        _, C, T_out = out.shape
-
-        out = out.permute(0, 2, 1)    # (B, T_out, C)
-        out = self.proj(out)           # (B, T_out, proj_size)
-
-        out = out.permute(1, 0, 2)    # (T_out, B, proj_size)
-        out, new_hidden = self.rnn(out, hidden)   # (T_out, B, hidden_size)
-
+        out = self.proj(x)                          # (T_chunk, B, hidden_size)
+        out, new_hidden = self.rnn(out, hidden)     # (T_chunk, B, hidden_size)
         logits = self.fc(out)
         log_probs = F.log_softmax(logits, dim=-1)
-
         return log_probs, new_hidden
 
 
@@ -334,45 +383,71 @@ class MorseCTCModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from config import ModelConfig, create_default_config
+    from config import ModelConfig
 
-    cfg = create_default_config("clean")
-    mcfg = cfg.model
-    model = MorseCTCModel(
-        in_channels=mcfg.in_channels,
-        cnn_channels=mcfg.cnn_channels,
-        cnn_time_pools=mcfg.cnn_time_pools,
-        cnn_dilations=mcfg.cnn_dilations,
-        cnn_kernel_size=mcfg.cnn_kernel_size,
-        proj_size=mcfg.proj_size,
+    mcfg = ModelConfig()
+    model = MorseEventModel(
+        in_features=mcfg.in_features,
         hidden_size=mcfg.hidden_size,
         n_rnn_layers=mcfg.n_rnn_layers,
         dropout=mcfg.dropout,
     )
 
-    print(f"in_channels : {model.in_channels}")
+    print(f"in_features : {model.in_features}")
+    print(f"hidden_size : {model.hidden_size}")
+    print(f"n_rnn_layers: {model.n_rnn_layers}")
     print(f"Parameters  : {model.num_params:,}")
-    print(f"pool_factor : {model.pool_factor}")
-    fps_in = 1000.0 / 5.0   # 5 ms hop → 200 fps
-    print(f"Output fps  : {fps_in / model.pool_factor:.0f}  (input {fps_in:.0f} fps)")
+    print(f"Vocab size  : {vocab.num_classes}")
 
-    # Full forward pass
-    B, T = 4, 400   # 400 frames = 2 s at 200 fps
-    C = mcfg.in_channels
-    x = torch.randn(B, C, T)
-    lens = torch.tensor([400, 380, 350, 300])
+    # Full forward pass (training mode) --------------------------------
+    # 80 events ≈ a short sentence at 20 WPM
+    T, B = 80, 4
+    x = torch.randn(T, B, mcfg.in_features)
+    lens = torch.tensor([80, 70, 60, 50])
     lp, ol = model(x, lens)
-    print(f"\nforward()  log_probs={lp.shape}  out_lens={ol.tolist()}")
+    print(f"\nforward()       log_probs={lp.shape}  out_lens={ol.tolist()}")
+    assert lp.shape == (T, B, vocab.num_classes)
+    assert ol.tolist() == [80, 70, 60, 50]
 
-    # Streaming step
+    # Streaming step — no length cap ------------------------------------
     h = None
-    chunk = torch.randn(1, C, 40)   # 40 frames = 200 ms at 200 fps
-    lp_s, h = model.streaming_step(chunk, h)
-    print(f"streaming_step() log_probs={lp_s.shape}  hidden={h.shape}")
+    lp_buf = []
+    for i in range(120):          # 120 events — well over any word length
+        ev = torch.randn(1, 1, mcfg.in_features)
+        lp_s, h = model.streaming_step(ev, h)
+        lp_buf.append(lp_s.squeeze(1))   # (1, num_classes)
+    all_lp = torch.cat(lp_buf, dim=0)    # (120, num_classes)
+    print(f"streaming_step(): processed 120 events, buffer={all_lp.shape}")
+    print(f"  h={h[0].shape}  c={h[1].shape}")
+    decoded = vocab.decode_ctc(all_lp, strip_trailing_space=True)
+    print(f"  greedy CTC decode (random weights): {decoded!r}")
 
-    # Receptive field estimate
-    # Block 1: (7-1)*1=6 causal pad, pool 2 → RF=7 frames at 200fps=35ms
-    # Block 2: (7-1)*2=12 causal pad, no pool → RF=13 frames at 100fps=130ms
-    # Block 3: (7-1)*4=24 causal pad, no pool → RF=25 frames at 100fps=250ms
-    # Combined: 7 + 26 + 50 - 2 ≈ 81 input frames = 405 ms
-    print(f"\nApprox. receptive field: ~405 ms  (see docstring for derivation)")
+    # Featurizer --------------------------------------------------------
+    featurizer = MorseEventFeaturizer()
+    # "K" = −·−  at ~20 WPM  (unit = 60 ms)
+    events = [
+        MorseEvent("mark",  0.000, 0.180, 0.92),   # dah
+        MorseEvent("space", 0.180, 0.060, 0.91),   # intra-char gap
+        MorseEvent("mark",  0.240, 0.060, 0.93),   # dit
+        MorseEvent("space", 0.300, 0.060, 0.91),   # intra-char gap
+        MorseEvent("mark",  0.360, 0.180, 0.92),   # dah
+        MorseEvent("space", 0.540, 0.180, 0.89),   # inter-letter gap
+    ]
+    feats = featurizer.featurize_sequence(events)
+    print(f"\nFeaturizer: {len(events)} events -> shape {feats.shape}")
+    print("  [is_mark  log_dur   conf    ratio_m  ratio_s]")
+    for ev, fv in zip(events, feats):
+        print(
+            f"  {ev.event_type:5s}  "
+            f"[{fv[0]:.0f}  {fv[1]:6.3f}  {fv[2]:.2f}  "
+            f"{fv[3]:+.3f}  {fv[4]:+.3f}]  "
+            f"dur={ev.duration_sec*1000:.0f}ms"
+        )
+
+    # Verify log ratios: dit after dah → ratio ≈ log(1/3) ≈ -1.099
+    # (small deviation from exact log(1/3) due to the eps offset in both terms)
+    eps = featurizer._eps
+    expected = math.log(0.060 + eps) - math.log(0.180 + eps)
+    assert abs(feats[2, 3] - expected) < 1e-4, "log_ratio_mark wrong"
+    print(f"\nlog(dit/dah) = {feats[2,3]:.4f}  expected {expected:.4f}  ok")
+    print("Self-test passed.")
