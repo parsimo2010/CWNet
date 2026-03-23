@@ -33,7 +33,7 @@ Metrics logged per epoch:
     beam_cer     --beam-search CER on the validation set (every N epochs;
                    NaN otherwise).  N = training.beam_cer_interval.
 
-CER is computed with jiwer (pip install jiwer).
+CER is computed via inline Levenshtein distance (no external dependency).
 """
 
 from __future__ import annotations
@@ -47,7 +47,6 @@ import random
 from pathlib import Path
 from typing import List, Optional
 
-import jiwer
 import numpy as np
 import soundfile as sf
 import torch
@@ -77,6 +76,21 @@ def beam_ctc_decode(log_probs: torch.Tensor, beam_width: int = 10) -> str:
     return vocab_module.beam_search_ctc(
         log_probs, beam_width=beam_width, blank_idx=0, strip_trailing_space=True
     )
+
+
+def _fast_cer(ref: str, hyp: str) -> float:
+    """Character error rate via Levenshtein distance, no jiwer overhead."""
+    n, m = len(ref), len(hyp)
+    if n == 0:
+        return 0.0 if m == 0 else 1.0
+    d = list(range(m + 1))
+    for i in range(n):
+        prev, d[0] = d[0], i + 1
+        for j in range(m):
+            prev, d[j + 1] = d[j + 1], min(
+                d[j] + 1, d[j + 1] + 1, prev + (ref[i] != hyp[j])
+            )
+    return d[m] / n
 
 
 # ---------------------------------------------------------------------------
@@ -194,11 +208,13 @@ def evaluate_model(
             if torch.isfinite(loss):
                 val_losses.append(loss.item())
 
-            for b in range(log_probs.shape[1]):
-                valid_t = out_lens[b].item()
-                sample_lp = log_probs[:valid_t, b, :]
+            log_probs_cpu = log_probs.cpu()
+            out_lens_cpu = out_lens.cpu()
+            for b in range(log_probs_cpu.shape[1]):
+                valid_t = out_lens_cpu[b].item()
+                sample_lp = log_probs_cpu[:valid_t, b, :]
                 pred_greedy = greedy_ctc_decode(sample_lp).strip()
-                greedy_cers.append(jiwer.cer(texts[b], pred_greedy))
+                greedy_cers.append(_fast_cer(texts[b], pred_greedy))
 
     avg_val = float(np.mean(val_losses)) if val_losses else float("inf")
     avg_g_cer = float(np.mean(greedy_cers)) if greedy_cers else 1.0
@@ -312,15 +328,14 @@ def train(args: argparse.Namespace) -> None:
         prefetch_factor=4 if config.training.num_workers > 0 else None,
         persistent_workers=(config.training.num_workers > 0),
     )
-    val_workers = min(4, config.training.num_workers)
     val_loader = DataLoader(
         val_ds,
         batch_size=config.training.batch_size,
         collate_fn=collate_fn,
-        num_workers=val_workers,
+        num_workers=config.training.num_workers,
         pin_memory=(device.type == "cuda"),
-        prefetch_factor=4 if val_workers > 0 else None,
-        persistent_workers=(val_workers > 0),
+        prefetch_factor=4 if config.training.num_workers > 0 else None,
+        persistent_workers=(config.training.num_workers > 0),
     )
 
     # ---- Loss / optimiser / scheduler -----------------------------------
@@ -642,15 +657,17 @@ def train(args: argparse.Namespace) -> None:
                 if torch.isfinite(loss):
                     val_losses.append(loss.item())
 
-                for b in range(log_probs.shape[1]):
-                    valid_t = out_lens[b].item()
-                    sample_lp = log_probs[:valid_t, b, :]
+                log_probs_cpu = log_probs.cpu()
+                out_lens_cpu = out_lens.cpu()
+                for b in range(log_probs_cpu.shape[1]):
+                    valid_t = out_lens_cpu[b].item()
+                    sample_lp = log_probs_cpu[:valid_t, b, :]
                     pred_greedy = greedy_ctc_decode(sample_lp).strip()
-                    greedy_cers.append(jiwer.cer(texts[b], pred_greedy))
+                    greedy_cers.append(_fast_cer(texts[b], pred_greedy))
 
                     if run_beam:
-                        pred_beam = beam_ctc_decode(sample_lp.cpu(), beam_width).strip()
-                        beam_cers.append(jiwer.cer(texts[b], pred_beam))
+                        pred_beam = beam_ctc_decode(sample_lp, beam_width).strip()
+                        beam_cers.append(_fast_cer(texts[b], pred_beam))
 
         _n = min(len(epoch_losses), config.training.log_interval)
         avg_train = float(np.mean(epoch_losses[-_n:])) if epoch_losses else float("inf")
