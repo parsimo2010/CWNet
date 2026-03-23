@@ -120,17 +120,36 @@ All training data is synthesised on the fly; no recorded audio is required.
 |---|---|---|
 | SNR | 15–40 dB | 3–30 dB |
 | WPM | 10–40 | 5–50 |
-| `dah_dit_ratio` | 2.5–3.5 | 1.5–4.0 |
+| `dah_dit_ratio` | 2.5–3.5 | 1.3–4.0 |
 | `ics_factor` (×3-dit gap) | 0.8–1.2 | 0.5–2.0 |
 | `iws_factor` (×7-dit gap) | 0.8–1.5 | 0.5–2.5 |
-| timing jitter | 0–5 % | 0–20 % |
+| timing jitter | 0–5 % | 0–25 % |
 | noise | white AWGN | white AWGN |
 | frequency drift | ±3 Hz | ±5 Hz |
-| AGC simulation | 30% samples, 6–15 dB depth | 70% samples, 6–18 dB depth |
-| QSB fading | disabled | 30% samples, 3–10 dB p-p |
+| AGC simulation | 30% samples, 6–15 dB depth | 70% samples, 6–22 dB depth |
+| QSB fading | disabled | 50% samples, 3–18 dB p-p |
+| key type | 20/20/60 straight/bug/paddle | 40/35/25 straight/bug/paddle |
+| speed drift | disabled | ±15 % within transmission |
 
 `dah_dit_ratio`, `ics_factor`, and `iws_factor` are sampled **independently** per sample
 to cover the wide range of real-world operator timing styles.
+
+**Key type simulation** — each training sample is generated with one of three key types,
+each producing distinct timing signatures:
+- **Straight key**: per-character speed variation (simpler characters keyed faster),
+  per-element dah/dit ratio variation, highest overall jitter.
+- **Bug (semi-automatic)**: mechanically consistent dits, manually timed dahs with
+  moderate jitter and per-dah ratio variation.
+- **Paddle (electronic keyer)**: electronically consistent elements, operator-controlled
+  inter-character and inter-word spacing.
+
+**Event-stream augmentations** applied in the direct event generator:
+- **Merged events**: when jitter pushes inter-element spaces below 12 ms, adjacent marks
+  merge into a single longer mark (simulating the feature extractor's blip filter).
+- **Dit dropout**: short marks are probabilistically dropped at low SNR (simulating
+  missed detections below the blip filter threshold).
+- **Noise spurious events**: brief false mark detections injected in spaces at low SNR,
+  capped at 2 per sample.
 
 **AGC simulation** models real HF radio automatic gain control: noise amplitude is
 attenuated during marks (fast attack, ~50 ms) and released during spaces (slow release,

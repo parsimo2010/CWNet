@@ -95,6 +95,16 @@ class MorseConfig:
     qsb_depth_db_min: float = 3.0      # peak-to-peak fading range (dB, min)
     qsb_depth_db_max: float = 10.0     # peak-to-peak fading range (dB, max)
 
+    # Key type weights: (straight_key, bug, paddle) probabilities.
+    # Straight key: per-character speed variation, high jitter on all elements.
+    # Bug (semi-automatic): consistent dits, variable dahs + spacing.
+    # Paddle (electronic keyer): consistent elements, variable spacing only.
+    key_type_weights: Tuple[float, float, float] = (0.33, 0.33, 0.34)
+
+    # Speed drift: slow WPM variation within a single transmission.
+    # Fraction of base unit_dur (e.g. 0.15 = ±15%).  0.0 = constant speed.
+    speed_drift_max: float = 0.0
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -354,6 +364,8 @@ def create_default_config(scenario: str = "clean") -> Config:
         # Real-world augmentations (mild -- model learns basic task first)
         cfg.morse.agc_probability = 0.3
         # qsb_probability left at 0.0 for clean stage
+        # Key type: mostly paddles (easiest) for clean stage
+        cfg.morse.key_type_weights = (0.20, 0.20, 0.60)
 
     elif scenario == "full":
         cfg.morse.min_snr_db = 3.0
@@ -362,14 +374,14 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.max_wpm = 50.0
         cfg.morse.min_chars = 20
         cfg.morse.max_chars = 200
-        cfg.morse.dah_dit_ratio_min = 1.5
+        cfg.morse.dah_dit_ratio_min = 1.3
         cfg.morse.dah_dit_ratio_max = 4.0
         cfg.morse.ics_factor_min = 0.5
         cfg.morse.ics_factor_max = 2.0
         cfg.morse.iws_factor_min = 0.5
         cfg.morse.iws_factor_max = 2.5
         cfg.morse.timing_jitter = 0.0
-        cfg.morse.timing_jitter_max = 0.20
+        cfg.morse.timing_jitter_max = 0.25
         cfg.morse.tone_drift = 5.0
         # sqrt(512/128) * 6e-4 ~ 1.2e-3; rounded to 1e-3.
         cfg.training.batch_size = 512
@@ -381,8 +393,13 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (full strength for curriculum stage 2)
         cfg.morse.agc_probability = 0.7
-        cfg.morse.agc_depth_db_max = 18.0
-        cfg.morse.qsb_probability = 0.3
+        cfg.morse.agc_depth_db_max = 22.0
+        cfg.morse.qsb_probability = 0.50
+        cfg.morse.qsb_depth_db_max = 18.0
+        # Key type: weighted toward harder key types (straight key, bug)
+        cfg.morse.key_type_weights = (0.40, 0.35, 0.25)
+        # Speed drift: ±15% WPM variation within a transmission
+        cfg.morse.speed_drift_max = 0.15
 
     else:
         raise ValueError(

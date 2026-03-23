@@ -74,7 +74,7 @@ and the LSTM processes them one event at a time with persistent hidden state.
 ## File Map & Key Functions
 
 ### config.py — All configuration (dataclasses)
-- `MorseConfig` — WPM, tone freq, SNR, timing params (dah_dit_ratio, ics/iws factors), AGC sim, QSB fading. **sample_rate = 16000**.
+- `MorseConfig` — WPM, tone freq, SNR, timing params (dah_dit_ratio, ics/iws factors), AGC sim, QSB fading, key type weights, speed drift. **sample_rate = 16000**.
 - `FeatureConfig` — STFT window/hop (20ms/5ms), freq monitoring range (300–1200 Hz), blip threshold.
 - `ModelConfig` — in_features (5), hidden_size (96), n_rnn_layers (2), dropout (0.1). ~155K params.
 - `TrainingConfig` — batch size, LR, epoch counts, beam search CER log interval
@@ -100,9 +100,11 @@ and the LSTM processes them one event at a time with persistent hidden state.
 
 ### morse_generator.py — Synthetic training data
 - `generate_sample(config, wpm=None, rng=None)` → `(audio_f32, text, metadata)`
-- `text_to_elements(text, unit_dur, ...)` → list of `(is_tone, duration)` tuples
+- `text_to_elements(text, unit_dur, ..., key_type, speed_drift_max)` → list of `(is_tone, duration)` tuples
 - `synthesize_audio(elements, ...)` → float32 waveform
-- Augmentations: AGC simulation (fast attack ~50ms / slow release ~400ms), QSB fading (0.05–0.3 Hz), frequency drift (±3–5 Hz), timing jitter (0–20%), bad-fist dah/dit ratios
+- `generate_events_direct(config, ...)` → `(list[MorseEvent], text, metadata)` — ~100× faster than audio path
+- `CW_ABBREVIATIONS` — common CW terms (CQ, DE, 73, QTH, RST, etc.) mixed into generated text (~15%)
+- Augmentations: AGC simulation (fast attack ~50ms / slow release ~400ms), QSB fading (0.05–0.3 Hz), frequency drift (±3–5 Hz), timing jitter (0–25%), bad-fist dah/dit ratios, key type simulation, speed drift, merged events, dit dropout, noise spurious events
 
 ### dataset.py — Training data pipeline
 - `StreamingMorseDataset(config, epoch_size, seed=None)` — IterableDataset, no pre-gen files
@@ -168,12 +170,23 @@ and the LSTM processes them one event at a time with persistent hidden state.
 
 ## Curriculum Learning
 
-| Stage | SNR | WPM | AGC | QSB | Timing |
-|-------|-----|-----|-----|-----|--------|
-| clean | 15–40 dB | 10–40 | 30% | 0% | near-ITU (dah/dit 2.5–3.5, ics 0.8–1.2, iws 0.8–1.5) |
-| full  | 3–30 dB  | 5–50  | 70% | 30% | bad-fist (dah/dit 1.5–4.0, ics 0.5–2.0, iws 0.5–2.5) |
+| Stage | SNR | WPM | AGC | QSB | Timing | Key Types |
+|-------|-----|-----|-----|-----|--------|-----------|
+| clean | 15–40 dB | 10–40 | 30% | 0% | near-ITU (dah/dit 2.5–3.5, ics 0.8–1.2, iws 0.8–1.5) | 20/20/60 straight/bug/paddle |
+| full  | 3–30 dB  | 5–50  | 70%, depth 6–22 dB | 50%, depth 3–18 dB | bad-fist (dah/dit 1.3–4.0, ics 0.5–2.0, iws 0.5–2.5, jitter 0–25%) | 40/35/25 straight/bug/paddle |
 
 Timing params (dah_dit_ratio, ics_factor, iws_factor) are **sampled independently per sample** — this is critical for robustness.
+
+**Key type simulation** — each sample is generated with one of three key types:
+- **Straight key**: per-character speed variation (simpler chars keyed faster), per-element dah/dit ratio variation, highest overall jitter.
+- **Bug (semi-automatic)**: mechanical dits (~15% of configured jitter), manual dahs (~80% jitter + per-dah ratio variation), manual spacing.
+- **Paddle (electronic keyer)**: electronic elements (~10% jitter), operator-controlled spacing (~60% jitter).
+
+**Additional full-stage augmentations** applied in `generate_events_direct`:
+- **Speed drift**: ±15% sinusoidal WPM modulation across word boundaries within a transmission.
+- **Merged events**: inter-element spaces < 12 ms collapse, merging adjacent marks (simulates blip filter absorption).
+- **Dit dropout**: probabilistic removal of short marks at low SNR (simulates missed detections).
+- **Noise spurious events**: SNR-dependent false mark insertions at low SNR (< 15 dB), capped at 2 per sample.
 
 **Training hyperparameters by scenario:**
 | | clean | full |

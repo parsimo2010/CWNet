@@ -104,6 +104,29 @@ LETTERS: List[str] = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 DIGITS: List[str] = [str(d) for d in range(10)]
 PUNCTUATION: List[str] = list(".,?/(&=+")
 
+# Common CW abbreviations heard on the air
+CW_ABBREVIATIONS: List[str] = [
+    "CQ", "DE", "EE", "73", "88", "RST", "UR", "ES", "TNX", "FB",
+    "OM", "HI", "K", "R", "QTH", "QSL", "QRZ", "AGN", "PSE", "WX",
+    "GL", "GE", "GM", "GA", "GN", "DX", "ANT", "RIG", "HR", "NR",
+]
+
+_KEY_TYPES = ("straight", "bug", "paddle")
+
+
+def _select_key_type(
+    weights: Tuple[float, float, float],
+    rng: np.random.Generator,
+) -> str:
+    """Select a key type based on configured weights."""
+    cumulative = (weights[0], weights[0] + weights[1])
+    r = float(rng.random())
+    if r < cumulative[0]:
+        return "straight"
+    elif r < cumulative[1]:
+        return "bug"
+    return "paddle"
+
 
 # ---------------------------------------------------------------------------
 # Real-world augmentation helpers
@@ -213,7 +236,10 @@ def generate_text(
 
     while total < target:
         kind = rng.random()
-        if kind < 0.60:
+        if kind < 0.15:
+            # Common CW abbreviation (CQ, DE, 73, etc.)
+            word = CW_ABBREVIATIONS[int(rng.integers(len(CW_ABBREVIATIONS)))]
+        elif kind < 0.60:
             word = _random_word(rng, wordlist)
         elif kind < 0.80:
             word = _random_number(rng)
@@ -239,6 +265,20 @@ def generate_text(
 Element = Tuple[bool, float]   # (is_tone, duration_seconds)
 
 
+def _char_complexity(code: str) -> float:
+    """Count dit↔dah transitions in a Morse code string (0 = uniform, higher = harder).
+
+    Used by straight-key simulation: characters with more transitions are keyed
+    slightly slower because the operator's wrist must reverse direction.
+    """
+    transitions = 0
+    for i in range(1, len(code)):
+        if code[i] != code[i - 1]:
+            transitions += 1
+    # Normalise: max transitions in a 5-element code is 4 (e.g. ".-.-.")
+    return transitions / max(len(code) - 1, 1)
+
+
 def text_to_elements(
     text: str,
     unit_dur: float,
@@ -247,6 +287,8 @@ def text_to_elements(
     dah_dit_ratio: float = 3.0,
     ics_factor: float = 1.0,
     iws_factor: float = 1.0,
+    key_type: str = "paddle",
+    speed_drift_max: float = 0.0,
 ) -> List[Element]:
     """Convert text to (is_tone, duration_seconds) element pairs.
 
@@ -258,7 +300,7 @@ def text_to_elements(
         Duration of one dit in seconds.
     timing_jitter : float
         Gaussian jitter std dev as a fraction of element duration.
-        0 = perfect timing.
+        0 = perfect timing.  Interpreted differently per key_type.
     rng : np.random.Generator
     dah_dit_ratio : float
         Dah duration in dits (ITU standard = 3.0).
@@ -266,43 +308,132 @@ def text_to_elements(
         Inter-character gap multiplier (standard = 1.0 → 3 dits).
     iws_factor : float
         Inter-word gap multiplier (standard = 1.0 → 7 dits).
+    key_type : str
+        One of "straight", "bug", "paddle".  Controls how jitter is applied:
+        - straight: high jitter on all elements, per-char speed variation,
+                    per-element dah/dit ratio variation.
+        - bug: minimal dit jitter (mechanical), moderate dah jitter (manual),
+               variable spacing.
+        - paddle: minimal element jitter (electronic), moderate spacing jitter.
+    speed_drift_max : float
+        Slow WPM variation within the transmission as a fraction of unit_dur.
+        0.0 = constant speed.  Applied as sinusoidal modulation across words.
     """
 
-    def jitter(units: float) -> float:
-        """Apply proportional Gaussian jitter, clamped to ≥10 % of nominal."""
-        nominal = units * unit_dur
+    # ---- Speed drift: sinusoidal modulation across the transmission ------
+    # Pre-sample drift parameters; actual modulation applied per-word below.
+    if speed_drift_max > 0.0:
+        drift_freq = float(rng.uniform(0.3, 1.5))   # cycles per ~10 words
+        drift_phase = float(rng.uniform(0.0, 2 * math.pi))
+        drift_amplitude = float(rng.uniform(0.0, speed_drift_max))
+    else:
+        drift_freq = 0.0
+        drift_phase = 0.0
+        drift_amplitude = 0.0
+
+    words = [w for w in text.split(" ") if w]
+    n_words = len(words)
+
+    # ---- Key-type-aware jitter functions ---------------------------------
+
+    def _jitter_straight(units: float, is_dit: bool, is_dah: bool,
+                         char_cplx: float, local_ud: float,
+                         local_ddr: float) -> float:
+        """Straight key: high jitter on everything, per-char speed factor."""
+        # Per-character speed: simple chars faster, complex chars slower
+        # ±10% at max complexity
+        speed_factor = 1.0 + 0.10 * (0.5 - char_cplx) * float(rng.normal(0.0, 1.0))
+        speed_factor = max(0.85, min(1.15, speed_factor))
+        nominal = units * local_ud * speed_factor
+        if is_dah:
+            # Per-element dah/dit ratio variation for straight keys
+            ratio_jitter = float(rng.normal(0.0, 0.08))  # ±~8% of ratio
+            nominal = nominal * (1.0 + ratio_jitter)
         if timing_jitter <= 0.0:
-            return nominal
+            return max(nominal, local_ud * 0.1)
         noise = rng.normal(0.0, timing_jitter * nominal)
         return max(nominal + noise, nominal * 0.1)
 
+    def _jitter_bug(units: float, is_dit: bool, is_dah: bool,
+                    char_cplx: float, local_ud: float,
+                    local_ddr: float) -> float:
+        """Bug: mechanical dits (minimal jitter), manual dahs (moderate jitter)."""
+        nominal = units * local_ud
+        if timing_jitter <= 0.0:
+            return max(nominal, local_ud * 0.1)
+        if is_dit:
+            # Mechanical dits: very consistent (~15% of configured jitter)
+            noise = rng.normal(0.0, timing_jitter * 0.15 * nominal)
+        elif is_dah:
+            # Manual dahs: moderate jitter (~80% of configured jitter)
+            # Also per-dah ratio variation
+            ratio_jitter = float(rng.normal(0.0, 0.06))
+            nominal = nominal * (1.0 + ratio_jitter)
+            noise = rng.normal(0.0, timing_jitter * 0.80 * nominal)
+        else:
+            # Spacing: manual, full jitter
+            noise = rng.normal(0.0, timing_jitter * nominal)
+        return max(nominal + noise, nominal * 0.1)
+
+    def _jitter_paddle(units: float, is_dit: bool, is_dah: bool,
+                       char_cplx: float, local_ud: float,
+                       local_ddr: float) -> float:
+        """Paddle: electronic elements (minimal jitter), manual spacing."""
+        nominal = units * local_ud
+        if timing_jitter <= 0.0:
+            return max(nominal, local_ud * 0.1)
+        if is_dit or is_dah:
+            # Electronic elements: very consistent (~10% of configured jitter)
+            noise = rng.normal(0.0, timing_jitter * 0.10 * nominal)
+        else:
+            # Manual spacing: moderate jitter (~60% of configured jitter)
+            noise = rng.normal(0.0, timing_jitter * 0.60 * nominal)
+        return max(nominal + noise, nominal * 0.1)
+
+    jitter_fn = {"straight": _jitter_straight,
+                 "bug":      _jitter_bug,
+                 "paddle":   _jitter_paddle}.get(key_type, _jitter_paddle)
+
+    # ---- Build elements --------------------------------------------------
     elements: List[Element] = []
-    words = [w for w in text.split(" ") if w]
 
     for w_idx, word in enumerate(words):
+        # Speed drift: modulate unit_dur per word
+        if drift_amplitude > 0.0 and n_words > 1:
+            phase = drift_phase + drift_freq * (w_idx / max(n_words - 1, 1)) * 2 * math.pi
+            local_ud = unit_dur * (1.0 + drift_amplitude * math.sin(phase))
+        else:
+            local_ud = unit_dur
+
         chars: List[str] = [word] if word in MORSE_TABLE else list(word)
 
         for c_idx, ch in enumerate(chars):
             if ch not in MORSE_TABLE:
                 continue
             code = MORSE_TABLE[ch]
+            cplx = _char_complexity(code)
 
             for e_idx, sym in enumerate(code):
                 if sym == ".":
-                    elements.append((True, jitter(1.0)))
+                    dur = jitter_fn(1.0, True, False, cplx, local_ud, dah_dit_ratio)
+                    elements.append((True, dur))
                 elif sym == "-":
-                    elements.append((True, jitter(dah_dit_ratio)))
+                    dur = jitter_fn(dah_dit_ratio, False, True, cplx, local_ud, dah_dit_ratio)
+                    elements.append((True, dur))
                 # Intra-character gap
                 if e_idx < len(code) - 1:
-                    elements.append((False, jitter(1.0)))
+                    dur = jitter_fn(1.0, False, False, cplx, local_ud, dah_dit_ratio)
+                    elements.append((False, dur))
 
             # Inter-character gap (3 × ics_factor dits)
             if c_idx < len(chars) - 1:
-                elements.append((False, jitter(3.0 * ics_factor)))
+                dur = jitter_fn(3.0 * ics_factor, False, False, cplx, local_ud, dah_dit_ratio)
+                elements.append((False, dur))
 
         # Inter-word gap (7 × iws_factor dits)
         if w_idx < len(words) - 1:
-            elements.append((False, jitter(7.0 * iws_factor)))
+            dur = jitter_fn(7.0 * iws_factor, False, False, 0.0, local_ud, dah_dit_ratio)
+            elements.append((False, dur))
 
     return elements
 
@@ -498,6 +629,9 @@ def generate_sample(
     else:
         jitter = config.timing_jitter
 
+    # ---- Per-sample key type selection -----------------------------------
+    key_type = _select_key_type(config.key_type_weights, rng)
+
     # ---- Per-sample amplitude target ------------------------------------
     if config.signal_amplitude_min < config.signal_amplitude_max:
         target_amplitude = float(
@@ -528,6 +662,8 @@ def generate_sample(
         dah_dit_ratio=dah_dit_ratio,
         ics_factor=ics_factor,
         iws_factor=iws_factor,
+        key_type=key_type,
+        speed_drift_max=config.speed_drift_max,
     )
     if not elements:
         text = "E"
@@ -536,6 +672,8 @@ def generate_sample(
             dah_dit_ratio=dah_dit_ratio,
             ics_factor=ics_factor,
             iws_factor=iws_factor,
+            key_type=key_type,
+            speed_drift_max=config.speed_drift_max,
         )
 
     # ---- Noise std for silence periods ----------------------------------
@@ -584,6 +722,7 @@ def generate_sample(
         "dah_dit_ratio": dah_dit_ratio,
         "ics_factor": ics_factor,
         "iws_factor": iws_factor,
+        "key_type": key_type,
         "target_amplitude": target_amplitude,
         "agc_depth_db": agc_depth_db,
         "qsb_depth_db": qsb_depth_db,
@@ -697,6 +836,8 @@ def generate_events_direct(
     else:
         jitter_val = config.timing_jitter
 
+    key_type = _select_key_type(config.key_type_weights, rng)
+
     agc_depth_db = 0.0
     if config.agc_probability > 0.0 and rng.random() < config.agc_probability:
         agc_depth_db = float(rng.uniform(config.agc_depth_db_min, config.agc_depth_db_max))
@@ -720,6 +861,8 @@ def generate_events_direct(
         dah_dit_ratio=dah_dit_ratio,
         ics_factor=ics_factor,
         iws_factor=iws_factor,
+        key_type=key_type,
+        speed_drift_max=config.speed_drift_max,
     )
     if not elements:
         text = "E"
@@ -728,6 +871,8 @@ def generate_events_direct(
             dah_dit_ratio=dah_dit_ratio,
             ics_factor=ics_factor,
             iws_factor=iws_factor,
+            key_type=key_type,
+            speed_drift_max=config.speed_drift_max,
         )
 
     # ---- Silence durations -----------------------------------------------
@@ -845,6 +990,98 @@ def generate_events_direct(
                     continue
             i += 1
 
+    # -- Merged events: collapse short inter-element spaces ----------------
+    # When inter-element spaces fall below ~12 ms (blip filter threshold),
+    # the real extractor absorbs them and merges adjacent marks.
+    MERGE_THRESHOLD = 0.012  # 12 ms
+    i = 1
+    while i < len(events) - 1:
+        ev = events[i]
+        if (ev.event_type == "space" and ev.duration_sec < MERGE_THRESHOLD
+                and i > 0 and events[i - 1].event_type == "mark"
+                and i + 1 < len(events) and events[i + 1].event_type == "mark"):
+            # Merge: prev_mark + short_space + next_mark → single mark
+            prev = events[i - 1]
+            nxt = events[i + 1]
+            merged_dur = prev.duration_sec + ev.duration_sec + nxt.duration_sec
+            # Weighted confidence from the two marks
+            w1 = prev.duration_sec / (prev.duration_sec + nxt.duration_sec)
+            merged_conf = w1 * prev.confidence + (1 - w1) * nxt.confidence
+            events[i - 1] = MorseEvent("mark", prev.start_sec, merged_dur, merged_conf)
+            del events[i:i + 2]  # remove space and next mark
+            # Don't advance i — check the new event against its next neighbour
+        else:
+            i += 1
+
+    # -- Dit dropout: probabilistic removal of short marks at low SNR ------
+    # At low SNR, short dits can fall below the blip filter threshold.
+    dit_dur_nominal = unit_dur  # one dit at this WPM
+    DROP_THRESHOLD = dit_dur_nominal * 1.5  # only consider marks shorter than this
+    n_dropped = 0
+    max_drops = max(1, int(len(events) * 0.05))  # cap at 5% of events
+    i = 1
+    while i < len(events) - 1 and n_dropped < max_drops:
+        ev = events[i]
+        if (ev.event_type == "mark" and ev.duration_sec < DROP_THRESHOLD
+                and snr_db < 20.0):
+            # Probability: higher at lower SNR, higher for shorter marks
+            p_drop = 0.3 * max(0.0, 1.0 - snr_db / 20.0) * min(1.0, DROP_THRESHOLD / max(ev.duration_sec, 0.001))
+            p_drop = min(p_drop, 0.4)
+            if rng.random() < p_drop:
+                # Merge surrounding spaces
+                prev = events[i - 1] if i > 0 else None
+                nxt = events[i + 1] if i + 1 < len(events) else None
+                if (prev and prev.event_type == "space"
+                        and nxt and nxt.event_type == "space"):
+                    merged_dur = prev.duration_sec + ev.duration_sec + nxt.duration_sec
+                    merged_conf = _conf(False, prev.start_sec, merged_dur,
+                                        prev.start_sec)
+                    events[i - 1] = MorseEvent("space", prev.start_sec,
+                                               merged_dur, merged_conf)
+                    del events[i:i + 2]
+                    n_dropped += 1
+                    continue
+        i += 1
+
+    # -- Random noise spurious events in any space at low SNR --------------
+    # Beyond AGC pumping, AWGN noise can cause brief false mark detections.
+    if snr_db < 15.0:
+        n_spurious_noise = 0
+        max_spurious = 2  # cap to avoid overwhelming the model
+        i = 0
+        while i < len(events) and n_spurious_noise < max_spurious:
+            ev = events[i]
+            if ev.event_type == "space" and ev.duration_sec > 0.030:
+                p_spur = 0.08 * max(0.0, 1.0 - snr_db / 15.0)
+                if rng.random() < p_spur:
+                    space_start = ev.start_sec
+                    space_dur = ev.duration_sec
+                    insert_offset = float(rng.uniform(0.2, 0.8)) * space_dur
+                    spur_dur = float(rng.exponential(0.010)) + 0.010
+                    spur_dur = min(spur_dur, 0.030, space_dur * 0.2)
+                    spur_conf = float(rng.uniform(0.05, 0.25))
+                    spur_time = space_start + insert_offset
+
+                    before_dur = spur_time - space_start
+                    after_dur = space_dur - before_dur - spur_dur
+
+                    if before_dur > 0.010 and after_dur > 0.010:
+                        events[i] = MorseEvent(
+                            "space", space_start, before_dur,
+                            _conf(False, space_start, before_dur),
+                        )
+                        events.insert(i + 1, MorseEvent(
+                            "mark", spur_time, spur_dur, spur_conf,
+                        ))
+                        events.insert(i + 2, MorseEvent(
+                            "space", spur_time + spur_dur, after_dur,
+                            _conf(False, spur_time + spur_dur, after_dur),
+                        ))
+                        n_spurious_noise += 1
+                        i += 3
+                        continue
+            i += 1
+
     # -- Trailing silence --------------------------------------------------
     if trailing_sec > 0.005:
         tsm = t - last_mark_end
@@ -861,6 +1098,7 @@ def generate_events_direct(
         "dah_dit_ratio": dah_dit_ratio,
         "ics_factor": ics_factor,
         "iws_factor": iws_factor,
+        "key_type": key_type,
         "agc_depth_db": agc_depth_db,
         "qsb_depth_db": qsb_depth_db,
         "leading_silence_sec": leading_sec,
