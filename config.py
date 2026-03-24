@@ -160,6 +160,31 @@ class FeatureConfig:
     # Set to 0 to disable blip filtering (every frame can cause a transition).
     blip_threshold_frames: int = 2
 
+    # --- Adaptive FAST_DB ---
+    # When enabled, EMA tracking speed adapts based on the current
+    # mark-space spread (proxy for SNR).  At low spread (poor SNR) the
+    # FAST_DB is reduced (more aggressive tracking) so faint marks are
+    # followed faster; at high spread it stays conservative.
+    adaptive_fast_db: bool = True
+    fast_db_min: float = 4.0    # aggressive — used when spread ≈ MIN_SPREAD
+    fast_db_max: float = 6.0    # conservative — used when spread is large
+
+    # --- Threshold center weighting ---
+    # Fraction of the adaptive threshold center attributed to mark_ema.
+    # Higher = more conservative (fewer false marks, but absorbs weak marks).
+    # 0.667 = original 2:1 toward mark; 0.5 = midpoint (equal weight).
+    # 0.55 tested as optimal: +0.10 confidence with no false positive increase.
+    center_mark_weight: float = 0.55
+
+    # --- Adaptive blip filter ---
+    # When enabled, the blip confirmation threshold varies with the
+    # current mark-space spread: tighter confirmation at low spread
+    # (low SNR), faster confirmation at high spread (high SNR).
+    # When disabled, the fixed blip_threshold_frames is used everywhere.
+    adaptive_blip: bool = True
+    blip_threshold_low_snr: int = 3   # frames required at low spread
+    blip_threshold_high_snr: int = 1  # frames required at high spread
+
     @property
     def fps(self) -> float:
         """Output frame rate in frames per second."""
@@ -185,11 +210,11 @@ class ModelConfig:
     (one per detected mark or space interval) rather than a fixed-rate frame
     array.  There is no CNN frontend and no time-axis downsampling.
 
-    Default (~155 K parameters):
+    Default (~400 K parameters):
       in_features = 5   — [is_mark, log_duration, confidence,
                             log_ratio_prev_mark, log_ratio_prev_space]
-      hidden_size  = 96
-      n_rnn_layers = 2
+      hidden_size  = 128
+      n_rnn_layers = 3
       dropout      = 0.1
     """
 
@@ -198,10 +223,10 @@ class ModelConfig:
     in_features: int = 5
 
     # LSTM hidden size
-    hidden_size: int = 96
+    hidden_size: int = 128
 
     # Number of stacked LSTM layers
-    n_rnn_layers: int = 2
+    n_rnn_layers: int = 3
 
     # Dropout between LSTM layers (0 disables; auto-disabled for n_rnn_layers=1)
     dropout: float = 0.1
@@ -297,15 +322,19 @@ def create_default_config(scenario: str = "clean") -> Config:
 
     Scenarios
     ---------
-    test   — 5 epochs, tiny epoch size; verifies the full pipeline
-    clean  — 300 epochs; high SNR, near-standard timing (curriculum stage 1)
-    full   — 500 epochs; low SNR, bad-fist timing (curriculum stage 2)
+    test     — 5 epochs, tiny epoch size; verifies the full pipeline
+    clean    — 200 epochs; high SNR, near-standard timing (curriculum stage 1)
+    moderate — 300 epochs; mid SNR, moderate bad-fist (curriculum stage 2)
+    full     — 500 epochs; low SNR, extreme bad-fist (curriculum stage 3)
 
     Recommended curriculum workflow::
 
         python train.py --scenario clean
-        python train.py --scenario full \\
+        python train.py --scenario moderate \\
             --checkpoint_file checkpoints/best_model.pt \\
+            --additional_epochs 300
+        python train.py --scenario full \\
+            --checkpoint_file checkpoints/best_model_moderate.pt \\
             --additional_epochs 500
 
     """
@@ -367,6 +396,39 @@ def create_default_config(scenario: str = "clean") -> Config:
         # Key type: mostly paddles (easiest) for clean stage
         cfg.morse.key_type_weights = (0.20, 0.20, 0.60)
 
+    elif scenario == "moderate":
+        cfg.morse.min_snr_db = 8.0
+        cfg.morse.max_snr_db = 35.0
+        cfg.morse.min_wpm = 8.0
+        cfg.morse.max_wpm = 45.0
+        cfg.morse.min_chars = 25
+        cfg.morse.max_chars = 175
+        cfg.morse.dah_dit_ratio_min = 1.8
+        cfg.morse.dah_dit_ratio_max = 3.8
+        cfg.morse.ics_factor_min = 0.6
+        cfg.morse.ics_factor_max = 1.6
+        cfg.morse.iws_factor_min = 0.6
+        cfg.morse.iws_factor_max = 2.0
+        cfg.morse.timing_jitter = 0.0
+        cfg.morse.timing_jitter_max = 0.15
+        cfg.morse.tone_drift = 4.0
+        cfg.training.batch_size = 512
+        cfg.training.learning_rate = 1e-3
+        cfg.training.num_epochs = 300
+        cfg.training.samples_per_epoch = 75000
+        cfg.training.val_samples = 5000
+        cfg.training.num_workers = 4
+        cfg.training.beam_cer_interval = 50
+        # Real-world augmentations (moderate strength)
+        cfg.morse.agc_probability = 0.5
+        cfg.morse.agc_depth_db_max = 18.0
+        cfg.morse.qsb_probability = 0.25
+        cfg.morse.qsb_depth_db_max = 12.0
+        # Key type: balanced mix
+        cfg.morse.key_type_weights = (0.30, 0.30, 0.40)
+        # Speed drift: mild ±8% WPM variation
+        cfg.morse.speed_drift_max = 0.08
+
     elif scenario == "full":
         cfg.morse.min_snr_db = 3.0
         cfg.morse.max_snr_db = 30.0
@@ -403,7 +465,7 @@ def create_default_config(scenario: str = "clean") -> Config:
 
     else:
         raise ValueError(
-            f"Unknown scenario: {scenario!r}.  Choose from: test, clean, full."
+            f"Unknown scenario: {scenario!r}.  Choose from: test, clean, moderate, full."
         )
 
     return cfg

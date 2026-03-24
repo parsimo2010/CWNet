@@ -23,7 +23,7 @@ Architecture overview
        Normalises the heterogeneous feature dimensions before entering the LSTM.
 
   2. Unidirectional LSTM
-       n_rnn_layers (default 2), hidden_size (default 96).
+       n_rnn_layers (default 3), hidden_size (default 128).
        Processes events one at a time; persistent (h, c) state carries speed
        context forward across the stream.
 
@@ -32,8 +32,8 @@ Architecture overview
        52-class vocabulary (same as before): blank + space + A-Z + 0-9 +
        punctuation + prosigns.
 
-Default (~155 K parameters):
-    in_features=5, hidden_size=96, n_rnn_layers=2, dropout=0.1
+Default (~400 K parameters):
+    in_features=5, hidden_size=128, n_rnn_layers=3, dropout=0.1
 
 Design rationale — log scale
 -----------------------------
@@ -204,9 +204,9 @@ class MorseEventModel(nn.Module):
         Input feature dimension.  Must match
         :attr:`MorseEventFeaturizer.in_features` (default 5).
     hidden_size : int
-        LSTM hidden dimension (default 96).
+        LSTM hidden dimension (default 128).
     n_rnn_layers : int
-        Number of stacked LSTM layers (default 2).
+        Number of stacked LSTM layers (default 3).
     dropout : float
         Dropout probability between LSTM layers (default 0.1).
         Disabled automatically when ``n_rnn_layers == 1``.
@@ -215,8 +215,8 @@ class MorseEventModel(nn.Module):
     def __init__(
         self,
         in_features: int = 5,
-        hidden_size: int = 96,
-        n_rnn_layers: int = 2,
+        hidden_size: int = 128,
+        n_rnn_layers: int = 3,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()

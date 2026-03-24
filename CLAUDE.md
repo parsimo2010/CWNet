@@ -38,14 +38,16 @@ and the LSTM processes them one event at a time with persistent hidden state.
 
 **Pipeline per frame:**
 1. **STFT** (20ms window / 5ms hop, 200fps) → peak bin energy in dB within monitored frequency range (default 300–1200 Hz). 20ms window = 50 Hz/bin at 16 kHz (320 samples), 18 bins in range. Chosen for time resolution: window clears within 4 hops (20ms) of any transition, enabling clean inter-element space detection at 40+ WPM.
-2. **mark_ema**: Fast upward (signal-following), slow downward release. Non-linear alpha: `alpha = 1 - exp(-deviation / FAST_DB)` where FAST_DB = 6 dB. No floor clamp — tracks freely.
-3. **space_ema**: Fast downward, slow upward. Same non-linear alpha.
-4. **Adaptive threshold**: `center = 0.667×mark_ema + 0.333×space_ema`, `spread = max(mark-space, 10 dB)`
-5. **E** = `tanh((peak_dB - center) × 3 / spread)` → ≈ +0.9 marks, ≈ −0.9 spaces
-6. **Delayed threshold** (3-frame / 15ms delay): peak_db from N frames ago is evaluated against the current (now-adapted) EMA center, giving clean mark/space separation from signal onset
-7. **Blip filter**: transitions confirmed only after `blip_threshold_frames + 1` consecutive frames in new state (default 3 frames / 15ms); shorter changes absorbed silently. Minimum event duration = 2 frames (10ms).
+2. **Signal quality estimation**: `sq = clip((spread - 12) / (30 - 12), 0, 1)` — maps current mark-space spread to a 0–1 quality score used by adaptive FAST_DB and adaptive blip filter.
+3. **Adaptive FAST_DB** (default on): `fast_db = 4 + sq × 2` — interpolates between 4 dB (aggressive, low SNR) and 6 dB (conservative, high SNR). At low SNR, smaller deviations produce larger alpha → EMA tracks faint marks faster.
+4. **mark_ema**: Fast upward (signal-following), slow downward release. Non-linear alpha: `alpha = 1 - exp(-deviation / fast_db)`. No floor clamp — tracks freely.
+5. **space_ema**: Fast downward, slow upward. Same non-linear alpha.
+6. **Adaptive threshold**: `center = 0.55×mark_ema + 0.45×space_ema` (configurable `center_mark_weight`), `spread = max(mark-space, 10 dB)`. The 0.55 center weight (vs original 0.667) shifts the threshold closer to the midpoint, improving mark detection at low SNR without increasing false positives.
+7. **E** = `tanh((peak_dB - center) × 3 / spread)` → ≈ +0.9 marks, ≈ −0.9 spaces
+8. **Delayed threshold** (3-frame / 15ms delay): peak_db from N frames ago is evaluated against the current (now-adapted) EMA center, giving clean mark/space separation from signal onset.
+9. **Adaptive blip filter** (default on): confirmation threshold varies with signal quality — `blip_thresh = round(3 + sq × (1 - 3))` — requiring 4 frames (20ms) at low SNR and 2 frames (10ms) at high SNR. Minimum event duration = 2 frames (10ms).
 
-**AGC-immune by design** — no explicit noise floor estimation, only relative mark/space energy tracking.
+**AGC-immune by design** — no explicit noise floor estimation, only relative mark/space energy tracking. Adaptive features maintain this property by only adjusting EMA tracking speed and threshold placement based on internal mark-space spread.
 
 ---
 
@@ -60,10 +62,10 @@ and the LSTM processes them one event at a time with persistent hidden state.
 - `log_ratio_prev_mark` — log(dur / prev_mark_dur) for marks; speed-invariant (always log(3) for dah after dit)
 - `log_ratio_prev_space` — log(dur / prev_space_dur) for spaces; speed-invariant regardless of WPM
 
-**MorseEventModel** (~155K parameters):
-1. **Input projection**: Linear(5 → 96, no bias) + LayerNorm + ReLU
-2. **LSTM**: 2 layers × 96 hidden, unidirectional, dropout=0.1
-3. **Output head**: Linear(96 → 52) → log_softmax
+**MorseEventModel** (~400K parameters):
+1. **Input projection**: Linear(5 → 128, no bias) + LayerNorm + ReLU
+2. **LSTM**: 3 layers × 128 hidden, unidirectional, dropout=0.1
+3. **Output head**: Linear(128 → 52) → log_softmax
 
 **Design rationale:** Log-scale features are speed-invariant — the same timing patterns appear at any WPM, just shifted by log(dit_duration). The LSTM learns one set of patterns and handles all speeds through its hidden state.
 
@@ -75,10 +77,10 @@ and the LSTM processes them one event at a time with persistent hidden state.
 
 ### config.py — All configuration (dataclasses)
 - `MorseConfig` — WPM, tone freq, SNR, timing params (dah_dit_ratio, ics/iws factors), AGC sim, QSB fading, key type weights, speed drift. **sample_rate = 16000**.
-- `FeatureConfig` — STFT window/hop (20ms/5ms), freq monitoring range (300–1200 Hz), blip threshold.
-- `ModelConfig` — in_features (5), hidden_size (96), n_rnn_layers (2), dropout (0.1). ~155K params.
+- `FeatureConfig` — STFT window/hop (20ms/5ms), freq monitoring range (300–1200 Hz), blip threshold, adaptive FAST_DB, center weighting, adaptive blip filter.
+- `ModelConfig` — in_features (5), hidden_size (128), n_rnn_layers (3), dropout (0.1). ~270K params.
 - `TrainingConfig` — batch size, LR, epoch counts, beam search CER log interval
-- `create_default_config(scenario)` — factory for "test" / "clean" / "full" scenarios
+- `create_default_config(scenario)` — factory for "test" / "clean" / "moderate" / "full" scenarios
 
 ### model.py — Neural network
 - `MorseEventFeaturizer` — converts MorseEvent → (5,) float32 feature vector; maintains log-duration state across calls
@@ -173,6 +175,7 @@ and the LSTM processes them one event at a time with persistent hidden state.
 | Stage | SNR | WPM | AGC | QSB | Timing | Key Types |
 |-------|-----|-----|-----|-----|--------|-----------|
 | clean | 15–40 dB | 10–40 | 30% | 0% | near-ITU (dah/dit 2.5–3.5, ics 0.8–1.2, iws 0.8–1.5) | 20/20/60 straight/bug/paddle |
+| moderate | 8–35 dB | 8–45 | 50%, depth 6–18 dB | 25%, depth 3–12 dB | moderate bad-fist (dah/dit 1.8–3.8, ics 0.6–1.6, iws 0.6–2.0, jitter 0–15%) | 30/30/40 straight/bug/paddle |
 | full  | 3–30 dB  | 5–50  | 70%, depth 6–22 dB | 50%, depth 3–18 dB | bad-fist (dah/dit 1.3–4.0, ics 0.5–2.0, iws 0.5–2.5, jitter 0–25%) | 40/35/25 straight/bug/paddle |
 
 Timing params (dah_dit_ratio, ics_factor, iws_factor) are **sampled independently per sample** — this is critical for robustness.
@@ -189,13 +192,13 @@ Timing params (dah_dit_ratio, ics_factor, iws_factor) are **sampled independentl
 - **Noise spurious events**: SNR-dependent false mark insertions at low SNR (< 15 dB), capped at 2 per sample.
 
 **Training hyperparameters by scenario:**
-| | clean | full |
-|--|-------|------|
-| batch_size | 512 | 512 |
-| learning_rate | 1e-3 | 1e-3 |
-| num_epochs | 200 | 500 |
-| samples_per_epoch | 100000 | 50000 |
-| val_samples | 5000 | 5000 |
+| | clean | moderate | full |
+|--|-------|----------|------|
+| batch_size | 512 | 512 | 512 |
+| learning_rate | 1e-3 | 1e-3 | 1e-3 |
+| num_epochs | 200 | 300 | 500 |
+| samples_per_epoch | 100000 | 75000 | 50000 |
+| val_samples | 5000 | 5000 | 5000 |
 
 ---
 
@@ -212,7 +215,7 @@ Timing params (dah_dit_ratio, ics_factor, iws_factor) are **sampled independentl
 2. **Event output is variable-rate** — `process_chunk` returns `list[MorseEvent]`, not an ndarray. Always call `flush()` at end of stream.
 3. **Blip filter is configurable** — `blip_threshold_frames` (default 2) means transitions require 3 consecutive frames (15ms) to confirm. Minimum detectable event = 10ms at 200fps.
 4. **Delay is 3 frames (15ms)** — peak_db from 3 frames ago is evaluated against the current adapted EMA center.
-5. **Deployment target is edge** — keep model compact; Raspberry Pi 4 / Zero 2W. Current model is ~155K params.
+5. **Deployment target is edge** — keep model compact; Raspberry Pi 4 / Zero 2W. Current model is ~400K params.
 6. **Sample rate is 16 kHz** — all audio is resampled to 16 kHz internally. Config defaults reflect this.
 7. **Log-ratio features are speed-invariant** — the model learns one set of timing patterns that works at any WPM via the LSTM hidden state.
 8. **Boundary space tokens** — dataset wraps targets with `[space] + encode(text) + [space]` to supervise leading/trailing silence events explicitly.

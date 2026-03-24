@@ -748,38 +748,63 @@ def _sim_confidence(
     agc_depth_db: float = 0.0,
     time_since_last_mark: float = 1e6,
 ) -> float:
-    """Simulate MorseEvent confidence from SNR and augmentation state.
+    """Simulate MorseEvent confidence calibrated to the enhanced audio-path extractor.
 
-    Models the steady-state E = tanh((peak_db - center) * 3 / spread) from
-    the real feature extractor.  In steady state with the 2:1 center weighting:
-      mark  deviation = 0.333 × spread  →  |E| = tanh(1.0) ≈ 0.76  (SNR ≥ 10)
-      space deviation = 0.667 × spread  →  |E| = tanh(2.0) ≈ 0.96  (SNR ≥ 10)
-    At low SNR (spread clamped to 10 dB), confidence drops proportionally.
+    The adaptive EMA threshold with center_mark_weight=0.55 is largely
+    AGC-immune, so confidence is nearly SNR-independent.  The main factors:
+
+      1. **Duration-dependent transition penalty** — event boundaries contain
+         frames where E is near the decision boundary, pulling down mean |E|.
+         Modelled as deficit ∝ 1/sqrt(n_frames), calibrated against 100 audio
+         samples across the full scenario.
+      2. **Long-space EMA decay** — during extended silences the mark_ema
+         slowly releases toward the noise floor, narrowing the spread and
+         reducing |E|.  Observed as ~0.10/s decline beyond 150 ms.
+      3. **Small per-event noise** — frame-to-frame peak_db fluctuations.
+
+    Steady-state theoretical values (center_mark_weight=0.55, gain=3/spread):
+      mark:  |E| = tanh((1 - 0.55) × 3) = tanh(1.35) ≈ 0.876
+      space: |E| = tanh(0.55 × 3)        = tanh(1.65) ≈ 0.929
     """
-    effective_snr = snr_db
+    _FPS = 200.0  # extractor frame rate (5 ms hop)
+    n_frames = max(event_dur * _FPS, 1.0)
 
-    # QSB: slow sinusoidal signal fading affects mark amplitude
-    if qsb_depth_db > 0.0 and is_mark:
-        t_mid = event_start + event_dur / 2
-        effective_snr += (qsb_depth_db / 2.0) * math.sin(
-            2 * math.pi * qsb_freq * t_mid + qsb_phase
-        )
+    if is_mark:
+        _BASE = 0.876          # tanh(1.35)
+        _TRANS_COEFF = 0.24    # transition penalty coefficient
+        _NOISE_STD = 0.060
 
-    # AGC: noise floor elevated in spaces after marks (exponential release)
-    if agc_depth_db > 0.0 and not is_mark and time_since_last_mark < 5.0:
-        effective_snr -= agc_depth_db * math.exp(
-            -time_since_last_mark / 0.4  # ~400 ms release
-        )
+        conf = _BASE - _TRANS_COEFF / math.sqrt(n_frames)
 
-    effective_snr = max(effective_snr, 1.0)
-    spread = max(effective_snr, 10.0)
+        # Small QSB modulation (mostly absorbed by adaptive threshold)
+        if qsb_depth_db > 0.0:
+            t_mid = event_start + event_dur / 2
+            qsb_mod = 0.005 * (qsb_depth_db / 18.0) * math.sin(
+                2 * math.pi * qsb_freq * t_mid + qsb_phase
+            )
+            conf += qsb_mod
 
-    weight = 0.333 if is_mark else 0.667
-    base = abs(math.tanh(weight * effective_snr * 3.0 / spread))
+    else:
+        _BASE = 0.929          # tanh(1.65)
+        _TRANS_COEFF = 0.27    # slightly higher than marks (asymmetric EMA)
+        _DECAY_RATE = 0.095    # confidence/sec decline for long spaces
+        _DECAY_ONSET = 0.15    # seconds before long-space decay begins
+        _NOISE_STD = 0.070
 
-    # Per-event noise: larger at lower SNR
-    noise_std = 0.03 + 0.05 * max(0.0, 1.0 - snr_db / 25.0)
-    conf = base + float(rng.normal(0.0, noise_std))
+        conf = _BASE - _TRANS_COEFF / math.sqrt(n_frames)
+
+        # Long-space EMA decay: spread narrows as mark_ema releases
+        if event_dur > _DECAY_ONSET:
+            conf -= _DECAY_RATE * (event_dur - _DECAY_ONSET)
+
+        # Small AGC effect on post-mark spaces (mostly absorbed)
+        if agc_depth_db > 0.0 and time_since_last_mark < 2.0:
+            agc_mod = 0.01 * (agc_depth_db / 22.0) * math.exp(
+                -time_since_last_mark / 0.4
+            )
+            conf -= agc_mod
+
+    conf += float(rng.normal(0.0, _NOISE_STD))
     return max(0.05, min(0.99, conf))
 
 

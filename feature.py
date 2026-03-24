@@ -131,11 +131,11 @@ class MorseEventExtractor:
     # Slow-release alpha for the opposite direction (τ ≈ 2.5 s at 200 fps).
     _RELEASE: float = 0.998
 
-    # Threshold centre weighting: closer to mark_ema → more conservative
-    # about calling something a mark (guards against elevated noise baseline).
-    # 0.667 * mark + 0.333 * space  (2:1 toward mark).
-    _CENTER_MARK_WEIGHT: float = 0.667
-    _CENTER_SPACE_WEIGHT: float = 0.333
+    # Spread thresholds for adaptive interpolation (spread in dB).
+    # Below _SPREAD_LO the signal quality is "poor"; above _SPREAD_HI
+    # it is "good".  Used for adaptive FAST_DB and adaptive blip filter.
+    _SPREAD_LO: float = 12.0
+    _SPREAD_HI: float = 30.0
 
     # Frames by which the threshold is applied retroactively.
     # At 200 fps this is 15 ms. The EMA converges in ~2–3 frames for large
@@ -188,6 +188,20 @@ class MorseEventExtractor:
         # Transitions lasting <= this many frames are absorbed as blips.
         # Confirmation requires blip_threshold_frames + 1 consecutive frames.
         self._blip_threshold: int = config.blip_threshold_frames
+
+        # ---- Adaptive feature params (from config) ----
+        self._adaptive_fast_db: bool = config.adaptive_fast_db
+        self._fast_db_min: float = config.fast_db_min
+        self._fast_db_max: float = config.fast_db_max
+        self._center_mark_weight: float = config.center_mark_weight
+        self._center_space_weight: float = 1.0 - config.center_mark_weight
+        self._adaptive_blip: bool = config.adaptive_blip
+        self._blip_low_snr: int = config.blip_threshold_low_snr
+        self._blip_high_snr: int = config.blip_threshold_high_snr
+
+        # Running signal quality estimate (0 = poor/low spread, 1 = good).
+        # Updated each frame; used by adaptive blip filter.
+        self._signal_quality: float = 0.0
 
         # ---- Event state machine ----
         self._stream_sec: float = 0.0
@@ -330,6 +344,7 @@ class MorseEventExtractor:
         self._space_ema = None
         self._frame_history.clear()
         self._frame_history_count = 0
+        self._signal_quality = 0.0
         self._stream_sec = 0.0
         self._confirmed_state = None
         self._event_start_sec = 0.0
@@ -342,14 +357,31 @@ class MorseEventExtractor:
     # Internal — event state machine
     # ------------------------------------------------------------------
 
+    def _current_blip_threshold(self) -> int:
+        """Return the effective blip threshold for the current frame.
+
+        When adaptive_blip is enabled, interpolates between
+        blip_threshold_low_snr (at poor signal quality) and
+        blip_threshold_high_snr (at good signal quality).
+        Otherwise returns the fixed blip_threshold_frames.
+        """
+        if not self._adaptive_blip:
+            return self._blip_threshold
+        sq = self._signal_quality
+        # Interpolate and round: low SNR → more frames, high SNR → fewer.
+        blip_f = self._blip_low_snr + sq * (self._blip_high_snr - self._blip_low_snr)
+        return max(0, round(blip_f))
+
     def _update_event_state(self, E: float, sec: float) -> Optional[MorseEvent]:
         """Update blip-filtered state machine with a new E value.
 
         Returns a completed :class:`MorseEvent` when a confirmed transition
         is detected, otherwise None.
 
-        A transition is confirmed only after ``blip_threshold_frames + 1``
-        consecutive frames in the new state (default 3 frames / 15 ms).
+        A transition is confirmed only after ``blip_threshold + 1``
+        consecutive frames in the new state.  The threshold is either
+        the fixed ``blip_threshold_frames`` or an adaptive value based
+        on current signal quality.
         Any shorter state change is absorbed back into the current interval.
         """
         raw = "mark" if E > 0.0 else "space"
@@ -378,10 +410,12 @@ class MorseEventExtractor:
             self._pending_frames = [(E, sec)]
             return None
 
+        blip_thresh = self._current_blip_threshold()
+
         if raw == self._pending_state:
             # Another consecutive frame in the candidate new state.
             self._pending_frames.append((E, sec))
-            if len(self._pending_frames) > self._blip_threshold:
+            if len(self._pending_frames) > blip_thresh:
                 # Enough consecutive frames — transition confirmed.
                 # Only emit the outgoing interval if it was long enough.
                 event: Optional[MorseEvent] = None
@@ -450,8 +484,28 @@ class MorseEventExtractor:
             self._mark_ema = peak_db
             self._space_ema = peak_db
 
-        fast_db = self._FAST_DB
         release = self._RELEASE
+
+        # Compute current spread for adaptive FAST_DB selection.
+        # Use raw spread before floor clamp so we can detect poor SNR.
+        # Both EMAs are guaranteed non-None after the init block above.
+        assert self._space_ema is not None
+        raw_spread = max(self._mark_ema - self._space_ema, 0.0)
+
+        # Signal quality: 0 (poor, spread ≈ 0) to 1 (good, spread ≥ HI).
+        spread_lo = self._SPREAD_LO
+        spread_hi = self._SPREAD_HI
+        if spread_hi > spread_lo:
+            sq = max(0.0, min(1.0, (raw_spread - spread_lo) / (spread_hi - spread_lo)))
+        else:
+            sq = 1.0
+        self._signal_quality = sq
+
+        # Select FAST_DB: lower (more aggressive) at low spread.
+        if self._adaptive_fast_db:
+            fast_db = self._fast_db_min + sq * (self._fast_db_max - self._fast_db_min)
+        else:
+            fast_db = self._FAST_DB
 
         # Mark EMA: fast pull-up, slow release downward.
         dev_up = peak_db - self._mark_ema
@@ -471,8 +525,8 @@ class MorseEventExtractor:
             self._space_ema = release * self._space_ema + (1.0 - release) * peak_db
 
         # ---- Delayed threshold application ----
-        mw = self._CENTER_MARK_WEIGHT
-        sw = self._CENTER_SPACE_WEIGHT
+        mw = self._center_mark_weight
+        sw = self._center_space_weight
         min_spread = self._MIN_SPREAD_DB
         gain_factor = self._GAIN_FACTOR
 
@@ -484,10 +538,13 @@ class MorseEventExtractor:
             E = float(math.tanh((peak_db - center) * gain))
         else:
             # Normal: use old peak_db + old spread with current center.
-            delayed_idx = self._frame_history_count - self._DELAY_FRAMES
-            hist_idx = delayed_idx - 1 if delayed_idx > 0 else 0
+            # Look back exactly DELAY_FRAMES into the history.
+            delay_back = self._DELAY_FRAMES
+            first_frame = self._frame_history_count - len(self._frame_history)
+            target_frame = self._frame_history_count - delay_back
+            hist_idx = target_frame - first_frame
 
-            if hist_idx < len(self._frame_history):
+            if 0 <= hist_idx < len(self._frame_history):
                 snap = self._frame_history[hist_idx]
                 old_peak_db = snap["peak_db"]
                 old_mark_ema = snap["mark_ema_after"]

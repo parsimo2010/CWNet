@@ -3,28 +3,32 @@ train.py --Full training loop for the CWNet 1D CTC Morse decoder.
 
 Quick start::
 
-    python train.py --scenario test    # verifies pipeline (~5 epochs)
-    python train.py --scenario clean   # curriculum stage 1 (300 epochs)
-    python train.py --scenario full    # curriculum stage 2 (500 epochs)
+    python train.py --scenario test      # verifies pipeline (~5 epochs)
+    python train.py --scenario clean     # curriculum stage 1 (200 epochs)
+    python train.py --scenario moderate  # curriculum stage 2 (300 epochs)
+    python train.py --scenario full      # curriculum stage 3 (500 epochs)
 
 Recommended curriculum::
 
     # Stage 1: high SNR, near-standard timing
     python train.py --scenario clean
 
-    # Stage 2: resume from clean checkpoint, full noise envelope
-    python train.py --scenario full \\
+    # Stage 2: resume from clean checkpoint, moderate augmentations
+    python train.py --scenario moderate \\
         --checkpoint_file checkpoints/best_model.pt \\
+        --additional_epochs 300
+
+    # Stage 3: resume from moderate checkpoint, full noise envelope
+    python train.py --scenario full \\
+        --checkpoint_file checkpoints/best_model_moderate.pt \\
         --additional_epochs 500
 
-Multi-model initial training (when starting from scratch):
-    By default, the first 10 epochs train 10 models sequentially with different
-    random seeds. After epoch 10, the model with lowest validation loss is
-    selected and continues for remaining epochs. This can be customized:
-
-        python train.py --scenario clean \\
-            --num_initial_models 5 \\
-            --initial_epochs 5
+LR scheduling:
+    For models with 3+ LSTM layers, a linear warmup phase ramps the LR from
+    near-zero to the target over the first 5% of epochs before cosine decay.
+    This helps deeper models establish useful lower-layer representations
+    before aggressive gradient updates.  Models with 2 layers use plain
+    cosine annealing (no warmup needed).
 
 Metrics logged per epoch:
     train_loss   --mean CTC loss over training batches
@@ -43,7 +47,6 @@ import csv
 import gc
 import json
 import math
-import random
 from pathlib import Path
 from typing import List, Optional
 
@@ -57,7 +60,7 @@ from tqdm import tqdm
 
 import vocab as vocab_module
 from config import Config, ModelConfig, MorseConfig, create_default_config
-from dataset import StreamingMorseDataset, collate_fn
+from dataset import PregeneratedDataset, StreamingMorseDataset, collate_fn
 from feature import MorseEventExtractor
 from model import MorseEventFeaturizer, MorseEventModel
 from morse_generator import generate_sample
@@ -172,13 +175,36 @@ def save_checkpoint(
 # Random seed helpers for multi-model training
 # ---------------------------------------------------------------------------
 
-def set_seed(seed: int) -> None:
-    """Set random seeds for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def make_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_epochs: int,
+    n_rnn_layers: int,
+    eta_min: float = 1e-6,
+) -> torch.optim.lr_scheduler._LRScheduler:
+    """Build LR scheduler, adding linear warmup for deep (3+ layer) models.
+
+    For n_rnn_layers >= 3: linear warmup over 5% of epochs (min 5), then
+    cosine decay for the remainder.  For shallower models: plain cosine.
+    """
+    if n_rnn_layers >= 3:
+        warmup_epochs = max(5, int(total_epochs * 0.05))
+        cosine_epochs = total_epochs - warmup_epochs
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs
+        )
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cosine_epochs, eta_min=eta_min
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
+        )
+        print(f"  LR schedule: linear warmup ({warmup_epochs} epochs) -> cosine ({cosine_epochs} epochs)")
+        return scheduler
+    else:
+        print(f"  LR schedule: cosine annealing ({total_epochs} epochs)")
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_epochs, eta_min=eta_min
+        )
 
 
 def evaluate_model(
@@ -214,7 +240,7 @@ def evaluate_model(
                 valid_t = out_lens_cpu[b].item()
                 sample_lp = log_probs_cpu[:valid_t, b, :]
                 pred_greedy = greedy_ctc_decode(sample_lp).strip()
-                greedy_cers.append(_fast_cer(texts[b], pred_greedy))
+                greedy_cers.append(_fast_cer(texts[b].strip(), pred_greedy))
 
     avg_val = float(np.mean(val_losses)) if val_losses else float("inf")
     avg_g_cer = float(np.mean(greedy_cers)) if greedy_cers else 1.0
@@ -304,46 +330,87 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # ---- Datasets --------------------------------------------------------
+    import glob as glob_mod
+
+    pregen_files: Optional[List[str]] = None
+    if getattr(args, "pregenerated", None):
+        pregen_files = sorted(glob_mod.glob(args.pregenerated))
+        if not pregen_files:
+            raise FileNotFoundError(f"No files match: {args.pregenerated}")
+        print(f"Data generation: pre-generated audio features "
+              f"({len(pregen_files)} shard{'s' if len(pregen_files) != 1 else ''})")
+        for f in pregen_files:
+            print(f"  {f}")
+
     use_direct = not getattr(args, "use_audio", False)
-    if use_direct:
-        print("Data generation: direct event simulation (fast)")
+    if pregen_files is None:
+        if use_direct:
+            print("Data generation: direct event simulation (fast)")
+        else:
+            print("Data generation: audio synthesis + feature extraction")
+
+    def _make_train_loader(epoch: int = 0):
+        """Create train DataLoader — fresh shard each epoch for pregenerated."""
+        if pregen_files:
+            shard = pregen_files[epoch % len(pregen_files)]
+            ds = PregeneratedDataset(shard, shuffle=True, seed=epoch)
+            return DataLoader(
+                ds,
+                batch_size=config.training.batch_size,
+                collate_fn=collate_fn,
+                num_workers=0,  # map-style, data already in RAM
+                pin_memory=(device.type == "cuda"),
+            )
+        else:
+            ds = StreamingMorseDataset(
+                config=config, epoch_size=config.training.samples_per_epoch,
+                use_direct_events=use_direct,
+            )
+            return DataLoader(
+                ds,
+                batch_size=config.training.batch_size,
+                collate_fn=collate_fn,
+                num_workers=config.training.num_workers,
+                pin_memory=(device.type == "cuda"),
+                prefetch_factor=4 if config.training.num_workers > 0 else None,
+                persistent_workers=(config.training.num_workers > 0),
+            )
+
+    train_loader = _make_train_loader(0)
+
+    # Validation
+    pregen_val = getattr(args, "pregenerated_val", None)
+    if pregen_val:
+        print(f"Validation   : pre-generated audio features ({pregen_val})")
+        val_ds = PregeneratedDataset(pregen_val, shuffle=False, seed=42)
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=config.training.batch_size,
+            collate_fn=collate_fn,
+            num_workers=0,
+            pin_memory=(device.type == "cuda"),
+        )
     else:
-        print("Data generation: audio synthesis + feature extraction")
-
-    train_ds = StreamingMorseDataset(
-        config=config, epoch_size=config.training.samples_per_epoch,
-        use_direct_events=use_direct,
-    )
-    val_ds = StreamingMorseDataset(
-        config=config, epoch_size=config.training.val_samples, seed=42,
-        use_direct_events=use_direct,
-    )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=config.training.batch_size,
-        collate_fn=collate_fn,
-        num_workers=config.training.num_workers,
-        pin_memory=(device.type == "cuda"),
-        prefetch_factor=4 if config.training.num_workers > 0 else None,
-        persistent_workers=(config.training.num_workers > 0),
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=config.training.batch_size,
-        collate_fn=collate_fn,
-        num_workers=config.training.num_workers,
-        pin_memory=(device.type == "cuda"),
-        prefetch_factor=4 if config.training.num_workers > 0 else None,
-        persistent_workers=(config.training.num_workers > 0),
-    )
+        val_direct = use_direct if pregen_files is None else True
+        if pregen_files and not pregen_val:
+            print("Validation   : direct events (pass --pregenerated-val for audio-path val)")
+        val_ds = StreamingMorseDataset(
+            config=config, epoch_size=config.training.val_samples, seed=42,
+            use_direct_events=val_direct,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=config.training.batch_size,
+            collate_fn=collate_fn,
+            num_workers=config.training.num_workers,
+            pin_memory=(device.type == "cuda"),
+            prefetch_factor=4 if config.training.num_workers > 0 else None,
+            persistent_workers=(config.training.num_workers > 0),
+        )
 
     # ---- Loss / optimiser / scheduler -----------------------------------
     ctc_loss  = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.training.learning_rate)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.training.num_epochs, eta_min=1e-6
-    )
 
     best_val_loss = math.inf
     start_epoch   = 0
@@ -353,10 +420,11 @@ def train(args: argparse.Namespace) -> None:
     checkpoint_path = args.checkpoint_file or args.checkpoint
     is_resumed = bool(checkpoint_path)
 
-    # ---- Resume from checkpoint ------------------------------------------
     if not is_resumed:
-        print("\n[info] Starting training from scratch with multi-model initial phase")
-        print(f"  num_initial_models={args.num_initial_models}, initial_epochs={args.initial_epochs}")
+        scheduler = make_scheduler(
+            optimizer, end_epoch, mcfg.n_rnn_layers
+        )
+        print("\n[info] Starting training from scratch")
     else:
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
@@ -370,6 +438,7 @@ def train(args: argparse.Namespace) -> None:
             for pg in optimizer.param_groups:
                 pg["lr"] = resume_lr
             end_epoch = start_epoch + args.additional_epochs
+            # No warmup on resume — model is already trained
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=args.additional_epochs, eta_min=1e-6
             )
@@ -377,169 +446,16 @@ def train(args: argparse.Namespace) -> None:
                   f"-> {args.additional_epochs} more epochs  lr={resume_lr:.2e}")
         else:
             best_val_loss = ckpt.get("best_val_loss", math.inf)
+            # Rebuild scheduler with same structure and restore state
+            scheduler = make_scheduler(
+                optimizer, end_epoch, mcfg.n_rnn_layers
+            )
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            end_epoch = config.training.num_epochs
             print(f"Resumed epoch {start_epoch}  (best_val={best_val_loss:.4f})")
 
-    # ---- Multi-model initial phase ---------------------------------------
     beam_interval = config.training.beam_cer_interval
     beam_width    = config.training.beam_width
     safety_path   = ckpt_dir / "checkpoint_safety.pt"
-
-    if not is_resumed and args.initial_epochs > 0:
-        num_models = args.num_initial_models
-        print(f"\n[info] Initial multi-model training phase:")
-        print(f"  Training {num_models} models for {args.initial_epochs} epochs each, "
-              f"then selecting the best.")
-
-        best_model_weights = None
-        best_val_loss_initial = math.inf
-        best_model_idx = -1
-        init_ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
-
-        for model_idx in range(num_models):
-            seed = 42 + model_idx * 1000
-            set_seed(seed)
-            print(f"\n{'='*60}")
-            print(f"Initial Phase --Model {model_idx+1}/{num_models}  (seed={seed})")
-            print(f"{'='*60}")
-
-            # Fresh model with this seed's random initialisation
-            mcfg = config.model
-            train_model = MorseEventModel(
-                in_features=mcfg.in_features,
-                hidden_size=mcfg.hidden_size,
-                n_rnn_layers=mcfg.n_rnn_layers,
-                dropout=mcfg.dropout,
-            ).to(device)
-
-            train_optimizer = torch.optim.Adam(
-                train_model.parameters(), lr=config.training.learning_rate
-            )
-            train_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                train_optimizer, T_max=config.training.num_epochs, eta_min=1e-6
-            )
-
-            # Train this model for initial_epochs epochs
-            for epoch in range(args.initial_epochs):
-                train_model.train()
-                epoch_losses: List[float] = []
-
-                pbar = tqdm(
-                    train_loader,
-                    desc=f"  M{model_idx+1}/{num_models} E{epoch+1}/{args.initial_epochs}",
-                    unit="batch",
-                    dynamic_ncols=True,
-                )
-
-                for batch_idx, (feat, targets, feat_lens, tgt_lens, texts) in enumerate(pbar):
-                    feat      = feat.to(device)
-                    targets   = targets.to(device)
-                    feat_lens = feat_lens.to(device)
-                    tgt_lens  = tgt_lens.to(device)
-
-                    train_optimizer.zero_grad(set_to_none=True)
-
-                    with autocast(device_type=device.type, enabled=(scaler is not None)):
-                        log_probs, out_lens = train_model(feat, feat_lens)
-                        loss = init_ctc_loss(log_probs, targets, out_lens, tgt_lens)
-
-                    if torch.isfinite(loss):
-                        if scaler is not None:
-                            scaler.scale(loss).backward()
-                            scaler.unscale_(train_optimizer)
-                            grad_ok = all(
-                                p.grad is None or torch.isfinite(p.grad).all()
-                                for p in train_model.parameters()
-                            )
-                            if grad_ok:
-                                nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=5.0)
-                                epoch_losses.append(loss.item())
-                            scaler.step(train_optimizer)
-                            scaler.update()
-                        else:
-                            loss.backward()
-                            if any(
-                                p.grad is not None and not torch.isfinite(p.grad).all()
-                                for p in train_model.parameters()
-                            ):
-                                train_optimizer.zero_grad(set_to_none=True)
-                            else:
-                                nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=5.0)
-                                train_optimizer.step()
-                                epoch_losses.append(loss.item())
-
-                    pbar.set_postfix(
-                        loss=f"{loss.item():.4f}",
-                        lr=f"{train_scheduler.get_last_lr()[0]:.2e}",
-                    )
-
-                del pbar
-                avg_train = float(np.mean(epoch_losses)) if epoch_losses else float("inf")
-                print(
-                    f"  M{model_idx+1} E{epoch+1}/{args.initial_epochs}"
-                    f"  train={avg_train:.4f}"
-                    f"  lr={train_scheduler.get_last_lr()[0]:.2e}"
-                )
-                train_scheduler.step()
-
-            # Evaluate after all initial epochs
-            print(f"\n[info] Evaluating model {model_idx+1}/{num_models} ...")
-            val_loss, greedy_cer = evaluate_model(
-                train_model, val_loader, device, init_ctc_loss, scaler
-            )
-            print(f"  Model {model_idx+1}: val_loss={val_loss:.4f}  greedy_CER={greedy_cer:.4f}")
-
-            if val_loss < best_val_loss_initial:
-                best_val_loss_initial = val_loss
-                best_model_idx = model_idx
-                # Save weights on CPU to keep GPU memory free during subsequent models
-                best_model_weights = {
-                    k: v.detach().cpu().clone() for k, v in train_model.state_dict().items()
-                }
-                print(f"  *** New best model: M{model_idx+1} (val_loss={best_val_loss_initial:.4f})")
-
-            del train_model, train_optimizer, train_scheduler
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
-        # Load best model into main model and reset for a full training run
-        if best_model_weights is None:
-            raise RuntimeError("No valid models produced during initial phase!")
-
-        print(f"\n{'='*60}")
-        print(f"Initial Phase Complete")
-        print(f"  Winner: Model {best_model_idx+1}  val_loss={best_val_loss_initial:.4f}")
-        print(f"{'='*60}")
-
-        # Move best weights back to device and load into the main model
-        model.load_state_dict({k: v.to(device) for k, v in best_model_weights.items()})
-        best_val_loss = best_val_loss_initial
-
-        # Give the selected model a full cosine LR cycle from epoch 0
-        start_epoch = 0
-        end_epoch   = config.training.num_epochs
-        optimizer   = torch.optim.Adam(model.parameters(), lr=config.training.learning_rate)
-        scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=config.training.num_epochs, eta_min=1e-6
-        )
-        print(f"[info] Starting main training loop ({end_epoch} epochs) "
-              f"with selected model weights.")
-    else:
-        # Normal single-model training (resumed or multi-model disabled)
-        beam_interval = config.training.beam_cer_interval
-        beam_width    = config.training.beam_width
-        safety_path   = ckpt_dir / "checkpoint_safety.pt"
-
-        if not is_resumed and args.additional_epochs:
-            if args.resume_lr is not None:
-                for pg in optimizer.param_groups:
-                    pg["lr"] = args.resume_lr
-            end_epoch = args.additional_epochs
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=args.additional_epochs, eta_min=1e-6
-            )
 
     # ---- Main training loop ----------------------------------------------
     for epoch in range(start_epoch, end_epoch):
@@ -556,6 +472,11 @@ def train(args: argparse.Namespace) -> None:
                 print(f"\n  [warn] NaN in weights before epoch {epoch+1} --no safety ckpt")
 
         save_checkpoint(safety_path, epoch, model, optimizer, scheduler, best_val_loss, config, scaler)
+
+        # Reload train shard for pregenerated data (one shard per epoch)
+        if pregen_files is not None:
+            train_loader = _make_train_loader(epoch)
+            gc.collect()
 
         model.train()
         epoch_losses: List[float] = []
@@ -663,11 +584,11 @@ def train(args: argparse.Namespace) -> None:
                     valid_t = out_lens_cpu[b].item()
                     sample_lp = log_probs_cpu[:valid_t, b, :]
                     pred_greedy = greedy_ctc_decode(sample_lp).strip()
-                    greedy_cers.append(_fast_cer(texts[b], pred_greedy))
+                    greedy_cers.append(_fast_cer(texts[b].strip(), pred_greedy))
 
                     if run_beam:
                         pred_beam = beam_ctc_decode(sample_lp, beam_width).strip()
-                        beam_cers.append(_fast_cer(texts[b], pred_beam))
+                        beam_cers.append(_fast_cer(texts[b].strip(), pred_beam))
 
         _n = min(len(epoch_losses), config.training.log_interval)
         avg_train = float(np.mean(epoch_losses[-_n:])) if epoch_losses else float("inf")
@@ -723,7 +644,7 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Train CWNet 1D CTC Morse decoder",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--scenario", choices=["test", "clean", "full"], default="clean")
+    p.add_argument("--scenario", choices=["test", "clean", "moderate", "full"], default="clean")
     p.add_argument("--config", type=str, default=None, metavar="PATH",
                    help="Load config from JSON (overrides --scenario)")
     p.add_argument("--checkpoint_file", type=str, default=None, metavar="PATH",
@@ -734,12 +655,14 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Run N more epochs with a fresh cosine LR cycle")
     p.add_argument("--resume_lr", type=float, default=None, metavar="LR",
                    help="Peak LR for the fresh cosine cycle (default: config LR)")
-    p.add_argument("--num_initial_models", type=int, default=1, metavar="N",
-                   help="Number of models to train in initial phase (default: 1)")
-    p.add_argument("--initial_epochs", type=int, default=5, metavar="E",
-                   help="Epochs for multi-model training before selecting best (default: 5)")
     p.add_argument("--use-audio", action="store_true", default=False,
                    help="Use audio synthesis pipeline instead of direct event generation")
+    p.add_argument("--pregenerated", type=str, default=None, metavar="GLOB",
+                   help="Glob pattern for pre-generated feature shards "
+                        "(e.g. 'features_full_*.npz'). One shard loaded per epoch.")
+    p.add_argument("--pregenerated-val", type=str, default=None, metavar="PATH",
+                   help="Pre-generated validation features (.npz). "
+                        "If omitted with --pregenerated, falls back to direct events.")
     return p
 
 

@@ -7,6 +7,9 @@
 # model checkpoints
 *.pt
 
+# pre-generated audio-based samples
+*.npz
+
 # debug files
 checkpoints/debug_samples
 

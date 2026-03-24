@@ -47,6 +47,7 @@ from torch.utils.data import DataLoader, IterableDataset
 
 import vocab as vocab_module
 from config import Config
+from fast_feature import FastFeatureExtractor
 from feature import MorseEventExtractor
 from model import MorseEventFeaturizer
 from morse_generator import generate_events_direct, generate_sample, load_wordlist
@@ -102,9 +103,9 @@ class StreamingMorseDataset(IterableDataset):
         """
         rng = self._make_rng()
 
-        # Extractor only needed for audio-based path.
+        # Fast extractor for audio-based path (vectorized STFT + Numba EMA).
         if not self.use_direct_events:
-            extractor = MorseEventExtractor(self.feature_cfg)
+            fast_extractor = FastFeatureExtractor(self.feature_cfg)
         featurizer = MorseEventFeaturizer()
 
         worker_info = torch.utils.data.get_worker_info()
@@ -123,13 +124,11 @@ class StreamingMorseDataset(IterableDataset):
                         self.morse_cfg, rng=rng, wordlist=self.wordlist
                     )
                 else:
-                    # Audio path: synthesis → STFT → EMA → events
+                    # Audio path: synthesis → vectorized STFT → Numba EMA → events
                     audio_f32, text, _ = generate_sample(
                         self.morse_cfg, rng=rng, wordlist=self.wordlist
                     )
-                    extractor.reset()
-                    events = extractor.process_chunk(audio_f32)
-                    events += extractor.flush()
+                    events = fast_extractor.extract(audio_f32)
             except Exception:
                 continue   # skip rare synthesis failures silently
 
@@ -229,6 +228,55 @@ def collate_fn(
         targets_pad[i, :t.shape[0]] = t
 
     return feat_pad, targets_pad, feat_lengths, target_lengths, list(texts)
+
+
+# ---------------------------------------------------------------------------
+# Pre-generated feature dataset (from pregenerate.py)
+# ---------------------------------------------------------------------------
+
+class PregeneratedDataset(torch.utils.data.Dataset):
+    """Map-style dataset loading pre-extracted audio-path features.
+
+    Created by ``pregenerate.py``, stored as compressed ``.npz``.
+    Zero data-generation overhead during training — just index lookups.
+
+    Args:
+        path: Path to ``.npz`` file from ``pregenerate.py``.
+        shuffle: Shuffle sample order (training). Fixed order for validation.
+        seed: Random seed for shuffle reproducibility.
+    """
+
+    def __init__(self, path: str, shuffle: bool = True, seed: int = 0) -> None:
+        data = np.load(path, allow_pickle=True)
+        self._features = data["features"]          # (total_T, 5) float32
+        self._feat_offsets = data["feat_offsets"]   # (N,) int64
+        self._feat_lengths = data["feat_lengths"]   # (N,) int32
+        self._targets = data["targets"]             # (total_S,) int32
+        self._target_offsets = data["target_offsets"]
+        self._target_lengths = data["target_lengths"]
+        self._texts = data["texts"]                 # (N,) str
+        self._n = int(data["n_samples"])
+
+        # Shuffle order
+        self._order = np.arange(self._n)
+        if shuffle:
+            np.random.default_rng(seed).shuffle(self._order)
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor, str]:
+        i = self._order[idx]
+        fo = self._feat_offsets[i]
+        fl = self._feat_lengths[i]
+        feat = torch.from_numpy(self._features[fo : fo + fl].copy())
+
+        to = self._target_offsets[i]
+        tl = self._target_lengths[i]
+        target = torch.from_numpy(self._targets[to : to + tl].astype(np.int64))
+
+        text = str(self._texts[i])
+        return feat, target, text
 
 
 # ---------------------------------------------------------------------------
