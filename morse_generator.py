@@ -115,16 +115,26 @@ _KEY_TYPES = ("straight", "bug", "paddle")
 
 
 def _select_key_type(
-    weights: Tuple[float, float, float],
+    weights: Tuple[float, ...],
     rng: np.random.Generator,
 ) -> str:
-    """Select a key type based on configured weights."""
-    cumulative = (weights[0], weights[0] + weights[1])
-    r = float(rng.random())
-    if r < cumulative[0]:
-        return "straight"
-    elif r < cumulative[1]:
-        return "bug"
+    """Select a key type based on configured weights.
+
+    Supports 3-tuple (straight, bug, paddle) or 4-tuple (+ cootie).
+    """
+    # Normalise to handle both 3- and 4-tuples
+    w = list(weights)
+    if len(w) < 4:
+        w.append(0.0)  # no cootie if not specified
+    total = sum(w)
+    if total <= 0:
+        return "paddle"
+    r = float(rng.random()) * total
+    cum = 0.0
+    for key_type, wt in zip(("straight", "bug", "paddle", "cootie"), w):
+        cum += wt
+        if r < cum:
+            return key_type
     return "paddle"
 
 
@@ -187,6 +197,252 @@ def _apply_qsb(
     )
     fade_lin   = np.float32(10.0) ** (fade_db.astype(np.float32) / np.float32(20.0))
     return signal * fade_lin
+
+
+# ---------------------------------------------------------------------------
+# HF noise loader (cached, thread-safe)
+# ---------------------------------------------------------------------------
+
+import threading as _threading
+
+_hf_noise_cache: Dict[str, np.ndarray] = {}
+_hf_noise_lock = _threading.Lock()
+
+
+def _load_hf_noise_files(noise_dir: str, target_sr: int = 16000) -> List[np.ndarray]:
+    """Load and cache all WAV files from noise_dir, resampled to target_sr."""
+    import glob
+    import soundfile as sf
+
+    key = f"{noise_dir}:{target_sr}"
+    with _hf_noise_lock:
+        if key in _hf_noise_cache:
+            return list(_hf_noise_cache[key])
+
+    noise_files = sorted(glob.glob(str(Path(noise_dir) / "noise_*.wav")))
+    if not noise_files:
+        return []
+
+    buffers = []
+    for fpath in noise_files:
+        data, sr = sf.read(fpath, dtype="float32")
+        if data.ndim > 1:
+            data = data[:, 0]
+        # Resample if needed (simple linear interpolation — noise doesn't need high quality)
+        if sr != target_sr:
+            ratio = target_sr / sr
+            n_out = int(len(data) * ratio)
+            indices = np.linspace(0, len(data) - 1, n_out)
+            idx_floor = np.floor(indices).astype(np.int64)
+            idx_ceil = np.minimum(idx_floor + 1, len(data) - 1)
+            frac = (indices - idx_floor).astype(np.float32)
+            data = data[idx_floor] * (1.0 - frac) + data[idx_ceil] * frac
+        buffers.append(data)
+
+    with _hf_noise_lock:
+        # Store as a single array tuple for the cache key
+        _hf_noise_cache[key] = buffers
+    return buffers
+
+
+def _get_hf_noise_segment(
+    noise_dir: str,
+    n_samples: int,
+    rng: np.random.Generator,
+    target_sr: int = 16000,
+) -> Optional[np.ndarray]:
+    """Extract a random segment of real HF noise, resampled to target_sr."""
+    buffers = _load_hf_noise_files(noise_dir, target_sr)
+    if not buffers:
+        return None
+
+    # Pick a random file
+    buf = buffers[int(rng.integers(len(buffers)))]
+    if len(buf) < n_samples:
+        # Tile if recording is shorter than needed (unlikely)
+        repeats = (n_samples // len(buf)) + 1
+        buf = np.tile(buf, repeats)
+
+    # Random start position
+    max_start = len(buf) - n_samples
+    start = int(rng.integers(0, max(1, max_start)))
+    return buf[start:start + n_samples].copy()
+
+
+# ---------------------------------------------------------------------------
+# QRM — interfering CW signals
+# ---------------------------------------------------------------------------
+
+def _apply_qrm(
+    audio: np.ndarray,
+    sample_rate: int,
+    rng: np.random.Generator,
+    n_interferers: int,
+    base_freq: float,
+    freq_offset_min: float,
+    freq_offset_max: float,
+    amplitude_min: float,
+    amplitude_max: float,
+    duration_sec: float,
+) -> np.ndarray:
+    """Add interfering CW signals at nearby frequencies.
+
+    Each interferer is a simple CW signal with random text, speed, and
+    frequency offset from the target signal. This simulates QRM from
+    other operators on adjacent frequencies.
+    """
+    n = len(audio)
+    result = audio.copy()
+
+    for _ in range(n_interferers):
+        # Random frequency offset (can be positive or negative)
+        offset = float(rng.uniform(freq_offset_min, freq_offset_max))
+        if rng.random() < 0.5:
+            offset = -offset
+        interferer_freq = base_freq + offset
+
+        # Random amplitude
+        amp = float(rng.uniform(amplitude_min, amplitude_max))
+
+        # Random keying pattern: random on/off with random speeds
+        # Use a simple random binary keying rather than full Morse generation
+        # to avoid recursive dependency and keep it fast
+        interferer_wpm = float(rng.uniform(10.0, 35.0))
+        dit_dur = 60.0 / (interferer_wpm * 50.0)
+
+        t = np.arange(n, dtype=np.float32) / sample_rate
+
+        # Generate random on/off keying envelope
+        envelope = np.zeros(n, dtype=np.float32)
+        pos = 0
+        is_on = bool(rng.random() < 0.5)
+        while pos < n:
+            # Random element duration (dits and dahs)
+            if is_on:
+                dur_samples = int((dit_dur * float(rng.choice([1.0, 3.0]))) * sample_rate)
+            else:
+                dur_samples = int((dit_dur * float(rng.choice([1.0, 3.0, 7.0]))) * sample_rate)
+            dur_samples = max(1, dur_samples)
+            end = min(pos + dur_samples, n)
+            if is_on:
+                envelope[pos:end] = 1.0
+            pos = end
+            is_on = not is_on
+
+        # Apply soft keying (5ms rise/fall)
+        rise_samples = max(2, int(0.005 * sample_rate))
+        ramp = (np.sin(np.linspace(0, math.pi / 2, rise_samples)) ** 2).astype(np.float32)
+        # Find transitions and apply ramps
+        diff = np.diff(envelope)
+        onsets = np.where(diff > 0.5)[0] + 1
+        offsets = np.where(diff < -0.5)[0] + 1
+        for onset in onsets:
+            r = min(rise_samples, n - onset)
+            if r > 0:
+                envelope[onset:onset + r] = np.minimum(envelope[onset:onset + r], ramp[:r])
+        for offset_pos in offsets:
+            r = min(rise_samples, n - offset_pos)
+            if r > 0:
+                envelope[offset_pos:offset_pos + r] = np.minimum(
+                    envelope[offset_pos:offset_pos + r], ramp[:r][::-1] if r == rise_samples else ramp[:r][::-1]
+                )
+
+        # Generate tone
+        phase = np.cumsum(np.float32(2 * math.pi * interferer_freq / sample_rate) * np.ones(n, dtype=np.float32))
+        phase += np.float32(rng.uniform(0, 2 * math.pi))
+        tone = np.sin(phase).astype(np.float32)
+
+        result += amp * envelope * tone
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# QRN — impulsive atmospheric noise (static crashes)
+# ---------------------------------------------------------------------------
+
+def _apply_qrn(
+    audio: np.ndarray,
+    sample_rate: int,
+    rng: np.random.Generator,
+    rate: float,
+    duration_ms_min: float,
+    duration_ms_max: float,
+    amplitude_min: float,
+    amplitude_max: float,
+    signal_rms: float,
+) -> np.ndarray:
+    """Add impulsive noise simulating atmospheric static crashes (QRN).
+
+    Lightning-generated impulses are modelled as short bursts of filtered
+    noise with exponential decay envelopes, Poisson-distributed in time.
+    """
+    total_sec = len(audio) / sample_rate
+    n_impulses = int(rng.poisson(rate * total_sec))
+    if n_impulses == 0:
+        return audio
+
+    result = audio.copy()
+    for _ in range(n_impulses):
+        # Random position
+        pos = int(rng.integers(0, len(audio)))
+
+        # Random duration and amplitude
+        dur_ms = float(rng.uniform(duration_ms_min, duration_ms_max))
+        dur_samples = max(1, int(dur_ms * 0.001 * sample_rate))
+        amp = float(rng.uniform(amplitude_min, amplitude_max)) * signal_rms
+
+        # Exponential decay envelope
+        t_imp = np.arange(dur_samples, dtype=np.float32) / sample_rate
+        decay_rate = float(rng.uniform(20.0, 100.0))  # faster = sharper crack
+        envelope = np.exp(-decay_rate * t_imp).astype(np.float32)
+
+        # Broadband noise burst (static crash)
+        burst = rng.normal(0.0, 1.0, dur_samples).astype(np.float32) * envelope * amp
+
+        # Random polarity (static crashes can be positive or negative)
+        if rng.random() < 0.5:
+            burst = -burst
+
+        # Add to audio
+        end = min(pos + dur_samples, len(audio))
+        actual = end - pos
+        result[pos:end] += burst[:actual]
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Receiver bandpass filter simulation
+# ---------------------------------------------------------------------------
+
+def _apply_bandpass(
+    audio: np.ndarray,
+    sample_rate: int,
+    center_freq: float,
+    bandwidth: float,
+    order: int = 4,
+) -> np.ndarray:
+    """Apply a Butterworth bandpass filter simulating a CW receiver filter.
+
+    Real CW filters have 200-500 Hz bandwidth centered on the beat note.
+    This removes out-of-band noise and any QRM outside the passband.
+    """
+    from scipy.signal import butter, sosfilt
+
+    low = center_freq - bandwidth / 2.0
+    high = center_freq + bandwidth / 2.0
+    nyq = sample_rate / 2.0
+
+    # Clamp to valid range
+    low = max(10.0, low) / nyq
+    high = min(nyq - 10.0, high) / nyq
+
+    if low >= high or high >= 1.0 or low <= 0.0:
+        return audio  # can't filter with these parameters
+
+    sos = butter(order, [low, high], btype="band", output="sos")
+    return sosfilt(sos, audio).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +545,8 @@ def text_to_elements(
     iws_factor: float = 1.0,
     key_type: str = "paddle",
     speed_drift_max: float = 0.0,
+    farnsworth_stretch: float = 1.0,
+    multi_op_speed_range: Optional[Tuple[float, float]] = None,
 ) -> List[Element]:
     """Convert text to (is_tone, duration_seconds) element pairs.
 
@@ -309,16 +567,45 @@ def text_to_elements(
     iws_factor : float
         Inter-word gap multiplier (standard = 1.0 → 7 dits).
     key_type : str
-        One of "straight", "bug", "paddle".  Controls how jitter is applied:
+        One of "straight", "bug", "paddle", "cootie".  Controls how jitter
+        is applied:
         - straight: high jitter on all elements, per-char speed variation,
                     per-element dah/dit ratio variation.
         - bug: minimal dit jitter (mechanical), moderate dah jitter (manual),
                variable spacing.
         - paddle: minimal element jitter (electronic), moderate spacing jitter.
+        - cootie: alternating side contacts; symmetric high jitter on all
+                  elements, no inherent dit/dah distinction — operator must
+                  time everything manually.
     speed_drift_max : float
         Slow WPM variation within the transmission as a fraction of unit_dur.
         0.0 = constant speed.  Applied as sinusoidal modulation across words.
+    farnsworth_stretch : float
+        Spacing stretch factor for Farnsworth timing.  1.0 = standard timing.
+        >1.0 = inter-character and inter-word spaces stretched by this factor
+        while intra-character timing stays at the faster character speed.
+    multi_op_speed_range : tuple of (float, float), optional
+        If set, applies abrupt speed changes at 1-3 random word boundaries,
+        simulating operator changes on a multi-op station. Values are
+        (min_multiplier, max_multiplier) for the speed change.
     """
+
+    # ---- Multi-operator speed changes ------------------------------------
+    # Pre-compute word indices where abrupt speed changes occur and their
+    # multiplier values.
+    multi_op_changes: Dict[int, float] = {}
+    if multi_op_speed_range is not None:
+        lo, hi = multi_op_speed_range
+        words_temp = [w for w in text.split(" ") if w]
+        if len(words_temp) >= 3:
+            n_changes = int(rng.integers(1, min(4, len(words_temp) // 2) + 1))
+            # Pick random word boundary indices (not first or last word)
+            change_indices = sorted(rng.choice(
+                range(1, len(words_temp)), size=min(n_changes, len(words_temp) - 1),
+                replace=False,
+            ))
+            for idx in change_indices:
+                multi_op_changes[int(idx)] = float(rng.uniform(lo, hi))
 
     # ---- Speed drift: sinusoidal modulation across the transmission ------
     # Pre-sample drift parameters; actual modulation applied per-word below.
@@ -390,20 +677,58 @@ def text_to_elements(
             noise = rng.normal(0.0, timing_jitter * 0.60 * nominal)
         return max(nominal + noise, nominal * 0.1)
 
+    def _jitter_cootie(units: float, is_dit: bool, is_dah: bool,
+                       char_cplx: float, local_ud: float,
+                       local_ddr: float) -> float:
+        """Cootie/sideswiper: alternating contacts, symmetric high jitter.
+
+        The operator switches between two paddle contacts for every element.
+        There is no mechanical dit/dah distinction — timing is entirely manual.
+        Result: symmetric but high jitter on all elements, with occasional
+        overshoot where dits are slightly long or dahs slightly short compared
+        to the target ratio.
+        """
+        nominal = units * local_ud
+        if timing_jitter <= 0.0:
+            return max(nominal, local_ud * 0.1)
+        # All elements get high jitter (~90% of configured jitter)
+        noise = rng.normal(0.0, timing_jitter * 0.90 * nominal)
+        # Cootie operators tend to drift the dah/dit ratio toward the middle
+        # (dahs shorter than intended, dits longer than intended)
+        if is_dah:
+            # Dahs tend to be slightly short (ratio compression)
+            ratio_drift = float(rng.normal(-0.05, 0.08))
+            nominal = nominal * (1.0 + ratio_drift)
+        elif is_dit:
+            # Dits tend to be slightly long (ratio compression)
+            ratio_drift = float(rng.normal(0.03, 0.06))
+            nominal = nominal * (1.0 + ratio_drift)
+        return max(nominal + noise, nominal * 0.1)
+
     jitter_fn = {"straight": _jitter_straight,
                  "bug":      _jitter_bug,
-                 "paddle":   _jitter_paddle}.get(key_type, _jitter_paddle)
+                 "paddle":   _jitter_paddle,
+                 "cootie":   _jitter_cootie}.get(key_type, _jitter_paddle)
 
     # ---- Build elements --------------------------------------------------
     elements: List[Element] = []
 
+    _multi_op_factor = 1.0  # persists across word boundaries
+
     for w_idx, word in enumerate(words):
+        # Multi-operator: abrupt speed step at designated word boundaries
+        if w_idx in multi_op_changes:
+            _multi_op_factor = multi_op_changes[w_idx]
+
         # Speed drift: modulate unit_dur per word
         if drift_amplitude > 0.0 and n_words > 1:
             phase = drift_phase + drift_freq * (w_idx / max(n_words - 1, 1)) * 2 * math.pi
             local_ud = unit_dur * (1.0 + drift_amplitude * math.sin(phase))
         else:
             local_ud = unit_dur
+
+        # Apply multi-op speed factor
+        local_ud = local_ud * _multi_op_factor
 
         chars: List[str] = [word] if word in MORSE_TABLE else list(word)
 
@@ -425,14 +750,14 @@ def text_to_elements(
                     dur = jitter_fn(1.0, False, False, cplx, local_ud, dah_dit_ratio)
                     elements.append((False, dur))
 
-            # Inter-character gap (3 × ics_factor dits)
+            # Inter-character gap (3 × ics_factor dits), stretched by Farnsworth
             if c_idx < len(chars) - 1:
-                dur = jitter_fn(3.0 * ics_factor, False, False, cplx, local_ud, dah_dit_ratio)
+                dur = jitter_fn(3.0 * ics_factor * farnsworth_stretch, False, False, cplx, local_ud, dah_dit_ratio)
                 elements.append((False, dur))
 
-        # Inter-word gap (7 × iws_factor dits)
+        # Inter-word gap (7 × iws_factor dits), stretched by Farnsworth
         if w_idx < len(words) - 1:
-            dur = jitter_fn(7.0 * iws_factor, False, False, 0.0, local_ud, dah_dit_ratio)
+            dur = jitter_fn(7.0 * iws_factor * farnsworth_stretch, False, False, 0.0, local_ud, dah_dit_ratio)
             elements.append((False, dur))
 
     return elements
@@ -455,6 +780,7 @@ def synthesize_audio(
     agc_attack_ms: float = 50.0,
     agc_release_ms: float = 400.0,
     qsb_depth_db: float = 0.0,
+    rise_time_ms: float = 5.0,
 ) -> np.ndarray:
     """Render Morse elements to a float32 audio waveform.
 
@@ -508,9 +834,9 @@ def synthesize_audio(
     inst_phase = np.cumsum(np.float32(2 * math.pi / sample_rate) * freq)
     carrier    = np.sin(inst_phase).astype(np.float32)
 
-    # ---- Key envelope with soft 5 ms rise/fall (prevents key clicks) ----
+    # ---- Key envelope with soft rise/fall (prevents key clicks) ----------
     envelope     = np.zeros(msg_samples, dtype=np.float32)
-    rise_samples = max(2, int(0.005 * sample_rate))
+    rise_samples = max(2, int(rise_time_ms * 0.001 * sample_rate))
     # Precompute the full-size ramp once; slice for shorter tone elements.
     _ramp_full = (np.sin(
         np.linspace(0.0, math.pi / 2, rise_samples, endpoint=False)
@@ -650,11 +976,32 @@ def generate_sample(
     if config.qsb_probability > 0.0 and rng.random() < config.qsb_probability:
         qsb_depth_db = float(rng.uniform(config.qsb_depth_db_min, config.qsb_depth_db_max))
 
+    # ---- Farnsworth timing -----------------------------------------------
+    farnsworth_stretch = 1.0
+    if (config.farnsworth_probability > 0.0
+            and rng.random() < config.farnsworth_probability):
+        # Character speed multiplier: characters sent faster, spaces stretched.
+        # farnsworth_stretch > 1.0 stretches inter-char and inter-word gaps.
+        char_speed_mult = float(rng.uniform(
+            config.farnsworth_char_speed_min, config.farnsworth_char_speed_max))
+        # Characters are sent at char_speed_mult × wpm, so unit_dur shrinks
+        # by 1/char_speed_mult.  To keep the *effective* WPM constant, we
+        # must stretch the spacing by char_speed_mult.
+        unit_dur = unit_dur / char_speed_mult
+        farnsworth_stretch = char_speed_mult
+
     # ---- Text generation -------------------------------------------------
     if text is None:
         text = generate_text(
             rng, min_chars=config.min_chars, max_chars=config.max_chars, wordlist=wordlist,
         )
+
+    # ---- Multi-operator speed change decision ------------------------------
+    multi_op_range = None
+    if (config.multi_op_probability > 0.0
+            and rng.random() < config.multi_op_probability):
+        multi_op_range = (config.multi_op_speed_change_min,
+                          config.multi_op_speed_change_max)
 
     # ---- Build Morse elements -------------------------------------------
     elements = text_to_elements(
@@ -664,6 +1011,8 @@ def generate_sample(
         iws_factor=iws_factor,
         key_type=key_type,
         speed_drift_max=config.speed_drift_max,
+        farnsworth_stretch=farnsworth_stretch,
+        multi_op_speed_range=multi_op_range,
     )
     if not elements:
         text = "E"
@@ -674,6 +1023,8 @@ def generate_sample(
             iws_factor=iws_factor,
             key_type=key_type,
             speed_drift_max=config.speed_drift_max,
+            farnsworth_stretch=farnsworth_stretch,
+            multi_op_speed_range=multi_op_range,
         )
 
     # ---- Noise std for silence periods ----------------------------------
@@ -691,6 +1042,9 @@ def generate_sample(
     leading_sec  = float(rng.uniform(min_silence_sec, max_silence_sec))
     trailing_sec = float(rng.uniform(min_silence_sec, max_silence_sec))
 
+    # ---- Per-sample keying waveform shaping --------------------------------
+    rise_time_ms = float(rng.uniform(config.rise_time_ms_min, config.rise_time_ms_max))
+
     # ---- Synthesise audio -----------------------------------------------
     audio_f32 = synthesize_audio(
         elements=elements,
@@ -705,12 +1059,78 @@ def generate_sample(
         agc_attack_ms=config.agc_attack_ms,
         agc_release_ms=config.agc_release_ms,
         qsb_depth_db=qsb_depth_db,
+        rise_time_ms=rise_time_ms,
     )
 
     # ---- Prepend leading silence ----------------------------------------
     leading_samples = int(leading_sec * config.sample_rate)
     leading_noise = rng.normal(0.0, noise_std, leading_samples).astype(np.float32)
     audio_f32 = np.concatenate([leading_noise, audio_f32])
+
+    # ---- QRM: interfering CW signals ------------------------------------
+    has_qrm = False
+    qrm_count = 0
+    if config.qrm_probability > 0.0 and rng.random() < config.qrm_probability:
+        qrm_count = int(rng.integers(config.qrm_count_min, config.qrm_count_max + 1))
+        audio_f32 = _apply_qrm(
+            audio_f32, config.sample_rate, rng,
+            n_interferers=qrm_count,
+            base_freq=base_freq,
+            freq_offset_min=config.qrm_freq_offset_min,
+            freq_offset_max=config.qrm_freq_offset_max,
+            amplitude_min=config.qrm_amplitude_min,
+            amplitude_max=config.qrm_amplitude_max,
+            duration_sec=len(audio_f32) / config.sample_rate,
+        )
+        has_qrm = True
+
+    # ---- QRN: impulsive atmospheric noise --------------------------------
+    has_qrn = False
+    if config.qrn_probability > 0.0 and rng.random() < config.qrn_probability:
+        qrn_rate = float(rng.uniform(config.qrn_rate_min, config.qrn_rate_max))
+        sig_rms = float(np.sqrt(np.mean(audio_f32.astype(np.float64) ** 2)))
+        audio_f32 = _apply_qrn(
+            audio_f32, config.sample_rate, rng,
+            rate=qrn_rate,
+            duration_ms_min=config.qrn_duration_ms_min,
+            duration_ms_max=config.qrn_duration_ms_max,
+            amplitude_min=config.qrn_amplitude_min,
+            amplitude_max=config.qrn_amplitude_max,
+            signal_rms=sig_rms,
+        )
+        has_qrn = True
+
+    # ---- Real HF noise: mix with existing audio -------------------------
+    has_hf_noise = False
+    if config.hf_noise_probability > 0.0 and rng.random() < config.hf_noise_probability:
+        hf_seg = _get_hf_noise_segment(
+            config.hf_noise_dir, len(audio_f32), rng, config.sample_rate,
+        )
+        if hf_seg is not None:
+            # Scale HF noise to match the existing noise level, then mix
+            hf_rms = float(np.sqrt(np.mean(hf_seg.astype(np.float64) ** 2)))
+            if hf_rms > 1e-9:
+                hf_seg = hf_seg * (noise_std / hf_rms)
+            mix = config.hf_noise_mix_ratio
+            # Replace fraction of existing audio noise with HF noise
+            audio_f32 = audio_f32 + mix * hf_seg
+            has_hf_noise = True
+
+    # ---- Bandpass filter: simulate CW receiver filter --------------------
+    has_bandpass = False
+    bandpass_bw = 0.0
+    if config.bandpass_probability > 0.0 and rng.random() < config.bandpass_probability:
+        bandpass_bw = float(rng.uniform(config.bandpass_bw_min, config.bandpass_bw_max))
+        audio_f32 = _apply_bandpass(
+            audio_f32, config.sample_rate, base_freq, bandpass_bw,
+            order=config.bandpass_order,
+        )
+        has_bandpass = True
+
+    # ---- Final normalisation after all augmentations --------------------
+    peak = float(np.max(np.abs(audio_f32)))
+    if peak > 1e-9:
+        audio_f32 = (audio_f32 * (target_amplitude / peak)).astype(np.float32)
 
     metadata: Dict = {
         "wpm": wpm,
@@ -728,6 +1148,14 @@ def generate_sample(
         "qsb_depth_db": qsb_depth_db,
         "leading_silence_sec": leading_sec,
         "trailing_silence_sec": trailing_sec,
+        "farnsworth_stretch": farnsworth_stretch,
+        "qrm": has_qrm,
+        "qrm_count": qrm_count,
+        "qrn": has_qrn,
+        "hf_noise": has_hf_noise,
+        "bandpass": has_bandpass,
+        "bandpass_bw": bandpass_bw,
+        "multi_op": multi_op_range is not None,
     }
     return audio_f32, text, metadata
 
@@ -875,6 +1303,22 @@ def generate_events_direct(
         qsb_freq = float(rng.uniform(0.05, 0.3))
         qsb_phase = float(rng.uniform(0.0, 2 * math.pi))
 
+    # ---- Farnsworth timing -----------------------------------------------
+    farnsworth_stretch = 1.0
+    if (config.farnsworth_probability > 0.0
+            and rng.random() < config.farnsworth_probability):
+        char_speed_mult = float(rng.uniform(
+            config.farnsworth_char_speed_min, config.farnsworth_char_speed_max))
+        unit_dur = unit_dur / char_speed_mult
+        farnsworth_stretch = char_speed_mult
+
+    # ---- Multi-operator speed change decision ------------------------------
+    multi_op_range = None
+    if (config.multi_op_probability > 0.0
+            and rng.random() < config.multi_op_probability):
+        multi_op_range = (config.multi_op_speed_change_min,
+                          config.multi_op_speed_change_max)
+
     # ---- Text and elements -----------------------------------------------
     if text is None:
         text = generate_text(
@@ -888,6 +1332,8 @@ def generate_events_direct(
         iws_factor=iws_factor,
         key_type=key_type,
         speed_drift_max=config.speed_drift_max,
+        farnsworth_stretch=farnsworth_stretch,
+        multi_op_speed_range=multi_op_range,
     )
     if not elements:
         text = "E"
@@ -898,6 +1344,8 @@ def generate_events_direct(
             iws_factor=iws_factor,
             key_type=key_type,
             speed_drift_max=config.speed_drift_max,
+            farnsworth_stretch=farnsworth_stretch,
+            multi_op_speed_range=multi_op_range,
         )
 
     # ---- Silence durations -----------------------------------------------
@@ -1128,6 +1576,8 @@ def generate_events_direct(
         "qsb_depth_db": qsb_depth_db,
         "leading_silence_sec": leading_sec,
         "trailing_silence_sec": trailing_sec,
+        "farnsworth_stretch": farnsworth_stretch,
+        "multi_op": multi_op_range is not None,
         "direct_events": True,
     }
     return events, text, metadata

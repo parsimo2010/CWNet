@@ -95,15 +95,73 @@ class MorseConfig:
     qsb_depth_db_min: float = 3.0      # peak-to-peak fading range (dB, min)
     qsb_depth_db_max: float = 10.0     # peak-to-peak fading range (dB, max)
 
-    # Key type weights: (straight_key, bug, paddle) probabilities.
+    # Key type weights: (straight_key, bug, paddle, cootie) probabilities.
     # Straight key: per-character speed variation, high jitter on all elements.
     # Bug (semi-automatic): consistent dits, variable dahs + spacing.
     # Paddle (electronic keyer): consistent elements, variable spacing only.
-    key_type_weights: Tuple[float, float, float] = (0.33, 0.33, 0.34)
+    # Cootie (sideswiper): alternating contacts, symmetric but high jitter,
+    #   no inherent dit/dah length distinction — operator must time everything.
+    key_type_weights: Tuple[float, ...] = (0.25, 0.25, 0.25, 0.25)
 
     # Speed drift: slow WPM variation within a single transmission.
     # Fraction of base unit_dur (e.g. 0.15 = ±15%).  0.0 = constant speed.
     speed_drift_max: float = 0.0
+
+    # Farnsworth timing: characters sent at a faster speed (char_wpm) but
+    # inter-character and inter-word spaces stretched to achieve a slower
+    # effective speed (the configured WPM).  Common in CW training and some
+    # operators' natural style.  0.0 = disabled, otherwise probability of
+    # applying Farnsworth timing to a given sample.
+    farnsworth_probability: float = 0.0
+    # The character speed multiplier: char_wpm = wpm * farnsworth_char_speed_mult.
+    # E.g. 1.5 means characters sent 50% faster than overall effective speed.
+    farnsworth_char_speed_min: float = 1.3
+    farnsworth_char_speed_max: float = 2.0
+
+    # Keying waveform shaping: rise/fall time range for mark envelopes.
+    # Real transmitters have 2-8 ms rise/fall; 0 ms = hard keying (unrealistic).
+    # The default 5 ms is a good middle ground.
+    rise_time_ms_min: float = 3.0
+    rise_time_ms_max: float = 8.0
+
+    # QRM — interfering CW signals at nearby frequencies.
+    # Simulates other operators transmitting on adjacent frequencies.
+    qrm_probability: float = 0.0         # fraction of samples with QRM
+    qrm_count_min: int = 1               # min number of interferers
+    qrm_count_max: int = 3               # max number of interferers
+    qrm_freq_offset_min: float = 100.0   # min frequency offset from target (Hz)
+    qrm_freq_offset_max: float = 500.0   # max frequency offset from target (Hz)
+    qrm_amplitude_min: float = 0.1       # min amplitude relative to main signal
+    qrm_amplitude_max: float = 0.8       # max amplitude relative to main signal
+
+    # QRN — impulsive atmospheric noise (static crashes from lightning).
+    # Poisson-distributed impulses with random duration and amplitude.
+    qrn_probability: float = 0.0         # fraction of samples with QRN
+    qrn_rate_min: float = 0.5            # min impulse rate (per second)
+    qrn_rate_max: float = 5.0            # max impulse rate (per second)
+    qrn_duration_ms_min: float = 1.0     # min impulse duration (ms)
+    qrn_duration_ms_max: float = 50.0    # max impulse duration (ms)
+    qrn_amplitude_min: float = 0.3       # min impulse amplitude (relative to signal)
+    qrn_amplitude_max: float = 2.0       # max impulse amplitude (relative to signal)
+
+    # Receiver bandpass filter — simulates a real CW filter (200-500 Hz BW).
+    # Applied after all signal mixing, before normalisation.
+    bandpass_probability: float = 0.0     # fraction of samples with bandpass
+    bandpass_bw_min: float = 200.0        # min filter bandwidth (Hz)
+    bandpass_bw_max: float = 500.0        # max filter bandwidth (Hz)
+    bandpass_order: int = 4               # Butterworth filter order
+
+    # Real HF noise — mix recorded HF band noise instead of/with AWGN.
+    # Bridges the synthetic-to-real gap by using actual band characteristics.
+    hf_noise_probability: float = 0.0     # fraction of samples using real HF noise
+    hf_noise_dir: str = "recordings"      # directory containing noise WAV files
+    hf_noise_mix_ratio: float = 0.7       # fraction of noise that is real HF (rest is AWGN)
+
+    # Multi-operator speed change — abrupt WPM changes between words.
+    # Simulates operator changes on multi-op stations or natural speed variation.
+    multi_op_probability: float = 0.0     # fraction of samples with speed changes
+    multi_op_speed_change_min: float = 0.7   # min speed multiplier at change point
+    multi_op_speed_change_max: float = 1.4   # max speed multiplier at change point
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -393,8 +451,19 @@ def create_default_config(scenario: str = "clean") -> Config:
         # Real-world augmentations (mild -- model learns basic task first)
         cfg.morse.agc_probability = 0.3
         # qsb_probability left at 0.0 for clean stage
-        # Key type: mostly paddles (easiest) for clean stage
-        cfg.morse.key_type_weights = (0.20, 0.20, 0.60)
+        # Key type: mostly paddles (easiest) for clean stage; no cootie yet
+        cfg.morse.key_type_weights = (0.20, 0.20, 0.60, 0.0)
+        # Farnsworth: mild introduction (10% of samples, mild stretch)
+        cfg.morse.farnsworth_probability = 0.10
+        cfg.morse.farnsworth_char_speed_min = 1.2
+        cfg.morse.farnsworth_char_speed_max = 1.5
+        # Bandpass filter: mild introduction (20% of samples, wide filter)
+        cfg.morse.bandpass_probability = 0.20
+        cfg.morse.bandpass_bw_min = 400.0
+        cfg.morse.bandpass_bw_max = 500.0
+        # Real HF noise: mild introduction (15% of samples)
+        cfg.morse.hf_noise_probability = 0.15
+        cfg.morse.hf_noise_mix_ratio = 0.5
 
     elif scenario == "moderate":
         cfg.morse.min_snr_db = 8.0
@@ -424,10 +493,33 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.agc_depth_db_max = 18.0
         cfg.morse.qsb_probability = 0.25
         cfg.morse.qsb_depth_db_max = 12.0
-        # Key type: balanced mix
-        cfg.morse.key_type_weights = (0.30, 0.30, 0.40)
+        # Key type: balanced mix, introduce cootie
+        cfg.morse.key_type_weights = (0.25, 0.25, 0.35, 0.15)
         # Speed drift: mild ±8% WPM variation
         cfg.morse.speed_drift_max = 0.08
+        # Farnsworth: moderate (20% of samples)
+        cfg.morse.farnsworth_probability = 0.20
+        cfg.morse.farnsworth_char_speed_min = 1.3
+        cfg.morse.farnsworth_char_speed_max = 1.8
+        # QRM: light introduction (15% of samples, 1-2 interferers)
+        cfg.morse.qrm_probability = 0.15
+        cfg.morse.qrm_count_max = 2
+        cfg.morse.qrm_amplitude_max = 0.5
+        # QRN: light introduction (15% of samples)
+        cfg.morse.qrn_probability = 0.15
+        cfg.morse.qrn_rate_max = 3.0
+        cfg.morse.qrn_amplitude_max = 1.0
+        # Bandpass filter: moderate (40% of samples)
+        cfg.morse.bandpass_probability = 0.40
+        cfg.morse.bandpass_bw_min = 250.0
+        cfg.morse.bandpass_bw_max = 500.0
+        # Real HF noise: moderate (30% of samples)
+        cfg.morse.hf_noise_probability = 0.30
+        cfg.morse.hf_noise_mix_ratio = 0.6
+        # Multi-operator: light (10% of samples)
+        cfg.morse.multi_op_probability = 0.10
+        cfg.morse.multi_op_speed_change_min = 0.8
+        cfg.morse.multi_op_speed_change_max = 1.3
 
     elif scenario == "full":
         cfg.morse.min_snr_db = 3.0
@@ -458,10 +550,33 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.agc_depth_db_max = 22.0
         cfg.morse.qsb_probability = 0.50
         cfg.morse.qsb_depth_db_max = 18.0
-        # Key type: weighted toward harder key types (straight key, bug)
-        cfg.morse.key_type_weights = (0.40, 0.35, 0.25)
+        # Key type: weighted toward harder key types (straight key, bug, cootie)
+        cfg.morse.key_type_weights = (0.30, 0.30, 0.20, 0.20)
         # Speed drift: ±15% WPM variation within a transmission
         cfg.morse.speed_drift_max = 0.15
+        # Farnsworth: full range (25% of samples)
+        cfg.morse.farnsworth_probability = 0.25
+        cfg.morse.farnsworth_char_speed_min = 1.3
+        cfg.morse.farnsworth_char_speed_max = 2.0
+        # QRM: full strength (30% of samples, 1-3 interferers)
+        cfg.morse.qrm_probability = 0.30
+        cfg.morse.qrm_count_max = 3
+        cfg.morse.qrm_amplitude_max = 0.8
+        # QRN: full strength (25% of samples)
+        cfg.morse.qrn_probability = 0.25
+        cfg.morse.qrn_rate_max = 5.0
+        cfg.morse.qrn_amplitude_max = 2.0
+        # Bandpass filter: full (60% of samples, narrower filters)
+        cfg.morse.bandpass_probability = 0.60
+        cfg.morse.bandpass_bw_min = 200.0
+        cfg.morse.bandpass_bw_max = 500.0
+        # Real HF noise: full (50% of samples)
+        cfg.morse.hf_noise_probability = 0.50
+        cfg.morse.hf_noise_mix_ratio = 0.7
+        # Multi-operator: full (15% of samples, wider speed range)
+        cfg.morse.multi_op_probability = 0.15
+        cfg.morse.multi_op_speed_change_min = 0.7
+        cfg.morse.multi_op_speed_change_max = 1.4
 
     else:
         raise ValueError(
