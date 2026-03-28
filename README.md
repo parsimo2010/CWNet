@@ -1,174 +1,103 @@
-# CWNet — Event-Stream LSTM Morse Code Decoder
+# CWNet — Neural & Probabilistic Morse Code Decoders
 
-A compact, causal Morse code (CW) decoder that combines a DSP-based
-mark/space event detector with an LSTM neural network trained end-to-end
-with CTC loss. The feature extractor produces AGC-immune mark/space events;
-the LSTM consumes the event stream and outputs character probabilities.
+CWNet is an advanced Morse code (CW) decoding project pursuing multiple
+approaches to achieve maximum accuracy on human-sent CW. All training data
+is synthesised on the fly — no recorded audio is required.
+
+## Decoder Approaches
+
+### 1. Event-Stream LSTM (baseline)
+
+A compact causal decoder combining a DSP-based mark/space event detector
+with an LSTM neural network trained end-to-end with CTC loss. ~400K params.
+
+```
+Audio (16 kHz) → MorseEventExtractor → MorseEventFeaturizer (5-dim)
+  → LSTM (3×128) → CTC decode → text
+```
+
+### 2. Event-Stream Transformer
+
+A bidirectional transformer encoder on 10-dimensional enhanced event features
+with RoPE positional embeddings and CTC loss. ~1.2M params. Uses sliding-window
+inference with optional trigram language model beam search.
+
+```
+Audio (16 kHz) → MorseEventExtractor → EnhancedFeaturizer (10-dim)
+  → Transformer (6 layers, d=128) → CTC beam search + LM → text
+```
+
+### 3. CW-Former (Conformer)
+
+A Conformer model operating directly on mel spectrograms with convolutional
+subsampling and CTC loss. ~30-40M params. Bypasses the event extraction stage
+entirely.
+
+```
+Audio (16 kHz) → Mel spectrogram (80 bins) → Conv subsampling (4×)
+  → Conformer (12 layers, d=256) → CTC beam search + LM → text
+```
+
+### 4. Reference Decoder (non-neural)
+
+A fully probabilistic decoder using I/Q matched-filter front end, Bayesian
+timing classification, beam search with character trigram language model and
+word dictionary. No neural network.
 
 ## Key Design Choices
 
 | Aspect | Decision | Rationale |
 |---|---|---|
-| **Feature** | DSP mark/space event detector | AGC-immune; asymmetric EMA adapts in 1–2 frames |
-| **Output** | `MorseEvent` list (variable rate) | Duration + confidence per element; no fixed frame grid |
-| **Blip filter** | Configurable min frames per event | Suppresses noise pops without signal distortion |
-| **Featurizer** | 5-dim log-scale event vectors | Speed-invariant: same patterns at any WPM |
-| **Model** | Unidirectional LSTM (~155K params) | Event-by-event streaming with persistent hidden state |
-| **Loss** | CTC (connectionist temporal classification) | Handles variable-rate alignment without forced segmentation |
-| **Deployment** | Target: Raspberry Pi 4 / Zero 2W | Edge-first; compact model |
+| **Feature extraction** | Asymmetric EMA adaptive threshold, AGC-immune | Adapts in 1-2 frames; no noise floor estimation needed |
+| **Event features** | Log-scale ratios (5-dim baseline, 10-dim enhanced) | Speed-invariant: same timing patterns at any WPM |
+| **Training data** | Synthesised on the fly with extensive augmentations | AGC, QSB, QRM, QRN, bandpass, HF noise, 4 key types |
+| **Loss** | CTC (connectionist temporal classification) | Variable-rate alignment without forced segmentation |
+| **Language model** | Character trigram LM with beam search shallow fusion | Provides significant accuracy improvement post-CTC |
+| **Hardware** | Desktop CPU/GPU | No edge deployment constraint — accuracy over speed |
 
-## Architecture
-
-```
-Audio (16 kHz float32)
-  → MorseEventExtractor   : STFT → adaptive threshold → MorseEvent list
-  → MorseEventFeaturizer  : event → [is_mark, log_dur, confidence, log_ratio_mark, log_ratio_space]
-  → MorseEventModel       : Linear+LayerNorm+ReLU → LSTM(2×96) → Linear → log_softmax
-  → CTC decode            : greedy or beam search → text
-```
-
-### Feature Extraction
+## Feature Extraction (feature.py)
 
 The STFT (20 ms window, 5 ms hop) is computed at 16 kHz over a configurable
-frequency range (default 300–1200 Hz), giving 50 Hz/bin resolution (18 bins).
-The window was chosen for time resolution over frequency resolution: at 40 WPM
-a dit/space is ~30 ms, and the 20 ms window clears within 4 hops of any
-transition.
+frequency range (default 300-1200 Hz). Two asymmetric EMAs track mark and space
+levels independently:
 
-#### Asymmetric EMA adaptive threshold
+- **mark_ema**: fast upward, slow downward — captures signal onset in 1-2 frames
+- **space_ema**: fast downward, slow upward
 
-`MorseEventExtractor` in `feature.py` maintains two separate exponential
-moving averages that track signal levels asymmetrically:
+The adaptive threshold with 3-frame delay produces clean mark/space events
+even at signal onset. A blip filter suppresses noise pops shorter than the
+configurable threshold (default 15 ms).
 
-- **`mark_ema`** — fast pull-up when energy exceeds the current mark level,
-  slow release downward.  Captures a new signal in 1–2 frames.
-- **`space_ema`** — fast pull-down when energy drops below the current space
-  level, slow release upward.
-
-Both use a non-linear alpha: `alpha = 1 − exp(−|deviation| / FAST_DB)`
-(FAST_DB = 6 dB), so a large jump is captured in a single frame while
-small fluctuations move the EMA slowly.
-
-The per-frame energy feature E is:
-
-```
-center = 0.667 × mark_ema + 0.333 × space_ema   (weighted toward mark level)
-spread = max(mark_ema − space_ema, 10 dB)
-E      = tanh((peak_dB − center) × 3 / spread)   ∈ [-1, +1]
-```
-
-#### Delayed threshold application (15 ms)
-
-E is computed using a 3-frame retroactive delay: the EMA that drives the
-threshold is allowed to see 3 more frames before being applied to a given
-frame's peak energy.  This gives the EMA time to adapt before it evaluates
-the frames that caused it to change, producing clean mark/space separation
-immediately at signal onset.
-
-#### Mark/space event output
-
-Rather than a fixed-rate frame array, `process_chunk()` returns a list of
-`MorseEvent` objects:
-
-| Field | Description |
-|---|---|
-| `event_type` | `"mark"` (tone on) or `"space"` (tone off) |
-| `start_sec` | Stream-relative start time (seconds) |
-| `duration_sec` | Interval duration (seconds) |
-| `confidence` | Mean \|E\| over the interval, range [0, 1] |
-
-A **blip filter** suppresses short state changes: a transition is
-only confirmed after `blip_threshold_frames + 1` consecutive frames in the
-new state (default 3 frames / 15 ms). Shorter transitions are absorbed
-into the surrounding interval.
-
-| Scenario | Behaviour |
-|---|---|
-| AGC changes overall level | Both EMAs track the shift; threshold follows |
-| Signal onset after silence | mark_ema jumps in 1–2 frames; 3-frame delay compensates |
-| Noise pop (1 frame) | Absorbed by blip filter; not emitted as an event |
-| Strong mark | E ≈ +0.9, confidence ≈ 0.9 |
-| Clean space | E ≈ −0.9, confidence ≈ 0.9 |
-| Near-boundary (weak SNR) | E near 0, confidence near 0 |
-
-### Model
-
-The `MorseEventModel` is a lightweight unidirectional LSTM that processes
-one event at a time. Each `MorseEvent` is converted by `MorseEventFeaturizer`
-into a 5-dimensional feature vector with speed-invariant log-ratio features:
-
-| Feature | Description |
-|---|---|
-| `is_mark` | 1.0 for mark, 0.0 for space |
-| `log_duration` | log(duration + eps) — linearises multiplicative timing |
-| `confidence` | Mean \|E\| from extractor |
-| `log_ratio_prev_mark` | log(dur / prev_mark_dur) for marks; ~log(3) for dah after dit at any WPM |
-| `log_ratio_prev_space` | log(dur / prev_space_dur) for spaces; encodes gap ratios |
-
-The model (~155K parameters):
-1. Input projection: Linear(5→96) + LayerNorm + ReLU
-2. LSTM: 2 layers × 96 hidden, unidirectional
-3. Output: Linear(96→52) → log_softmax
-
-No time-axis downsampling — one CTC output per input event.
+Output is a variable-rate list of `MorseEvent` objects (type, start, duration, confidence).
 
 ## Training Data
 
-All training data is synthesised on the fly; no recorded audio is required.
+All training data is generated on the fly with curriculum learning:
 
-| Parameter | Clean stage | Full stage |
-|---|---|---|
-| SNR | 15–40 dB | 3–30 dB |
-| WPM | 10–40 | 5–50 |
-| `dah_dit_ratio` | 2.5–3.5 | 1.3–4.0 |
-| `ics_factor` (×3-dit gap) | 0.8–1.2 | 0.5–2.0 |
-| `iws_factor` (×7-dit gap) | 0.8–1.5 | 0.5–2.5 |
-| timing jitter | 0–5 % | 0–25 % |
-| noise | white AWGN | white AWGN |
-| frequency drift | ±3 Hz | ±5 Hz |
-| AGC simulation | 30% samples, 6–15 dB depth | 70% samples, 6–22 dB depth |
-| QSB fading | disabled | 50% samples, 3–18 dB p-p |
-| key type | 20/20/60 straight/bug/paddle | 40/35/25 straight/bug/paddle |
-| speed drift | disabled | ±15 % within transmission |
+| Parameter | Clean | Moderate | Full |
+|---|---|---|---|
+| SNR | 15-40 dB | 8-35 dB | 3-30 dB |
+| WPM | 10-40 | 8-45 | 5-50 |
+| dah/dit ratio | 2.5-3.5 | 1.8-3.8 | 1.3-4.0 |
+| Timing jitter | 0-5% | 0-15% | 0-25% |
+| Key types (S/B/P/C) | 20/20/60/0 | 25/25/35/15 | 30/30/20/20 |
+| AGC simulation | 30% | 50% | 70% |
+| QSB fading | 0% | 25% | 50% |
+| QRM (interferers) | - | 15% (1-2) | 30% (1-3) |
+| QRN (static) | - | 15% | 25% |
+| Bandpass filter | 20% | 40% | 60% |
+| HF noise mixing | 15% | 30% | 50% |
 
-`dah_dit_ratio`, `ics_factor`, and `iws_factor` are sampled **independently** per sample
-to cover the wide range of real-world operator timing styles.
+Four key types are simulated: straight key, bug (semi-automatic), paddle
+(electronic keyer), and cootie (sideswiper), each with distinct timing signatures.
 
-**Key type simulation** — each training sample is generated with one of three key types,
-each producing distinct timing signatures:
-- **Straight key**: per-character speed variation (simpler characters keyed faster),
-  per-element dah/dit ratio variation, highest overall jitter.
-- **Bug (semi-automatic)**: mechanically consistent dits, manually timed dahs with
-  moderate jitter and per-dah ratio variation.
-- **Paddle (electronic keyer)**: electronically consistent elements, operator-controlled
-  inter-character and inter-word spacing.
-
-**Event-stream augmentations** applied in the direct event generator:
-- **Merged events**: when jitter pushes inter-element spaces below 12 ms, adjacent marks
-  merge into a single longer mark (simulating the feature extractor's blip filter).
-- **Dit dropout**: short marks are probabilistically dropped at low SNR (simulating
-  missed detections below the blip filter threshold).
-- **Noise spurious events**: brief false mark detections injected in spaces at low SNR,
-  capped at 2 per sample.
-
-**AGC simulation** models real HF radio automatic gain control: noise amplitude is
-attenuated during marks (fast attack, ~50 ms) and released during spaces (slow release,
-~400 ms).  This reproduces the characteristic noise-floor rise seen between elements in
-real recordings.
-
-**QSB** adds slow sinusoidal amplitude fading (0.05–0.3 Hz) to capture mark-to-mark
-signal strength variation from HF propagation.
-
-## Vocabulary
-
-52-class CTC vocabulary: blank (0), space (1), A–Z, 0–9,
-punctuation `.,?/(&=+` (5-element sequences, common on air),
-and prosigns AR, SK, BT, KN, AS, CT.
+50% of training text is generated by a QSO corpus generator that produces
+realistic amateur radio exchanges (callsigns, signal reports, QSO patterns).
 
 ## Installation
 
 ```bash
-pip install torch torchaudio numpy scipy soundfile jiwer tqdm
+pip install torch torchaudio numpy scipy soundfile tqdm
 ```
 
 Optional (for live audio):
@@ -178,127 +107,120 @@ pip install sounddevice
 
 ## Training
 
+### LSTM baseline
 ```bash
-# Stage 1: high SNR, standard timing (200 epochs)
 python train.py --scenario clean
-
-# Stage 2: resume from clean, full noise envelope (500 more epochs)
-python train.py --scenario full \
-    --checkpoint_file checkpoints/best_model_clean.pt \
-    --additional_epochs 500
-
-# Quick pipeline test (~5 epochs)
-python train.py --scenario test
-
-# Multi-model initial training (train N models, select best)
-python train.py --scenario clean \
-    --num_initial_models 5 \
-    --initial_epochs 5
-
-# Use a custom config JSON
-python train.py --config my_config.json
+python train.py --scenario full --checkpoint_file checkpoints/best_model_clean.pt
 ```
 
-Training produces a CSV log (`checkpoints/training_log_<scenario>.csv`) with:
-- `train_loss`, `val_loss` — CTC loss
-- `greedy_cer` — greedy-decode CER, computed every epoch
-- `beam_cer` — beam-search CER, computed every 50 epochs (NaN otherwise)
+### Event Transformer
+```bash
+# Clean stage
+python -m neural_decoder.train_event_transformer --scenario clean --workers 8
+
+# Full stage (resume from clean checkpoint)
+python -m neural_decoder.train_event_transformer --scenario full --workers 8 \
+    --batch-size 64 --max-events 600 \
+    --checkpoint checkpoints_transformer/best_model.pt
+```
+
+### CW-Former
+```bash
+# Clean stage
+python -m neural_decoder.train_cwformer --scenario clean --workers 12 --batch-size 8
+
+# Full stage (resume)
+python -m neural_decoder.train_cwformer --scenario full --workers 12 \
+    --checkpoint checkpoints_cwformer/best_model.pt
+```
+
+Training produces CSV logs in the checkpoint directory with train/val loss,
+greedy CER (every epoch), and beam CER (every 50 epochs).
 
 ## Inference
 
-### CLI
-
+### LSTM baseline
 ```bash
-# Decode a WAV file (greedy)
 python inference.py --checkpoint checkpoints/best_model.pt --input morse.wav
-
-# Decode with beam search
 python inference.py --checkpoint checkpoints/best_model.pt --input morse.wav --beam-width 10
+```
 
-# Sliding-window offline decoder
-python inference.py --checkpoint checkpoints/best_model.pt --input morse.wav --sliding
+### Event Transformer
+```bash
+python -m neural_decoder.inference_transformer \
+    --checkpoint checkpoints_transformer/best_model.pt \
+    --input morse.wav --beam-width 15 --lm trigram_lm.json --lm-weight 0.1
+```
 
-# Live decoding from default audio device
+### Live decoding (LSTM)
+```bash
 python listen.py --checkpoint checkpoints/best_model.pt --device
-
-# Live decoding, monitoring 600-900 Hz only
 python listen.py --checkpoint checkpoints/best_model.pt --device --freq-min 600 --freq-max 900
 
-# Pipe from rtl_fm
+# Pipe from SDR
 rtl_fm -f 7.040M -M usb -s 44100 | \
     python listen.py --checkpoint checkpoints/best_model.pt --stdin --sample-rate 44100
 ```
 
-### Python API (streaming pattern)
+## Vocabulary
 
-```python
-from feature import MorseEventExtractor
-from model import MorseEventFeaturizer, MorseEventModel
-from config import FeatureConfig, ModelConfig
-import vocab
-import torch
-
-# Setup
-extractor  = MorseEventExtractor(FeatureConfig())
-featurizer = MorseEventFeaturizer()
-model      = MorseEventModel()
-hidden     = None
-lp_buffer  = []
-
-# Stream events
-for audio_chunk in audio_source.stream():
-    events = extractor.process_chunk(audio_chunk)
-    for event in events:
-        feat = featurizer.featurize(event)
-        x = torch.tensor(feat).unsqueeze(0).unsqueeze(0)  # (1, 1, 5)
-        lp, hidden = model.streaming_step(x, hidden)
-        lp_buffer.append(lp.squeeze(1))
-
-# Decode at any time
-events += extractor.flush()
-all_lp = torch.cat(lp_buffer, dim=0)
-text = vocab.beam_search_ctc(all_lp)
-```
-
-## Deployment (Raspberry Pi)
-
-```bash
-# INT8 quantization (benchmark + save)
-python quantize.py --checkpoint checkpoints/best_model.pt
-
-# Also export ONNX for ONNX Runtime
-python quantize.py --checkpoint checkpoints/best_model.pt --onnx
-```
-
-Performance targets (single thread):
-- **RPi 4 fp32**: ~3–5 ms per 100 ms chunk
-- **RPi 4 INT8**: ~1–2 ms per 100 ms chunk
-- **RPi Zero 2W INT8**: ~8–15 ms per 100 ms chunk
+52-class CTC vocabulary: blank (0), space (1), A-Z, 0-9,
+punctuation `.,?/(&=+`, and prosigns AR, SK, BT, KN, AS, CT.
 
 ## File Structure
 
-| File | Purpose |
-|---|---|
-| `config.py` | `MorseConfig`, `FeatureConfig`, `ModelConfig`, `TrainingConfig` |
-| `vocab.py` | 52-class CTC vocabulary + greedy/beam decode utilities |
-| `morse_table.py` | ITU Morse code table + binary trie |
-| `feature.py` | STFT → adaptive threshold → MorseEvent extractor |
-| `model.py` | MorseEventFeaturizer + MorseEventModel (LSTM CTC) |
-| `morse_generator.py` | Synthetic Morse audio generator |
-| `dataset.py` | Streaming on-the-fly training dataset (event-based) |
-| `train.py` | Training loop with multi-model start + CER tracking |
-| `inference.py` | CausalStreamingDecoder + StreamingDecoder (event-stream) |
-| `source.py` | Audio source abstraction (file / device / stdin) |
-| `listen.py` | Live and file decode CLI |
-| `quantize.py` | INT8 quantization + ONNX export |
-| `analyze.py` | Debug visualization (3-panel: waveform / energy / events) |
+```
+CWNet/
+├── config.py                  # All configuration (MorseConfig, FeatureConfig, etc.)
+├── vocab.py                   # 52-class CTC vocabulary + decode utilities
+├── morse_table.py             # ITU Morse code table + binary trie
+├── feature.py                 # STFT → adaptive threshold → MorseEvent extractor
+├── fast_feature.py            # Numba-accelerated feature extraction
+├── model.py                   # LSTM baseline (MorseEventFeaturizer + MorseEventModel)
+├── morse_generator.py         # Synthetic Morse audio/event generator
+├── dataset.py                 # Streaming dataset for LSTM baseline
+├── train.py                   # LSTM training loop
+├── inference.py               # LSTM inference (causal + sliding-window)
+├── source.py                  # Audio source abstraction (file/device/stdin)
+├── listen.py                  # Live decode CLI
+├── analyze.py                 # Debug visualization (waveform/energy/events)
+├── quantize.py                # INT8 quantization + ONNX export
+├── qso_corpus.py              # QSO corpus generator + CharTrigramLM
+├── build_lm.py                # Build trigram LM → trigram_lm.json
+├── trigram_lm.json            # Pre-built character trigram language model
+│
+├── neural_decoder/            # Transformer-based decoders
+│   ├── event_transformer.py   # Event Transformer model (RoPE + CTC)
+│   ├── enhanced_featurizer.py # 10-dim enhanced event features
+│   ├── rope.py                # Rotary Position Embeddings
+│   ├── dataset_events.py      # Streaming dataset (events)
+│   ├── train_event_transformer.py
+│   ├── inference_transformer.py
+│   ├── cwformer.py            # CW-Former model (Conformer + CTC)
+│   ├── conformer.py           # Conformer encoder blocks
+│   ├── mel_frontend.py        # Mel spectrogram + SpecAugment
+│   ├── dataset_audio.py       # Streaming dataset (audio)
+│   ├── train_cwformer.py
+│   ├── inference_cwformer.py
+│   ├── ctc_decode.py          # CTC beam search with LM fusion
+│   └── eval.py                # Evaluation utilities
+│
+├── reference_decoder/         # Non-neural probabilistic decoder
+│   ├── iq_frontend.py         # I/Q matched-filter front end
+│   ├── freq_tracker.py        # Frequency tracking
+│   ├── timing_model.py        # Bayesian timing classification
+│   ├── key_detector.py        # Key type detection
+│   ├── beam_decoder.py        # Beam search with language model
+│   ├── language_model.py      # LM integration
+│   ├── qso_tracker.py         # QSO structure tracking
+│   ├── decoder.py             # Main decoder pipeline
+│   └── cli.py                 # CLI entry point
+│
+└── morse_decoding_research.md # Research survey & design rationale
+```
 
-## Metrics
+## Performance Targets
 
-Character Error Rate (CER) is computed using [jiwer](https://github.com/jitsi/jiwer):
-- **Greedy CER**: logged every epoch (fast).
-- **Beam CER**: logged every 50 epochs (slow; more representative of deployment accuracy).
-
-Target performance:
-- Clean signals (SNR > 15 dB, standard timing): **< 2 % CER**
-- Challenging (SNR 5–15 dB, bad-fist timing): **< 10 % CER**
+- Primary window (15-40 WPM, any key type, SNR > 8 dB): < 2% CER
+- Extended (10-45 WPM, moderate timing variance): < 5% CER
+- Challenging (SNR 5-15 dB, bad-fist): < 10% CER

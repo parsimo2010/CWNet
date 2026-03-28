@@ -2,13 +2,47 @@
 
 ## Project Intent & Goals
 
-CWNet is a Morse code (CW) decoder combining a DSP-based mark/space event detector with a neural network. The feature extractor does the heavy lifting of AGC compensation and noise discrimination; the model consumes the resulting event stream.
+CWNet is an advanced Morse code (CW) decoder project pursuing two parallel approaches to achieve maximum decoding accuracy on human-sent CW:
 
-**Key design philosophy:** Use asymmetric EMA adaptive thresholding to produce AGC-immune mark/space events before the model ever sees the data. This is the project's core differentiator.
+1. **Reference Decoder** (`reference_decoder/`): A fully probabilistic, non-neural decoder using I/Q matched-filter front end, Bayesian timing classification with RWE speed tracking, beam search with character trigram language model and word dictionary. No hardware constraints.
+
+2. **Neural Decoder** (`neural_decoder/`): A transformer-based decoder in two variants — CW-Former (Conformer on raw mel spectrograms, ~30-40M params) and Event-Stream Transformer (transformer on MorseEvent features, ~2-5M params). Both use CTC loss with language model integration. No hardware constraints.
+
+**Design philosophy:** Never make hard decisions — propagate probabilities through every stage. Use the best published ideas from seven decades of CW decoding research (see `morse_decoding_research.md`). Both approaches must handle any key type (straight, bug, paddle, cootie) on human-sent code.
+
+**Key reference:** `morse_decoding_research.md` contains the full research survey, architectural recommendations, and design rationale. Read it for context on any design decisions.
+
+**Target performance:** 15–40 WPM primary window, any key type, SNR > 5–8 dB. Accuracy over speed range — narrower optimal window acceptable if CER improves significantly. Edge deployment (RPi) is no longer a constraint.
 
 ---
 
-## Architecture Overview
+## Current State & Active Development
+
+The project has three decoder paths:
+
+### Existing (baseline)
+- **LSTM event-stream decoder**: `model.py` + `feature.py` + `inference.py` — the original pipeline. ~400K params, event-based, STFT front end. Works but limited by LSTM sequence modeling and lack of language model.
+- **Streaming reference decoder**: `decode_streaming.py` + `decode_utils.py` — non-neural beam search with Gaussian timing model. Good baseline but uses hard clustering and lacks language model integration.
+
+### Under development
+- **Advanced reference decoder** (`reference_decoder/`): I/Q matched filter, Bayesian classification, RWE speed tracking, language model, QSO structure tracking. See `reference_decoder/PLAN.md`.
+- **Event-Stream Transformer** (`neural_decoder/`): ~1.2M params, bidirectional transformer with RoPE on 10-dim enhanced features, CTC loss. Trained clean→moderate→full curriculum. **Currently retraining on audio-extracted events** (previously trained with `--use-direct` which caused train/inference domain gap — model produced gibberish on real audio). Training at ~30 min/epoch on full scenario.
+- **CW-Former** (`neural_decoder/`): Conformer on mel spectrograms, ~30-40M params, CTC loss. Not yet trained. Must train from audio (no direct event shortcut).
+
+### Shared infrastructure
+- `qso_corpus.py` + `build_lm.py` — QSO corpus generator and character trigram language model builder
+- `trigram_lm.json` — pre-built character trigram LM used by beam search decoders
+- `neural_decoder/ctc_decode.py` — CTC beam search with LM shallow fusion
+- `neural_decoder/enhanced_featurizer.py` — 10-dim feature vectors for event transformer
+- `neural_decoder/dataset_events.py` / `dataset_audio.py` — streaming datasets for event transformer / CW-Former
+- `vocab.py`, `morse_table.py`, `morse_generator.py` — shared across all approaches
+
+### Key lesson: direct events vs audio training
+**`generate_events_direct()` must not be used as the sole training path for models that will decode real audio.** Direct event generation produces idealized MorseEvent objects with synthetic timing/confidence. Real audio through `MorseEventExtractor` produces noisier events with different confidence distributions, missed dits, merged marks, etc. The Event Transformer was initially trained entirely with `--use-direct` and produced gibberish on real recordings. It is now being retrained with audio-extracted events (`direct_events=False`).
+
+---
+
+## Architecture Overview (Legacy — Baseline LSTM)
 
 ```
 Audio (16 kHz float32)
@@ -20,7 +54,7 @@ Audio (16 kHz float32)
   → vocab.py    : CTC decode → text
 ```
 
-The pipeline is fully event-based: the feature extractor emits variable-rate
+The baseline pipeline is fully event-based: the feature extractor emits variable-rate
 MorseEvent objects, the featurizer converts them to fixed-dimension vectors,
 and the LSTM processes them one event at a time with persistent hidden state.
 
@@ -106,7 +140,7 @@ and the LSTM processes them one event at a time with persistent hidden state.
 - `synthesize_audio(elements, ...)` → float32 waveform
 - `generate_events_direct(config, ...)` → `(list[MorseEvent], text, metadata)` — ~100× faster than audio path
 - `CW_ABBREVIATIONS` — common CW terms (CQ, DE, 73, QTH, RST, etc.) mixed into generated text (~15%)
-- Augmentations: AGC simulation (fast attack ~50ms / slow release ~400ms), QSB fading (0.05–0.3 Hz), frequency drift (±3–5 Hz), timing jitter (0–25%), bad-fist dah/dit ratios, key type simulation, speed drift, merged events, dit dropout, noise spurious events
+- Augmentations: AGC simulation (fast attack ~50ms / slow release ~400ms), QSB fading (0.05–0.3 Hz), frequency drift (±3–5 Hz), timing jitter (0–25%), bad-fist dah/dit ratios, key type simulation (straight/bug/paddle/cootie), speed drift, merged events, dit dropout, noise spurious events, Farnsworth timing (stretched spacing), variable keying waveform shaping (3–8 ms rise/fall), QRM (1–3 interfering CW signals at ±100–500 Hz), QRN (impulsive atmospheric static crashes), receiver bandpass filter (200–500 Hz Butterworth), real HF noise mixing (recorded 20m/40m band noise), multi-operator speed changes (abrupt WPM steps at word boundaries)
 
 ### dataset.py — Training data pipeline
 - `StreamingMorseDataset(config, epoch_size, seed=None)` — IterableDataset, no pre-gen files
@@ -168,22 +202,61 @@ and the LSTM processes them one event at a time with persistent hidden state.
 - Event timeline panel: marks as blue bars above zero, spaces as coral bars below zero; bar height = confidence
 - Internal sample rate: 16 kHz (resamples from any source)
 
+### neural_decoder/ — Transformer-based decoders
+
+#### Event-Stream Transformer
+- `event_transformer.py` — `EventTransformerModel` (~1.2M params): bidirectional transformer encoder with RoPE, CTC head. Input: (T, B, 10) enhanced features → (T, B, 52) log-probs. Config: d_model=128, n_heads=4, n_layers=6, d_ff=512.
+- `enhanced_featurizer.py` — `EnhancedFeaturizer`: converts MorseEvent → 10-dim feature vectors (is_mark, log_duration, confidence, log_ratio_prev_mark, log_ratio_prev_space, log_ratio_same, dit_estimate_log, mark_space_ratio, log_gap_since_mark, duration_zscore). Stateful — maintains running dit estimate and mark/space statistics.
+- `rope.py` — Rotary Position Embeddings for speed-invariant relative positioning.
+- `dataset_events.py` — `EventTransformerDataset`: streaming IterableDataset. Supports both audio path (generate_sample → MorseEventExtractor → EnhancedFeaturizer) and direct path (generate_events_direct → EnhancedFeaturizer). `max_events` parameter controls sequence length cap (default 400, use 600 for full scenario).
+- `train_event_transformer.py` — Training loop with curriculum, gradient accumulation, AMP, cosine LR. Persistent workers, prefetch_factor=4. Resets best_val_loss when scenario changes.
+- `inference_transformer.py` — `TransformerDecoder`: sliding-window bidirectional decoding (default 3s window, 1.5s stride). Supports greedy, beam search, and LM-augmented beam search. Window merging via character-position ratio (crude — known limitation).
+
+#### CW-Former (Conformer)
+- `cwformer.py` — `CWFormer` (~30-40M params): MelFrontend → ConvSubsampling (4× time reduction) → ConformerEncoder → CTC head. Config: d_model=256, n_heads=4, n_layers=12, d_ff=1024, conv_kernel=31.
+- `mel_frontend.py` — `MelFrontend`: raw audio → STFT (25ms/10ms) → 80-bin mel filterbank (0–4000 Hz) → log compression → SpecAugment (freq + time masking).
+- `conformer.py` — Conformer blocks: feed-forward → multi-head self-attention → convolution module → feed-forward (Macaron style).
+- `dataset_audio.py` — `AudioDataset`: streaming IterableDataset producing raw audio waveforms. Audio generation is CPU-bound bottleneck (~5-15s of 16kHz per sample).
+- `train_cwformer.py` — Training loop. Smaller batches (micro=8, effective=64) due to audio memory. Persistent workers, prefetch_factor=4. 20K samples/epoch (reduced from baseline due to audio generation cost).
+- `inference_cwformer.py` — CW-Former inference.
+
+#### Shared neural decoder infrastructure
+- `ctc_decode.py` — `beam_search_with_lm()`: Graves 2012 prefix beam search with character trigram LM shallow fusion. Scoring: `log_ctc + lm_weight * log_lm + word_bonus`.
+- `eval.py` — Evaluation utilities for neural decoders.
+
+### reference_decoder/ — Advanced probabilistic decoder
+- `iq_frontend.py` — I/Q matched-filter front end
+- `freq_tracker.py` — Frequency tracking
+- `timing_model.py` — Bayesian timing classification
+- `key_detector.py` — Key type detection (straight/bug/paddle/cootie)
+- `beam_decoder.py` — Beam search decoder with language model
+- `language_model.py` — Language model integration
+- `qso_tracker.py` — QSO structure tracking
+- `decoder.py` — Main decoder pipeline
+- `cli.py` / `__main__.py` — CLI entry point
+
+### Shared root-level infrastructure
+- `qso_corpus.py` — `QSOCorpusGenerator`: generates realistic amateur radio QSO text (callsigns, signal reports, exchanges)
+- `build_lm.py` — Builds character trigram LM from QSO corpus → `trigram_lm.json`
+- `fast_feature.py` — Numba-accelerated feature extraction (used in training data pipeline)
+
 ---
 
 ## Curriculum Learning
 
-| Stage | SNR | WPM | AGC | QSB | Timing | Key Types |
-|-------|-----|-----|-----|-----|--------|-----------|
-| clean | 15–40 dB | 10–40 | 30% | 0% | near-ITU (dah/dit 2.5–3.5, ics 0.8–1.2, iws 0.8–1.5) | 20/20/60 straight/bug/paddle |
-| moderate | 8–35 dB | 8–45 | 50%, depth 6–18 dB | 25%, depth 3–12 dB | moderate bad-fist (dah/dit 1.8–3.8, ics 0.6–1.6, iws 0.6–2.0, jitter 0–15%) | 30/30/40 straight/bug/paddle |
-| full  | 3–30 dB  | 5–50  | 70%, depth 6–22 dB | 50%, depth 3–18 dB | bad-fist (dah/dit 1.3–4.0, ics 0.5–2.0, iws 0.5–2.5, jitter 0–25%) | 40/35/25 straight/bug/paddle |
+| Stage | SNR | WPM | AGC | QSB | Timing | Key Types | Audio Augmentations |
+|-------|-----|-----|-----|-----|--------|-----------|---------------------|
+| clean | 15–40 dB | 10–40 | 30% | 0% | near-ITU (dah/dit 2.5–3.5, ics 0.8–1.2, iws 0.8–1.5) | 20/20/60/0 S/B/P/C | 10% Farnsworth, 20% bandpass (400–500 Hz), 15% HF noise |
+| moderate | 8–35 dB | 8–45 | 50%, depth 6–18 dB | 25%, depth 3–12 dB | moderate bad-fist (dah/dit 1.8–3.8, ics 0.6–1.6, iws 0.6–2.0, jitter 0–15%) | 25/25/35/15 S/B/P/C | 20% Farnsworth, 15% QRM (1–2), 15% QRN, 40% bandpass (250–500 Hz), 30% HF noise, 10% multi-op |
+| full  | 3–30 dB  | 5–50  | 70%, depth 6–22 dB | 50%, depth 3–18 dB | bad-fist (dah/dit 1.3–4.0, ics 0.5–2.0, iws 0.5–2.5, jitter 0–25%) | 30/30/20/20 S/B/P/C | 25% Farnsworth, 30% QRM (1–3), 25% QRN, 60% bandpass (200–500 Hz), 50% HF noise, 15% multi-op |
 
 Timing params (dah_dit_ratio, ics_factor, iws_factor) are **sampled independently per sample** — this is critical for robustness.
 
-**Key type simulation** — each sample is generated with one of three key types:
+**Key type simulation** — each sample is generated with one of four key types:
 - **Straight key**: per-character speed variation (simpler chars keyed faster), per-element dah/dit ratio variation, highest overall jitter.
 - **Bug (semi-automatic)**: mechanical dits (~15% of configured jitter), manual dahs (~80% jitter + per-dah ratio variation), manual spacing.
 - **Paddle (electronic keyer)**: electronic elements (~10% jitter), operator-controlled spacing (~60% jitter).
+- **Cootie (sideswiper)**: alternating contacts, symmetric high jitter (~90%) on all elements, dah/dit ratio compression (dahs shorter, dits longer than intended).
 
 **Additional full-stage augmentations** applied in `generate_events_direct`:
 - **Speed drift**: ±15% sinusoidal WPM modulation across word boundaries within a transmission.
@@ -203,19 +276,27 @@ Timing params (dah_dit_ratio, ics_factor, iws_factor) are **sampled independentl
 ---
 
 ## Performance Targets
-- Clean (SNR > 15 dB, standard timing): < 2% CER
-- Challenging (SNR 5–15 dB, bad-fist): < 10% CER
-- RPi 4 INT8: ~1–2ms per 100ms chunk | RPi Zero 2W INT8: ~8–15ms per chunk
+- Primary window (15–40 WPM, any key type, SNR > 8 dB): < 2% CER goal
+- Extended (10–45 WPM, moderate timing variance): < 5% CER goal
+- Challenging (SNR 5–15 dB, bad-fist): < 10% CER goal
+- Hardware: Desktop CPU/GPU — no edge deployment constraint
 
 ---
 
 ## Things to Keep in Mind
 
-1. **feature.py is the key differentiator** — asymmetric EMA adaptive threshold with no floor clamps. Any changes must maintain AGC-immunity.
+1. **feature.py is the key differentiator** — asymmetric EMA adaptive threshold with no floor clamps. Any changes must maintain AGC-immunity. The reference decoder may use an I/Q matched filter instead, but feature.py remains the front end for neural decoders.
 2. **Event output is variable-rate** — `process_chunk` returns `list[MorseEvent]`, not an ndarray. Always call `flush()` at end of stream.
 3. **Blip filter is configurable** — `blip_threshold_frames` (default 2) means transitions require 3 consecutive frames (15ms) to confirm. Minimum detectable event = 10ms at 200fps.
 4. **Delay is 3 frames (15ms)** — peak_db from 3 frames ago is evaluated against the current adapted EMA center.
-5. **Deployment target is edge** — keep model compact; Raspberry Pi 4 / Zero 2W. Current model is ~400K params.
-6. **Sample rate is 16 kHz** — all audio is resampled to 16 kHz internally. Config defaults reflect this.
-7. **Log-ratio features are speed-invariant** — the model learns one set of timing patterns that works at any WPM via the LSTM hidden state.
+5. **No hardware constraint** — models can be as large as needed. Desktop CPU/GPU target. Edge deployment is no longer a goal.
+6. **Sample rate is 16 kHz** — all audio is resampled to 16 kHz internally. Config defaults reflect this. May benchmark 8 kHz for CW-Former.
+7. **Log-ratio features are speed-invariant** — the model learns one set of timing patterns that works at any WPM via the LSTM hidden state or transformer attention.
 8. **Boundary space tokens** — dataset wraps targets with `[space] + encode(text) + [space]` to supervise leading/trailing silence events explicitly.
+9. **Never make hard decisions** — the core design principle from CW Skimmer research. Propagate probabilities through every stage.
+10. **Language model integration is critical** — research shows LM post-processing provides enormous leverage. Both decoders must integrate character trigram LM and word dictionary.
+11. **Two plans exist** — see `reference_decoder/PLAN.md` and `neural_decoder/PLAN.md` for detailed implementation plans. Work alternates between them.
+12. **morse_decoding_research.md** — comprehensive research survey. Read it for context on any CW decoding design decision.
+13. **Never train with `--use-direct` only** — direct event generation skips the audio→MorseEventExtractor path, creating a train/inference domain gap. Models trained only on direct events produce gibberish on real audio. Always include audio-path training, at minimum for the final curriculum stage.
+14. **Training scripts reset best_val_loss on scenario change** — when resuming a checkpoint from a different scenario (e.g., clean→full), best_val_loss resets to infinity so best_model.pt reflects the current scenario's best, not a stale value from an easier stage.
+15. **DataLoader tuning for audio-heavy training** — use `persistent_workers=True`, `prefetch_factor=4`, and as many workers as CPU cores allow. Audio generation in `generate_sample()` is the bottleneck; more workers = better GPU utilization. Monitor with `nvidia-smi`.
