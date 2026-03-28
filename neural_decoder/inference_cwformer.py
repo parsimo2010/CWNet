@@ -119,6 +119,10 @@ class CWFormerDecoder:
         beam_width: CTC beam search width (1 = greedy).
         lm_path: Path to trigram_lm.json for LM-augmented beam search.
         lm_weight: LM shallow fusion weight.
+        dict_bonus: Dictionary word bonus at word boundaries.
+        callsign_bonus: Callsign pattern bonus at word boundaries.
+        non_dict_penalty: Penalty for non-dictionary words at word boundaries.
+        use_dict: Whether to load and use the CW dictionary.
     """
 
     def __init__(
@@ -130,12 +134,19 @@ class CWFormerDecoder:
         beam_width: int = 1,
         lm_path: Optional[str] = None,
         lm_weight: float = 0.3,
+        dict_bonus: float = 3.0,
+        callsign_bonus: float = 1.8,
+        non_dict_penalty: float = -0.5,
+        use_dict: bool = True,
     ) -> None:
         self.device = torch.device(device)
         self.window_sec = window_sec
         self.stride_sec = stride_sec
         self.beam_width = beam_width
         self.lm_weight = lm_weight
+        self.dict_bonus = dict_bonus
+        self.callsign_bonus = callsign_bonus
+        self.non_dict_penalty = non_dict_penalty
 
         self._model, self._model_cfg, self.sample_rate = (
             _load_cwformer_checkpoint(checkpoint, self.device)
@@ -154,6 +165,16 @@ class CWFormerDecoder:
         if lm_path and Path(lm_path).exists():
             from qso_corpus import CharTrigramLM
             self._lm = CharTrigramLM.load(lm_path)
+
+        # Load dictionary
+        self._dictionary = None
+        if use_dict:
+            try:
+                from qso_corpus import CWDictionary
+                self._dictionary = CWDictionary()
+                self._dictionary.build_default()
+            except Exception:
+                pass
 
     def decode_file(self, path: str) -> str:
         """Decode an entire audio file.
@@ -287,17 +308,17 @@ class CWFormerDecoder:
             return ""
 
         if self.beam_width > 1:
-            if self._lm is not None:
-                from neural_decoder.ctc_decode import beam_search_with_lm
-                return beam_search_with_lm(
-                    log_probs,
-                    lm=self._lm,
-                    lm_weight=self.lm_weight,
-                    beam_width=self.beam_width,
-                    strip_trailing_space=True,
-                )
-            return vocab_module.beam_search_ctc(
-                log_probs, beam_width=self.beam_width, strip_trailing_space=True,
+            from neural_decoder.ctc_decode import beam_search_with_lm
+            return beam_search_with_lm(
+                log_probs,
+                lm=self._lm,
+                dictionary=self._dictionary,
+                lm_weight=self.lm_weight,
+                dict_bonus=self.dict_bonus,
+                callsign_bonus=self.callsign_bonus,
+                non_dict_penalty=self.non_dict_penalty,
+                beam_width=self.beam_width,
+                strip_trailing_space=True,
             )
 
         return vocab_module.decode_ctc(log_probs, strip_trailing_space=True)
@@ -328,6 +349,17 @@ def main():
     parser.add_argument("--lm-weight", type=float, default=0.3,
                         dest="lm_weight",
                         help="LM shallow fusion weight")
+    parser.add_argument("--dict-bonus", type=float, default=3.0,
+                        dest="dict_bonus",
+                        help="Dictionary word bonus at word boundaries")
+    parser.add_argument("--callsign-bonus", type=float, default=1.8,
+                        dest="callsign_bonus",
+                        help="Callsign pattern bonus at word boundaries")
+    parser.add_argument("--non-dict-penalty", type=float, default=-0.5,
+                        dest="non_dict_penalty",
+                        help="Penalty for non-dictionary words (0=off)")
+    parser.add_argument("--no-dict", action="store_true", dest="no_dict",
+                        help="Disable dictionary scoring")
     parser.add_argument("--device", default="cpu",
                         help="Device (cpu or cuda)")
 
@@ -341,10 +373,15 @@ def main():
         beam_width=args.beam_width,
         lm_path=args.lm,
         lm_weight=args.lm_weight,
+        dict_bonus=args.dict_bonus,
+        callsign_bonus=args.callsign_bonus,
+        non_dict_penalty=args.non_dict_penalty,
+        use_dict=not args.no_dict,
     )
 
     print(f"[cwformer] window={dec.window_sec}s stride={dec.stride_sec}s "
           f"beam={dec.beam_width} lm={'yes' if dec._lm else 'no'} "
+          f"dict={'yes' if dec._dictionary else 'no'} "
           f"params={dec._model.num_params:,}")
 
     transcript = dec.decode_file(args.input)

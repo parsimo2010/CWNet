@@ -318,9 +318,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--beam-width", type=int, default=32, metavar="N",
                    dest="beam_width",
                    help="Beam search width")
-    p.add_argument("--lm-weight", type=float, default=0.3, metavar="W",
+    p.add_argument("--lm-weight", type=float, default=6.0, metavar="W",
                    dest="lm_weight",
-                   help="Language model weight (0=off, 0.3=default/raw, 1.0=moderate, 1.5=aggressive)")
+                   help="Language model weight (0=off, 6.0=default, scales dict bonus at word boundaries)")
     p.add_argument("--lm-path", type=str, default=None, metavar="PATH",
                    dest="lm_path",
                    help="Path to trigram_lm.json (auto-detected by default)")

@@ -100,6 +100,10 @@ class BeamDecoder:
         self.deferred_chars = deferred_chars
 
         if lm is not None:
+            # Scale the char_weight down to prevent the LM from overriding
+            # timing-based decisions.  The LM char_weight is applied per
+            # character and compounds over a message, so it must be small
+            # relative to per-event timing log-probs (typically -0.1 to -2).
             lm.char_weight = lm_char_weight
 
         # Active beams
@@ -321,10 +325,11 @@ class BeamDecoder:
                 pending_skip_dur=0.0,
             ))
 
-            # Near-miss correction: if the word doesn't match dictionary
-            # and there's a near-match, fork a beam with the correction
-            if add_space and self.lm is not None:
-                self._add_near_miss_beams(beam, base_lp + lm_score, new_text, results)
+            # Near-miss correction is disabled — it introduces more errors
+            # than it corrects at current accuracy levels.  The dictionary
+            # bonus alone provides sufficient word-level guidance.
+            # TODO: re-enable once raw CER < 5% where corrections are
+            # more likely to fix the 1-char errors vs introducing new ones.
 
         elif beam.code and not beam.node.is_terminal:
             # Non-terminal code at boundary → emit '*'

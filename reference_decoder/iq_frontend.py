@@ -72,6 +72,13 @@ class IQFrontendConfig:
     # 2000 envelope samples/sec — more than enough for CW timing.
     envelope_hop: int = 4  # 0.5 ms at 8 kHz
 
+    # Edge detection filter: a short moving average used for hysteresis
+    # threshold crossing (mark/space transitions).  The long matched filter
+    # (dit-length) is kept for level tracking / SNR, but it smears edges
+    # and creates a systematic duration bias of ~0.3×filter_length on marks.
+    # A short edge filter (5–10 ms) gives sharp transitions at any WPM.
+    edge_filter_ms: float = 6.0  # 6 ms → 12 envelope samples at 2 kHz
+
     # Bootstrap: require this many envelope samples before starting event
     # detection. Allows level EMAs to settle before making decisions.
     bootstrap_samples: int = 100  # 50 ms at 2000 env samples/sec
@@ -94,7 +101,7 @@ class IQFrontendConfig:
     min_event_sec: float = 0.005  # 5 ms
 
     # Dit estimate adaptation rate
-    dit_adapt_alpha: float = 0.1  # IIR smoothing for dit length updates
+    dit_adapt_alpha: float = 0.15  # IIR smoothing for dit length updates
 
 
 class IQFrontend:
@@ -179,9 +186,16 @@ class IQFrontend:
         self._iq_q_accum: float = 0.0
         self._iq_accum_count: int = 0
 
-        # Accumulated envelope samples for matched filter
+        # Long matched filter (dit-length) — for level tracking / SNR
         self._env_ring: list[float] = []
         self._env_ring_sum: float = 0.0
+
+        # Short edge filter — for hysteresis threshold detection
+        self._edge_filter_len: int = max(
+            1, round(cfg.edge_filter_ms / 1000.0 * cfg.sample_rate / cfg.envelope_hop)
+        )
+        self._edge_ring: list[float] = []
+        self._edge_ring_sum: float = 0.0
 
         # Dit estimate tracking (for adaptive filter length)
         self._mark_durations: list[float] = []
@@ -224,6 +238,11 @@ class IQFrontend:
         self._iq_accum_count = 0
         self._env_ring = []
         self._env_ring_sum = 0.0
+        self._edge_ring = []
+        self._edge_ring_sum = 0.0
+        self._edge_filter_len = max(
+            1, round(cfg.edge_filter_ms / 1000.0 * cfg.sample_rate / cfg.envelope_hop)
+        )
         self._mark_durations = []
         self._dit_estimate_sec = cfg.initial_dit_ms / 1000.0
 
@@ -324,11 +343,10 @@ class IQFrontend:
                     self._iq_i_accum * inv_n + self._iq_q_accum * inv_n
                 )
 
-                # Matched filter: moving average of envelope over dit-length window
+                # Long matched filter (dit-length) — for level tracking
                 self._env_ring.append(envelope)
                 self._env_ring_sum += envelope
 
-                # Compute filter length in envelope samples
                 filter_len_env = max(
                     1, round(self._dit_estimate_sec * sr / hop)
                 )
@@ -339,11 +357,21 @@ class IQFrontend:
 
                 filtered = self._env_ring_sum / len(self._env_ring)
 
+                # Short edge filter — for sharp transition detection
+                self._edge_ring.append(envelope)
+                self._edge_ring_sum += envelope
+
+                while len(self._edge_ring) > self._edge_filter_len:
+                    self._edge_ring_sum -= self._edge_ring[0]
+                    self._edge_ring.pop(0)
+
+                edge_val = self._edge_ring_sum / len(self._edge_ring)
+
                 # Update stream time
                 self._stream_sec = self._sample_count / sr
 
-                # Hysteresis threshold detection
-                self._threshold_step(filtered)
+                # Hysteresis: levels from long filter, edges from short filter
+                self._threshold_step(filtered, edge_val)
 
                 # Reset accumulator
                 self._iq_i_accum = 0.0
@@ -352,33 +380,45 @@ class IQFrontend:
 
             self._sample_count += 1
 
-    def _threshold_step(self, envelope: float) -> None:
-        """Apply hysteresis thresholding to a filtered envelope sample.
+    def _threshold_step(self, filtered: float, edge: float) -> None:
+        """Apply hysteresis thresholding using dual-filter approach.
 
-        Updates mark/space level EMAs and detects transitions.
+        The long matched filter (``filtered``) drives mark/space level EMAs
+        for robust SNR estimation.  The short edge filter (``edge``) drives
+        the actual threshold crossings so that mark/space transitions are
+        detected with minimal latency — eliminating the duration bias that
+        the dit-length matched filter would otherwise introduce.
+
+        Parameters
+        ----------
+        filtered : float
+            Dit-length matched-filter envelope (for level tracking).
+        edge : float
+            Short-window filtered envelope (for edge detection).
         """
         cfg = self.config
 
-        # Initialize level trackers
+        # Initialize level trackers from long filter
         if self._mark_level is None:
-            self._mark_level = envelope
-            self._space_level = envelope
+            self._mark_level = filtered
+            self._space_level = filtered
             return
 
-        # Update mark and space level EMAs (asymmetric: fast toward, slow away)
-        if envelope > self._mark_level:
-            self._mark_level += cfg.mark_ema_attack * (envelope - self._mark_level)
+        # Update mark and space level EMAs from long filter
+        # (asymmetric: fast toward, slow away)
+        if filtered > self._mark_level:
+            self._mark_level += cfg.mark_ema_attack * (filtered - self._mark_level)
         else:
             self._mark_level = cfg.mark_ema_release * self._mark_level + \
-                (1.0 - cfg.mark_ema_release) * envelope
+                (1.0 - cfg.mark_ema_release) * filtered
 
-        if envelope < self._space_level:
-            self._space_level += cfg.space_ema_attack * (envelope - self._space_level)
+        if filtered < self._space_level:
+            self._space_level += cfg.space_ema_attack * (filtered - self._space_level)
         else:
             self._space_level = cfg.space_ema_release * self._space_level + \
-                (1.0 - cfg.space_ema_release) * envelope
+                (1.0 - cfg.space_ema_release) * filtered
 
-        # Compute thresholds
+        # Compute thresholds from long-filter levels
         mark_lvl = self._mark_level
         space_lvl = self._space_level
         span = max(mark_lvl - space_lvl, 1e-12)
@@ -386,29 +426,26 @@ class IQFrontend:
         upper_thresh = space_lvl + cfg.hysteresis_upper * span
         lower_thresh = space_lvl + cfg.hysteresis_lower * span
 
-        # Confidence: how far the envelope is from the decision boundary
+        # Confidence from edge filter (how clearly mark vs space)
         midpoint = space_lvl + 0.5 * span
         if span > 1e-12:
-            confidence = min(1.0, abs(envelope - midpoint) / (0.5 * span))
+            confidence = min(1.0, abs(edge - midpoint) / (0.5 * span))
         else:
             confidence = 0.0
 
-        # Hysteresis state transitions
+        # Hysteresis state transitions — compare edge filter against thresholds
         self._bootstrap_count += 1
         if not self._has_first_event:
-            # Bootstrap: wait for levels to settle and sufficient mark/space
-            # separation before starting event detection.
             if self._bootstrap_count < self.config.bootstrap_samples:
                 return
             if mark_lvl < space_lvl * self.config.bootstrap_min_ratio:
                 return
-            # Levels have settled — start from first clear transition
-            if envelope > upper_thresh:
+            if edge > upper_thresh:
                 self._in_mark = True
                 self._has_first_event = True
                 self._event_start_sec = self._stream_sec
                 self._event_energies = [confidence]
-            elif envelope < lower_thresh:
+            elif edge < lower_thresh:
                 self._in_mark = False
                 self._has_first_event = True
                 self._event_start_sec = self._stream_sec
@@ -416,14 +453,14 @@ class IQFrontend:
             return
 
         if self._in_mark:
-            if envelope < lower_thresh:
+            if edge < lower_thresh:
                 # Transition mark → space
                 self._emit_event("mark", confidence)
                 self._in_mark = False
             else:
                 self._event_energies.append(confidence)
         else:
-            if envelope > upper_thresh:
+            if edge > upper_thresh:
                 # Transition space → mark
                 self._emit_event("space", confidence)
                 self._in_mark = True

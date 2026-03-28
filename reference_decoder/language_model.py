@@ -66,9 +66,9 @@ class DecoderLM:
         self,
         lm: CharTrigramLM,
         dictionary: CWDictionary,
-        char_weight: float = 0.3,
-        dict_bonus: float = 1.0,
-        callsign_bonus: float = 0.5,
+        char_weight: float = 0.05,
+        dict_bonus: float = 0.5,
+        callsign_bonus: float = 0.3,
         near_miss_penalty: float = -2.0,
     ) -> None:
         self.lm = lm
@@ -82,7 +82,7 @@ class DecoderLM:
     def load(
         cls,
         lm_path: str = "trigram_lm.json",
-        char_weight: float = 0.3,
+        char_weight: float = 0.05,
     ) -> "DecoderLM":
         """Load from pre-built trigram LM file.
 

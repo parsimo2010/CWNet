@@ -48,8 +48,12 @@ def _log_add(a: float, b: float) -> float:
 def beam_search_with_lm(
     log_probs: "Tensor",
     lm: Optional["CharTrigramLM"] = None,
+    dictionary: Optional["CWDictionary"] = None,
     lm_weight: float = 0.3,
-    word_bonus: float = 0.0,
+    dict_bonus: float = 3.0,
+    callsign_bonus: float = 1.8,
+    non_dict_penalty: float = -0.5,
+    repeat_penalty: float = -0.3,
     beam_width: int = 32,
     blank_idx: int = 0,
     strip_trailing_space: bool = True,
@@ -58,7 +62,10 @@ def beam_search_with_lm(
 
     Implements Graves (2012) prefix beam search augmented with:
     - Character trigram LM prefix scoring (shallow fusion)
-    - Optional word insertion bonus
+    - Dictionary word bonus at word boundaries
+    - Callsign pattern bonus at word boundaries
+    - Non-dictionary word penalty at word boundaries
+    - Repeat character penalty
 
     Parameters
     ----------
@@ -66,11 +73,20 @@ def beam_search_with_lm(
         Log-probabilities from the CTC model for a single sample.
     lm : CharTrigramLM, optional
         Trained character trigram LM for prefix scoring.
+    dictionary : CWDictionary, optional
+        Word dictionary for word-boundary scoring.
     lm_weight : float
         Weight for LM scores (lambda in shallow fusion). 0 = no LM.
-    word_bonus : float
-        Bonus added when emitting a space (word boundary). Encourages
-        longer words. Typically 0.0-0.5.
+    dict_bonus : float
+        Bonus for words found in the dictionary at word boundaries.
+    callsign_bonus : float
+        Bonus for words matching callsign patterns at word boundaries.
+    non_dict_penalty : float
+        Penalty for words NOT in dictionary and NOT a callsign at word
+        boundaries. Set to 0 to disable. Only applied to words >= 3 chars.
+    repeat_penalty : float
+        Penalty for consecutive identical characters. Applied per repeat.
+        Third+ consecutive repeat gets 3x penalty.
     beam_width : int
         Number of beams to keep at each step.
     blank_idx : int
@@ -130,11 +146,64 @@ def beam_search_with_lm(
             context = context[-1] + ch
         return score * lm_weight
 
-    def _word_bonus_score(char_idx: int) -> float:
-        """Return word bonus if this token is a space."""
-        if word_bonus > 0 and char_idx == space_idx:
-            return word_bonus
+    def _prefix_to_text(prefix: tuple) -> str:
+        """Convert prefix tuple to text string."""
+        return "".join(
+            vocab_module.idx_to_char.get(i, "") for i in prefix if i != blank_idx
+        )
+
+    def _last_word(text: str) -> str:
+        """Extract the last word from text (before trailing space)."""
+        stripped = text.rstrip()
+        last_sp = stripped.rfind(" ")
+        if last_sp >= 0:
+            return stripped[last_sp + 1:]
+        return stripped
+
+    def _word_boundary_score(prefix: tuple, char_idx: int) -> float:
+        """Score at word boundary (space emission).
+
+        Applies dictionary bonus, callsign bonus, or non-dict penalty
+        for the word that just completed.
+        """
+        if char_idx != space_idx:
+            return 0.0
+        if dictionary is None:
+            return 0.0
+
+        text = _prefix_to_text(prefix)
+        word = _last_word(text)
+        if not word:
+            return 0.0
+
+        w = word.upper()
+
+        # Dictionary match
+        if dictionary.contains(w):
+            return dict_bonus
+
+        # Callsign match
+        if dictionary.is_callsign(w):
+            return callsign_bonus
+
+        # Non-dictionary penalty (only for words >= 3 chars to avoid
+        # penalizing single-char CW words like K, R, etc.)
+        if non_dict_penalty != 0 and len(w) >= 3:
+            return non_dict_penalty
+
         return 0.0
+
+    def _repeat_char_penalty(prefix: tuple, char_idx: int) -> float:
+        """Penalty for consecutive identical characters."""
+        if repeat_penalty == 0 or not prefix:
+            return 0.0
+        if prefix[-1] != char_idx:
+            return 0.0
+        # Two in a row
+        if len(prefix) < 2 or prefix[-2] != char_idx:
+            return repeat_penalty
+        # Three+ in a row — stronger penalty
+        return repeat_penalty * 3.0
 
     def _update(d: dict, key: tuple, lpb: float, lpnb: float, lms: float) -> None:
         if key in d:
@@ -171,11 +240,21 @@ def beam_search_with_lm(
                     # Same token as last: repeat without extending
                     _update(new_beams, prefix, NEG_INF, log_p_nb + lp_c, lm_s)
                     # New copy after blank
-                    new_lm = lm_s + _lm_score_char(prefix, c) + _word_bonus_score(c)
+                    ext_score = (
+                        _lm_score_char(prefix, c)
+                        + _word_boundary_score(prefix, c)
+                        + _repeat_char_penalty(prefix, c)
+                    )
+                    new_lm = lm_s + ext_score
                     _update(new_beams, prefix + (c,), NEG_INF, log_p_b + lp_c, new_lm)
                 else:
                     # Normal extension
-                    new_lm = lm_s + _lm_score_char(prefix, c) + _word_bonus_score(c)
+                    ext_score = (
+                        _lm_score_char(prefix, c)
+                        + _word_boundary_score(prefix, c)
+                        + _repeat_char_penalty(prefix, c)
+                    )
+                    new_lm = lm_s + ext_score
                     _update(new_beams, prefix + (c,), NEG_INF, log_p_tot + lp_c, new_lm)
 
         # Prune: score = CTC + LM
@@ -187,8 +266,32 @@ def beam_search_with_lm(
             sorted(new_beams.items(), key=_beam_score, reverse=True)[:beam_width]
         )
 
-    # Select best beam
-    best = max(beams, key=lambda p: _log_add(beams[p][0], beams[p][1]) + beams[p][2])
+    # Score final words (may not have trailing space)
+    def _final_word_score(prefix: tuple) -> float:
+        if dictionary is None:
+            return 0.0
+        text = _prefix_to_text(prefix)
+        word = _last_word(text)
+        if not word:
+            return 0.0
+        w = word.upper()
+        if dictionary.contains(w):
+            return dict_bonus
+        if dictionary.is_callsign(w):
+            return callsign_bonus
+        if non_dict_penalty != 0 and len(w) >= 3:
+            return non_dict_penalty
+        return 0.0
+
+    # Select best beam (include final word score)
+    best = max(
+        beams,
+        key=lambda p: (
+            _log_add(beams[p][0], beams[p][1])
+            + beams[p][2]
+            + _final_word_score(p)
+        ),
+    )
     text = "".join(
         vocab_module.idx_to_char.get(i, "") for i in best if i != blank_idx
     )
@@ -203,7 +306,8 @@ def rescore_nbest(
     lm: Optional["CharTrigramLM"] = None,
     dictionary: Optional["CWDictionary"] = None,
     lm_weight: float = 0.3,
-    dict_bonus: float = 1.0,
+    dict_bonus: float = 3.0,
+    callsign_bonus: float = 1.8,
 ) -> str:
     """Re-score N-best list with LM and dictionary.
 
@@ -221,6 +325,8 @@ def rescore_nbest(
         Weight for LM re-scoring.
     dict_bonus : float
         Bonus per word that appears in the dictionary.
+    callsign_bonus : float
+        Bonus per word that matches callsign pattern.
 
     Returns
     -------
@@ -240,12 +346,15 @@ def rescore_nbest(
         if lm is not None and lm_weight > 0:
             score += lm_weight * lm.score_sequence(text)
 
-        # Dictionary bonus
-        if dictionary is not None and dict_bonus > 0:
+        # Dictionary / callsign bonus
+        if dictionary is not None:
             words = text.split()
             for word in words:
-                if dictionary.lookup(word):
+                w = word.upper()
+                if dictionary.contains(w):
                     score += dict_bonus
+                elif dictionary.is_callsign(w):
+                    score += callsign_bonus
 
         if score > best_score:
             best_score = score

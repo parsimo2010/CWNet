@@ -225,6 +225,7 @@ def evaluate_sample(
     freq: float = 700.0,
     beam_width: int = 32,
     lm_weight: float = 1.0,
+    lm_char_weight: float = 0.0,
     seed: Optional[int] = None,
 ) -> EvalResult:
     """Generate synthetic audio and decode it, returning CER."""
@@ -249,6 +250,7 @@ def evaluate_sample(
         sample_rate=8000,
         beam_width=beam_width,
         lm_weight=lm_weight,
+        lm_char_weight=lm_char_weight,
         initial_wpm=max(10.0, wpm * 0.7),  # start with slightly wrong estimate
     )
 
@@ -391,6 +393,7 @@ def run_grid(
     n_samples: int = 5,
     beam_width: int = 32,
     lm_weight: float = 1.0,
+    lm_char_weight: float = 0.0,
     seed: int = 42,
 ) -> list[EvalResult]:
     """Run evaluation across a grid of conditions."""
@@ -414,6 +417,7 @@ def run_grid(
                         timing_quality=0.8 if key == "paddle" else 0.5,
                         beam_width=beam_width,
                         lm_weight=lm_weight,
+                        lm_char_weight=lm_char_weight,
                         seed=int(sample_seed),
                     )
                     results.append(result)

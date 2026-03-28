@@ -77,7 +77,8 @@ class AdvancedStreamingDecoder:
         freq_max: float = 1200.0,
         beam_width: int = 32,
         lm_path: Optional[str] = None,
-        lm_weight: float = 1.0,
+        lm_weight: float = 6.0,
+        lm_char_weight: float = 0.02,
         use_qso_tracking: bool = True,
         initial_wpm: float = 20.0,
     ) -> None:
@@ -98,18 +99,24 @@ class AdvancedStreamingDecoder:
         self._key_detector = KeyDetector()
 
         # Stage 3: Beam Decoder with LM
+        # lm_weight controls dictionary bonus at word boundaries.
+        # lm_char_weight controls character trigram scoring weight.
+        # With a balanced trigram model (English + QSO), char scoring
+        # can provide mild disambiguation without biasing toward ham text.
         try:
             if lm_path:
-                self._lm = DecoderLM.load(lm_path, char_weight=lm_weight)
+                self._lm = DecoderLM.load(lm_path, char_weight=lm_char_weight)
             else:
-                self._lm = DecoderLM.load(char_weight=lm_weight)
+                self._lm = DecoderLM.load(char_weight=lm_char_weight)
+            self._lm.dict_bonus = lm_weight * 0.5
+            self._lm.callsign_bonus = lm_weight * 0.3
         except Exception:
             self._lm = None
 
         self._decoder = BeamDecoder(
             lm=self._lm,
             beam_width=beam_width,
-            lm_char_weight=lm_weight,
+            lm_char_weight=lm_char_weight,
         )
 
         # QSO tracking

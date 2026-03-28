@@ -867,35 +867,19 @@ class CWDictionary:
         self._built = False
 
     def build_default(self) -> None:
-        """Build dictionary from built-in word lists."""
+        """Build dictionary from built-in word lists + external word file."""
+        import os as _os
+
         # Q-codes
         self._words.update(Q_CODES)
 
         # Abbreviations
         self._words.update(ABBREVIATIONS)
 
-        # Common QSO words
-        qso_words = [
+        # Ham-specific words (always included)
+        ham_words = [
             "CQ", "DE", "K", "R", "BK", "QTH", "NAME", "RST", "RIG",
-            "ANT", "PWR", "WX", "HW", "HR", "IS", "THE", "AND", "FOR",
-            "NOT", "BUT", "WITH", "FROM", "THAT", "THIS", "HAVE", "BEEN",
-            "WILL", "CAN", "ALL", "WAS", "ARE", "YOU", "YOUR", "HIS",
-            "HER", "HAS", "HAD", "ONE", "TWO", "OUR", "OUT", "DAY",
-            "GET", "HAS", "HIM", "HOW", "ITS", "LET", "MAY", "NEW",
-            "NOW", "OLD", "SEE", "WAY", "WHO", "DID", "GOT", "HAS",
-            "HER", "HIM", "HIS", "HOW", "MAN", "OUR", "SAY", "SHE",
-            "TOO", "USE", "ABOUT", "AFTER", "AGAIN", "ALSO", "BACK",
-            "BEEN", "CALL", "CAME", "COME", "COULD", "EACH", "EVEN",
-            "FIND", "FIRST", "FROM", "GIVE", "GOOD", "GREAT", "HAND",
-            "HERE", "HIGH", "HOME", "INTO", "JUST", "KNOW", "LAST",
-            "LIKE", "LINE", "LONG", "LOOK", "MADE", "MAKE", "MANY",
-            "MUCH", "MUST", "NAME", "NEXT", "ONLY", "OVER", "PART",
-            "REAL", "SAME", "SAID", "SOME", "SUCH", "TAKE", "TELL",
-            "THAN", "THAT", "THEM", "THEN", "THEY", "TIME", "VERY",
-            "WANT", "WELL", "WENT", "WHAT", "WHEN", "WILL", "WITH",
-            "WORD", "WORK", "YEAR", "BEST", "NICE", "FINE", "HOPE",
-            "SURE", "TRUE",
-            # Ham-specific
+            "ANT", "PWR", "WX", "HW", "HR",
             "DIPOLE", "VERTICAL", "BEAM", "YAGI", "WIRE", "LOOP",
             "ANTENNA", "RECEIVER", "TRANSMITTER", "STATION", "RADIO",
             "SIGNAL", "NOISE", "BAND", "FREQUENCY", "POWER", "WATTS",
@@ -905,8 +889,32 @@ class CWDictionary:
             "CONTEST", "EXCHANGE", "SERIAL", "ZONE",
             "WEATHER", "TEMPERATURE", "SUNNY", "CLOUDY", "RAIN",
             "COLD", "WARM", "WIND", "SNOW",
+            "CUAGN", "BCNU", "CQCQ",
         ]
-        self._words.update(w.upper() for w in qso_words)
+        self._words.update(w.upper() for w in ham_words)
+
+        # Load English word list from google-10000-english-usa.txt
+        # Try several locations for the file
+        word_file = None
+        for candidate in [
+            _os.path.join(_os.path.dirname(__file__), "google-10000-english-usa.txt"),
+            _os.path.join(_os.path.dirname(__file__), "..", "google-10000-english-usa.txt"),
+        ]:
+            if _os.path.exists(candidate):
+                word_file = candidate
+                break
+
+        if word_file:
+            max_words = 5000
+            count = 0
+            with open(word_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    word = line.strip().upper()
+                    if word.isalpha() and len(word) >= 2:
+                        self._words.add(word)
+                        count += 1
+                    if count >= max_words:
+                        break
 
         # Prosigns as words
         self._words.update(["AR", "SK", "BT", "KN", "BK", "AS", "CT"])
