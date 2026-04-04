@@ -1,10 +1,15 @@
 """
-dataset_events.py — Dataset for the Event Transformer using EnhancedFeaturizer.
+dataset.py — Dataset for the Hybrid Event Transformer using HybridFeaturizer.
 
-Extends the baseline dataset with:
-  - 10-dim enhanced features instead of 5-dim
-  - QSO corpus text generation mixed with random text
-  - Same collate_fn interface (T-first layout for CTC)
+Extends the Event Transformer dataset to produce 17-dim features by combining
+the EnhancedFeaturizer's 10-dim features with 7 Bayesian timing posteriors
+from the reference decoder's timing model.
+
+Supports optional timing-dropout: with configurable probability, the 7 timing
+features (indices 10-16) are zeroed out during training. This prevents the
+model from over-relying on timing posteriors and maintains robustness when
+the timing model is wrong (e.g., early in a transmission before the RWE
+speed tracker has converged).
 """
 
 from __future__ import annotations
@@ -20,8 +25,8 @@ from torch.utils.data import IterableDataset
 import vocab as vocab_module
 from config import Config
 from fast_feature import FastFeatureExtractor
+from hybrid_decoder.hybrid_featurizer import HybridFeaturizer
 from morse_generator import generate_events_direct, generate_sample, load_wordlist
-from neural_decoder.enhanced_featurizer import EnhancedFeaturizer
 from qso_corpus import QSOCorpusGenerator
 
 
@@ -29,12 +34,15 @@ from qso_corpus import QSOCorpusGenerator
 # Dataset
 # ---------------------------------------------------------------------------
 
-class EventTransformerDataset(IterableDataset):
-    """Streaming dataset producing 10-dim features for the Event Transformer.
+class HybridTransformerDataset(IterableDataset):
+    """Streaming dataset producing 17-dim features for the Hybrid Transformer.
 
     Generates samples using either the audio path (through feature extractor)
     or the direct event path (~100x faster). Text is a mix of QSO corpus
     content and random text from the baseline generator.
+
+    The 17-dim features combine the 10-dim EnhancedFeaturizer output with
+    7 Bayesian timing posteriors from the reference decoder's timing model.
 
     Args:
         config: Full pipeline configuration.
@@ -43,8 +51,11 @@ class EventTransformerDataset(IterableDataset):
         qso_text_ratio: Fraction of samples using QSO corpus text (0-1).
         use_direct_events: Use direct event generation (fast) vs audio path.
         max_events: Maximum number of events per sample. Samples with more
-            events are truncated (text re-derived). Controls peak VRAM usage
-            since attention is O(T^2). Default 400 (~P75).
+            events are skipped. Controls peak VRAM usage since attention
+            is O(T^2). Default 400 (~P75).
+        timing_dropout: Probability of zeroing out timing features (10-16)
+            during training. Prevents over-reliance on Bayesian posteriors.
+            Default 0.1.
     """
 
     def __init__(
@@ -55,6 +66,7 @@ class EventTransformerDataset(IterableDataset):
         qso_text_ratio: float = 0.5,
         use_direct_events: bool = False,
         max_events: int = 400,
+        timing_dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.morse_cfg = config.morse
@@ -64,6 +76,7 @@ class EventTransformerDataset(IterableDataset):
         self.qso_text_ratio = qso_text_ratio
         self.use_direct_events = use_direct_events
         self.max_events = max_events
+        self.timing_dropout = timing_dropout
         self.wordlist = load_wordlist()
         self._space_idx = vocab_module.char_to_idx[" "]
 
@@ -73,7 +86,7 @@ class EventTransformerDataset(IterableDataset):
 
         if not self.use_direct_events:
             fast_extractor = FastFeatureExtractor(self.feature_cfg)
-        featurizer = EnhancedFeaturizer()
+        featurizer = HybridFeaturizer()
 
         worker_info = torch.utils.data.get_worker_info()
         per_worker = (
@@ -90,7 +103,6 @@ class EventTransformerDataset(IterableDataset):
 
                 if self.use_direct_events:
                     if use_qso:
-                        # Generate QSO text, then create events from it
                         text = qso_gen.generate(min_len=8, max_len=80)
                         events, text, _ = generate_events_direct(
                             self.morse_cfg, rng=rng, wordlist=self.wordlist,
@@ -118,16 +130,16 @@ class EventTransformerDataset(IterableDataset):
             if len(events) == 0:
                 continue
 
-            # Cap sequence length to control VRAM (attention is O(T^2)).
-            # Truncate events and re-derive text from the shorter sequence
-            # by generating with fewer characters next time. For now, just
-            # skip samples that are too long — the generator will produce
-            # shorter ones with different random seeds.
+            # Cap sequence length to control VRAM (attention is O(T^2))
             if self.max_events > 0 and len(events) > self.max_events:
                 continue
 
-            # Featurize with enhanced 10-dim features
-            feat_array = featurizer.featurize_sequence(events)  # (T, 10)
+            # Featurize with hybrid 17-dim features
+            feat_array = featurizer.featurize_sequence(events)  # (T, 17)
+
+            # Apply timing dropout: zero out features 10-16 with probability
+            if self.timing_dropout > 0 and float(rng.random()) < self.timing_dropout:
+                feat_array[:, 10:17] = 0.0
 
             # Target with boundary space tokens
             inner = vocab_module.encode(text)
@@ -156,7 +168,7 @@ class EventTransformerDataset(IterableDataset):
 
 
 # ---------------------------------------------------------------------------
-# Collate function (same interface as dataset.py but works with any feature dim)
+# Collate function
 # ---------------------------------------------------------------------------
 
 def collate_fn(

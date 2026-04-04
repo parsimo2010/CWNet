@@ -45,20 +45,23 @@ from neural_decoder.mel_frontend import MelFrontendConfig
 def _load_cwformer_checkpoint(
     checkpoint: str,
     device: torch.device,
-) -> Tuple[CWFormer, CWFormerConfig, int]:
+) -> Tuple[CWFormer, CWFormerConfig, int, bool]:
     """Load CW-Former checkpoint.
 
-    Returns (model, config, sample_rate).
+    Returns (model, config, sample_rate, narrowband).
     """
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
 
     mc = ckpt.get("model_config", {})
+    narrowband = mc.get("narrowband", False)
 
     mel_cfg = MelFrontendConfig(
         sample_rate=mc.get("sample_rate", 16000),
         n_mels=mc.get("n_mels", 80),
         n_fft=mc.get("n_fft", 400),
         hop_length=mc.get("hop_length", 160),
+        f_min=mc.get("f_min", 0.0),
+        f_max=mc.get("f_max", 4000.0),
         spec_augment=False,  # no augmentation at inference
     )
     conformer_cfg = ConformerConfig(
@@ -69,7 +72,9 @@ def _load_cwformer_checkpoint(
         conv_kernel=mc.get("conv_kernel", 31),
         dropout=0.0,  # no dropout at inference
     )
-    model_cfg = CWFormerConfig(mel=mel_cfg, conformer=conformer_cfg)
+    model_cfg = CWFormerConfig(
+        mel=mel_cfg, conformer=conformer_cfg, narrowband=narrowband,
+    )
 
     model = CWFormer(model_cfg).to(device)
     if "model_state_dict" in ckpt:
@@ -78,7 +83,7 @@ def _load_cwformer_checkpoint(
         model.load_state_dict(ckpt, strict=False)
     model.eval()
 
-    return model, model_cfg, mel_cfg.sample_rate
+    return model, model_cfg, mel_cfg.sample_rate, narrowband
 
 
 # ---------------------------------------------------------------------------
@@ -148,9 +153,17 @@ class CWFormerDecoder:
         self.callsign_bonus = callsign_bonus
         self.non_dict_penalty = non_dict_penalty
 
-        self._model, self._model_cfg, self.sample_rate = (
+        self._model, self._model_cfg, self.sample_rate, self._narrowband = (
             _load_cwformer_checkpoint(checkpoint, self.device)
         )
+
+        # Narrowband processor for frequency detection + bandpass + shift
+        self._nb_processor = None
+        if self._narrowband:
+            from neural_decoder.narrowband_frontend import NarrowbandProcessor
+            self._nb_processor = NarrowbandProcessor(
+                sample_rate=self.sample_rate,
+            )
 
         # Pre-compute window/stride in samples
         self._win_samples = int(window_sec * self.sample_rate)
@@ -198,6 +211,10 @@ class CWFormerDecoder:
         Returns:
             Decoded text string.
         """
+        # Apply narrowband preprocessing if model was trained with it
+        if self._nb_processor is not None:
+            audio, _ = self._nb_processor.process(audio)
+
         # Short audio — single pass
         if len(audio) <= self._win_samples:
             log_probs = self._forward_window(audio)
@@ -382,6 +399,7 @@ def main():
     print(f"[cwformer] window={dec.window_sec}s stride={dec.stride_sec}s "
           f"beam={dec.beam_width} lm={'yes' if dec._lm else 'no'} "
           f"dict={'yes' if dec._dictionary else 'no'} "
+          f"narrowband={'yes' if dec._narrowband else 'no'} "
           f"params={dec._model.num_params:,}")
 
     transcript = dec.decode_file(args.input)

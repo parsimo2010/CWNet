@@ -1,27 +1,38 @@
 #!/usr/bin/env python3
 """
-train_cwformer.py — Training loop for the CW-Former (Conformer on audio).
+train.py — Training loop for the Hybrid Event Transformer.
+
+Combines the reference decoder's Bayesian timing model with the neural
+Event Transformer. The transformer receives 17-dim features (10 from
+EnhancedFeaturizer + 7 Bayesian timing posteriors) instead of 10-dim.
+
+Reuses EventTransformerModel from neural_decoder with in_features=17.
 
 Usage:
     # Quick test (verify pipeline)
-    python -m neural_decoder.train_cwformer --scenario test
+    python -m hybrid_decoder.train --scenario test
 
     # Stage 1: Clean conditions
-    python -m neural_decoder.train_cwformer --scenario clean
+    python -m hybrid_decoder.train --scenario clean
 
     # Stage 2: Resume from clean, moderate augmentations
-    python -m neural_decoder.train_cwformer --scenario moderate \
-        --checkpoint checkpoints_cwformer/best_model.pt
+    python -m hybrid_decoder.train --scenario moderate \\
+        --checkpoint checkpoints_hybrid/best_model.pt
 
     # Stage 3: Resume from moderate, full augmentations
-    python -m neural_decoder.train_cwformer --scenario full \
-        --checkpoint checkpoints_cwformer/best_model_moderate.pt
+    python -m hybrid_decoder.train --scenario full \\
+        --checkpoint checkpoints_hybrid/best_model_moderate.pt
+
+    # Custom config
+    python -m hybrid_decoder.train --scenario clean \\
+        --d-model 192 --n-layers 8 --d-ff 768 --epochs 300
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import math
 import os
 import sys
@@ -38,10 +49,8 @@ from tqdm import tqdm
 
 import vocab as vocab_module
 from config import Config, create_default_config
-from neural_decoder.cwformer import CWFormer, CWFormerConfig
-from neural_decoder.conformer import ConformerConfig
-from neural_decoder.mel_frontend import MelFrontendConfig
-from neural_decoder.dataset_audio import AudioDataset, collate_fn
+from hybrid_decoder.dataset import HybridTransformerDataset, collate_fn
+from neural_decoder.event_transformer import EventTransformerConfig, EventTransformerModel
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +93,7 @@ def compute_cer(hypothesis: str, reference: str) -> float:
 # ---------------------------------------------------------------------------
 
 def evaluate(
-    model: CWFormer,
+    model: EventTransformerModel,
     loader: DataLoader,
     device: torch.device,
     use_amp: bool = False,
@@ -100,23 +109,23 @@ def evaluate(
     all_cer_beam = []
 
     with torch.no_grad():
-        for audio, targets, audio_lens, target_lens, texts in loader:
-            audio = audio.to(device, non_blocking=True)
+        for feat, targets, feat_lens, target_lens, texts in loader:
+            feat = feat.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            audio_lens = audio_lens.to(device, non_blocking=True)
+            feat_lens = feat_lens.to(device, non_blocking=True)
             target_lens = target_lens.to(device, non_blocking=True)
 
             with autocast("cuda", enabled=use_amp):
-                log_probs, out_lens = model(audio, audio_lens)
+                log_probs, out_lens = model(feat, feat_lens)
                 loss = ctc_loss_fn(log_probs, targets, out_lens, target_lens)
 
             total_loss += loss.item()
             total_batches += 1
 
-            # Move to CPU for CER computation, free GPU memory
+            # CER computation — move to CPU to free GPU memory
             log_probs_cpu = log_probs.cpu()
             out_lens_cpu = out_lens.cpu()
-            del audio, targets, audio_lens, target_lens, log_probs, out_lens, loss
+            del feat, targets, feat_lens, target_lens, log_probs, out_lens, loss
 
             B = log_probs_cpu.shape[1]
             for i in range(B):
@@ -155,56 +164,30 @@ def train(args: argparse.Namespace) -> None:
     # ---- Config ----
     config = create_default_config(args.scenario)
 
+    # Override epochs if specified
     if args.epochs is not None:
         config.training.num_epochs = args.epochs
 
     # ---- Model config ----
-    if args.narrowband:
-        from neural_decoder.narrowband_frontend import (
-            NARROWBAND_F_MIN, NARROWBAND_F_MAX, NARROWBAND_N_MELS,
-        )
-        mel_cfg = MelFrontendConfig(
-            sample_rate=config.morse.sample_rate,
-            n_mels=NARROWBAND_N_MELS,
-            f_min=NARROWBAND_F_MIN,
-            f_max=NARROWBAND_F_MAX,
-            spec_augment=True,
-            freq_mask_width=8,   # fewer bins → narrower masks
-        )
-    else:
-        mel_cfg = MelFrontendConfig(
-            sample_rate=config.morse.sample_rate,
-            spec_augment=True,
-        )
-    conformer_cfg = ConformerConfig(
+    model_cfg = EventTransformerConfig(
+        in_features=17,  # 10 base + 7 Bayesian timing posteriors
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         d_ff=args.d_ff,
-        conv_kernel=args.conv_kernel,
         dropout=args.dropout,
-    )
-    model_cfg = CWFormerConfig(
-        mel=mel_cfg,
-        conformer=conformer_cfg,
-        narrowband=args.narrowband,
     )
 
     # ---- Checkpoint directory ----
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save config
-    config_path = ckpt_dir / "config.json"
-    config.save(str(config_path))
-
     # ---- Model ----
-    model = CWFormer(model_cfg).to(device)
-    nb_str = f", narrowband (n_mels={mel_cfg.n_mels}, f={mel_cfg.f_min}-{mel_cfg.f_max} Hz)" if args.narrowband else ""
-    print(f"CW-Former: {model.num_params:,} parameters{nb_str}")
-    print(f"  d_model={conformer_cfg.d_model}, n_heads={conformer_cfg.n_heads}, "
-          f"n_layers={conformer_cfg.n_layers}, d_ff={conformer_cfg.d_ff}, "
-          f"conv_kernel={conformer_cfg.conv_kernel}")
+    model = EventTransformerModel(model_cfg).to(device)
+    print(f"Model: {model.num_params:,} parameters")
+    print(f"  in_features={model_cfg.in_features}, d_model={model_cfg.d_model}, "
+          f"n_heads={model_cfg.n_heads}, n_layers={model_cfg.n_layers}, "
+          f"d_ff={model_cfg.d_ff}")
 
     # ---- Load checkpoint if resuming ----
     start_epoch = 0
@@ -224,7 +207,8 @@ def train(args: argparse.Namespace) -> None:
         else:
             best_val_loss = float("inf")
             if prev_scenario and prev_scenario != args.scenario:
-                print(f"  Scenario changed ({prev_scenario} -> {args.scenario}), resetting best_val_loss")
+                print(f"  Scenario changed ({prev_scenario} -> {args.scenario}), "
+                      f"resetting best_val_loss")
         print(f"  Resuming from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
 
     # ---- Optimizer + scheduler ----
@@ -236,7 +220,7 @@ def train(args: argparse.Namespace) -> None:
         eps=1e-9,
     )
     total_epochs = config.training.num_epochs
-    warmup_epochs = min(5, max(1, total_epochs // 40))
+    warmup_epochs = min(5, max(1, total_epochs // 40))  # ~2.5% warmup, capped at 5
 
     def lr_lambda(epoch: int) -> float:
         if epoch < warmup_epochs:
@@ -251,24 +235,28 @@ def train(args: argparse.Namespace) -> None:
     ctc_loss_fn = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
 
     # ---- Datasets ----
-    # CW-Former on audio is much heavier — use smaller batches and fewer samples
-    # Audio generation is slower than direct events, so reduce epoch size
-    samples_per_epoch = min(config.training.samples_per_epoch, 20000)
-    val_samples = min(config.training.val_samples, 2000)
+    samples_per_epoch = config.training.samples_per_epoch
+    val_samples = config.training.val_samples
 
+    # Transformer attention is O(T^2) — use small micro-batches with
+    # gradient accumulation to match the effective batch size.
     micro_batch = args.batch_size
-    effective_batch = 64  # Target effective batch for audio
+    effective_batch = config.training.batch_size
     accum_steps = max(1, effective_batch // micro_batch)
 
-    train_ds = AudioDataset(
+    use_direct = args.use_direct
+    max_events = args.max_events
+    timing_dropout = args.timing_dropout
+
+    train_ds = HybridTransformerDataset(
         config, epoch_size=samples_per_epoch, seed=None,
-        qso_text_ratio=0.5, max_audio_sec=args.max_audio_sec,
-        narrowband=args.narrowband,
+        qso_text_ratio=0.5, use_direct_events=use_direct,
+        max_events=max_events, timing_dropout=timing_dropout,
     )
-    val_ds = AudioDataset(
+    val_ds = HybridTransformerDataset(
         config, epoch_size=val_samples, seed=12345,
-        qso_text_ratio=0.5, max_audio_sec=args.max_audio_sec,
-        narrowband=args.narrowband,
+        qso_text_ratio=0.5, use_direct_events=use_direct,
+        max_events=max_events, timing_dropout=0.0,  # no dropout during validation
     )
 
     num_workers = args.workers
@@ -295,9 +283,10 @@ def train(args: argparse.Namespace) -> None:
     # ---- Training loop ----
     beam_cer_interval = 50
     print(f"\nTraining: {total_epochs} epochs, {samples_per_epoch} samples/epoch, "
-          f"micro_batch={micro_batch}, accum={accum_steps} (effective={micro_batch*accum_steps}), "
-          f"workers={num_workers}")
-    print(f"Scenario: {args.scenario}")
+          f"micro_batch={micro_batch}, accum={accum_steps} "
+          f"(effective={micro_batch*accum_steps}), workers={num_workers}")
+    print(f"Scenario: {args.scenario}, direct_events={use_direct}, "
+          f"max_events={max_events}, timing_dropout={timing_dropout}")
 
     for epoch in range(start_epoch, total_epochs):
         t0 = time.time()
@@ -310,59 +299,43 @@ def train(args: argparse.Namespace) -> None:
         optimizer.zero_grad(set_to_none=True)
         micro_step = 0
 
-        for audio, targets, audio_lens, target_lens, texts in pbar:
-            audio = audio.to(device, non_blocking=True)
+        for feat, targets, feat_lens, target_lens, texts in pbar:
+            feat = feat.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            audio_lens = audio_lens.to(device, non_blocking=True)
+            feat_lens = feat_lens.to(device, non_blocking=True)
             target_lens = target_lens.to(device, non_blocking=True)
 
             with autocast("cuda", enabled=use_amp):
-                log_probs, out_lens = model(audio, audio_lens)
-
-                # CTC feasibility: skip if output too short for targets
-                valid = out_lens >= target_lens
-                if not valid.all():
-                    # Filter to valid samples only
-                    idx = valid.nonzero(as_tuple=True)[0]
-                    if len(idx) == 0:
-                        del audio, targets, audio_lens, target_lens, log_probs, out_lens
-                        continue
-                    log_probs = log_probs[:, idx, :]
-                    targets = targets[idx]
-                    out_lens = out_lens[idx]
-                    target_lens = target_lens[idx]
-
+                log_probs, out_lens = model(feat, feat_lens)
                 loss = ctc_loss_fn(log_probs, targets, out_lens, target_lens)
+                # Scale loss by accumulation steps so gradients average correctly
                 loss = loss / accum_steps
 
             if torch.isnan(loss) or torch.isinf(loss):
-                del audio, targets, audio_lens, target_lens, log_probs, out_lens, loss
-                optimizer.zero_grad(set_to_none=True)
-                micro_step = 0
+                del feat, targets, feat_lens, target_lens, log_probs, out_lens, loss
                 continue
 
             scaler.scale(loss).backward()
 
-            # Free forward-pass tensors after backward
+            # Free forward-pass tensors immediately after backward
             loss_val = loss.item() * accum_steps
-            del audio, targets, audio_lens, target_lens, log_probs, out_lens, loss
+            del feat, targets, feat_lens, target_lens, log_probs, out_lens, loss
 
             micro_step += 1
 
-            if micro_step >= accum_steps:
+            if micro_step % accum_steps == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                micro_step = 0
 
             total_train_loss += loss_val
             n_batches += 1
-            pbar.set_postfix(loss=f"{total_train_loss/n_batches:.3f}")
+            pbar.set_postfix(loss=f"{loss_val:.3f}")
 
-        # Flush any remaining gradient
-        if micro_step > 0:
+        # Flush any remaining accumulated gradients
+        if micro_step % accum_steps != 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
@@ -370,9 +343,7 @@ def train(args: argparse.Namespace) -> None:
             optimizer.zero_grad(set_to_none=True)
 
         scheduler.step()
-
-        avg_train_loss = total_train_loss / max(1, n_batches)
-        current_lr = optimizer.param_groups[0]["lr"]
+        train_loss = total_train_loss / max(1, n_batches)
 
         # ---- Validation ----
         do_beam = (epoch + 1) % beam_cer_interval == 0 or epoch == total_epochs - 1
@@ -380,25 +351,30 @@ def train(args: argparse.Namespace) -> None:
             model, val_loader, device, use_amp,
             beam_width=10 if do_beam else 0,
         )
-
-        elapsed = time.time() - t0
         val_loss = val_results["loss"]
         greedy_cer = val_results["greedy_cer"]
-        beam_cer = val_results.get("beam_cer", -1.0)
+        beam_cer = val_results.get("beam_cer", float("nan"))
 
-        print(f"Epoch {epoch+1:4d}/{total_epochs} | "
-              f"train={avg_train_loss:.4f} val={val_loss:.4f} | "
-              f"CER={greedy_cer:.3f}"
-              + (f" beam={beam_cer:.3f}" if beam_cer >= 0 else "")
-              + f" | lr={current_lr:.2e} | {elapsed:.0f}s")
+        elapsed = time.time() - t0
+        lr = optimizer.param_groups[0]["lr"]
 
-        # ---- CSV log ----
+        # Log
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow([
-                epoch + 1, f"{avg_train_loss:.6f}", f"{val_loss:.6f}",
-                f"{greedy_cer:.6f}", f"{beam_cer:.6f}" if beam_cer >= 0 else "",
-                f"{current_lr:.2e}", f"{elapsed:.1f}",
+                epoch + 1, f"{train_loss:.5f}", f"{val_loss:.5f}",
+                f"{greedy_cer:.4f}",
+                f"{beam_cer:.4f}" if not math.isnan(beam_cer) else "",
+                f"{lr:.6f}", f"{elapsed:.1f}",
             ])
+
+        print(
+            f"Epoch {epoch+1}/{total_epochs}: "
+            f"train={train_loss:.4f} val={val_loss:.4f} "
+            f"cer={greedy_cer:.4f}"
+            + (f" beam_cer={beam_cer:.4f}" if not math.isnan(beam_cer) else "")
+            + f" lr={lr:.6f} ({elapsed:.1f}s)",
+            file=sys.stderr,
+        )
 
         # ---- Checkpoints ----
         ckpt_data = {
@@ -406,41 +382,41 @@ def train(args: argparse.Namespace) -> None:
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
+            "train_loss": train_loss,
             "val_loss": val_loss,
-            "best_val_loss": min(best_val_loss, val_loss),
             "greedy_cer": greedy_cer,
-            "scenario": args.scenario,
+            "best_val_loss": best_val_loss,
             "model_config": {
-                "d_model": conformer_cfg.d_model,
-                "n_heads": conformer_cfg.n_heads,
-                "n_layers": conformer_cfg.n_layers,
-                "d_ff": conformer_cfg.d_ff,
-                "conv_kernel": conformer_cfg.conv_kernel,
-                "n_mels": mel_cfg.n_mels,
-                "f_min": mel_cfg.f_min,
-                "f_max": mel_cfg.f_max,
-                "sample_rate": mel_cfg.sample_rate,
-                "n_fft": mel_cfg.n_fft,
-                "hop_length": mel_cfg.hop_length,
-                "narrowband": args.narrowband,
+                "in_features": model_cfg.in_features,
+                "d_model": model_cfg.d_model,
+                "n_heads": model_cfg.n_heads,
+                "n_layers": model_cfg.n_layers,
+                "d_ff": model_cfg.d_ff,
+                "dropout": model_cfg.dropout,
             },
+            "scenario": args.scenario,
         }
 
-        # Safety checkpoint (overwritten each epoch)
-        torch.save(ckpt_data, ckpt_dir / "latest_model.pt")
+        # Safety checkpoint (every epoch, overwritten)
+        torch.save(ckpt_data, ckpt_dir / "safety_checkpoint.pt")
 
-        # Best model
+        # Best model checkpoint
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             ckpt_data["best_val_loss"] = best_val_loss
             torch.save(ckpt_data, ckpt_dir / "best_model.pt")
-            print(f"  → New best model (val_loss={val_loss:.4f})")
+            print(f"  -> New best val_loss: {best_val_loss:.4f}", file=sys.stderr)
 
-        # Periodic checkpoint every 10 epochs
+        # Periodic checkpoint
         if (epoch + 1) % 10 == 0:
             torch.save(ckpt_data, ckpt_dir / f"checkpoint_epoch{epoch+1}.pt")
 
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     print(f"\nTraining complete. Best val_loss: {best_val_loss:.4f}")
+    print(f"Checkpoints in: {ckpt_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -448,35 +424,52 @@ def train(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Train CW-Former (Conformer CW decoder)")
-    parser.add_argument("--scenario", type=str, default="clean",
-                        choices=["test", "clean", "moderate", "full"])
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Resume from checkpoint")
-    parser.add_argument("--ckpt-dir", type=str, default="checkpoints_cwformer")
+    parser = argparse.ArgumentParser(
+        description="Train Hybrid Event Transformer CW decoder",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--scenario", default="clean",
+                        choices=["test", "clean", "moderate", "full"],
+                        help="Training scenario (controls SNR, WPM, augmentation)")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override number of epochs")
-    parser.add_argument("--narrowband", action="store_true",
-                        help="Enable narrowband mode: freq detection + bandpass + "
-                             "32-bin mel (400-1200 Hz) instead of 80-bin (0-4000 Hz)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to checkpoint to resume from")
+    parser.add_argument("--ckpt-dir", type=str, default="checkpoints_hybrid",
+                        dest="ckpt_dir",
+                        help="Checkpoint output directory")
 
     # Model architecture
-    parser.add_argument("--d-model", type=int, default=256)
-    parser.add_argument("--n-heads", type=int, default=4)
-    parser.add_argument("--n-layers", type=int, default=12)
-    parser.add_argument("--d-ff", type=int, default=1024)
-    parser.add_argument("--conv-kernel", type=int, default=31)
+    parser.add_argument("--d-model", type=int, default=128, dest="d_model",
+                        help="Transformer hidden dimension")
+    parser.add_argument("--n-heads", type=int, default=4, dest="n_heads",
+                        help="Number of attention heads")
+    parser.add_argument("--n-layers", type=int, default=6, dest="n_layers",
+                        help="Number of transformer layers")
+    parser.add_argument("--d-ff", type=int, default=512, dest="d_ff",
+                        help="Feed-forward inner dimension")
     parser.add_argument("--dropout", type=float, default=0.1)
 
     # Training
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="Peak learning rate")
-    parser.add_argument("--batch-size", type=int, default=8,
-                        help="Micro-batch size (gradient accumulation to effective ~64)")
+    parser.add_argument("--batch-size", type=int, default=64, dest="batch_size",
+                        help="Micro-batch size per GPU step (gradient accumulation "
+                             "maintains effective batch from config). "
+                             "64 uses ~11 GB VRAM, 96 uses ~16 GB.")
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 4),
-                        help="DataLoader workers (default: min(8, cpu_count))")
-    parser.add_argument("--max-audio-sec", type=float, default=15.0,
-                        help="Max audio duration per sample (seconds)")
+                        help="DataLoader num_workers (default: min(8, cpu_count))")
+    parser.add_argument("--use-direct", action="store_true", dest="use_direct",
+                        help="Use direct event generation (fast, no audio)")
+    parser.add_argument("--max-events", type=int, default=400, dest="max_events",
+                        help="Max event sequence length per sample. Longer samples "
+                             "are skipped. Controls peak VRAM since attention is O(T^2). "
+                             "400 = P75, 600 = P95. Lower = less VRAM, shorter text.")
+    parser.add_argument("--timing-dropout", type=float, default=0.1,
+                        dest="timing_dropout",
+                        help="Probability of zeroing out Bayesian timing features "
+                             "(indices 10-16) during training. Prevents over-reliance "
+                             "on timing posteriors.")
 
     args = parser.parse_args()
     train(args)

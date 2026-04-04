@@ -26,19 +26,24 @@ The project has three decoder paths:
 
 ### Under development
 - **Advanced reference decoder** (`reference_decoder/`): I/Q matched filter, Bayesian classification, RWE speed tracking, language model, QSO structure tracking. See `reference_decoder/PLAN.md`.
-- **Event-Stream Transformer** (`neural_decoder/`): ~1.2M params, bidirectional transformer with RoPE on 10-dim enhanced features, CTC loss. Trained clean→moderate→full curriculum. **Currently retraining on audio-extracted events** (previously trained with `--use-direct` which caused train/inference domain gap — model produced gibberish on real audio). Training at ~30 min/epoch on full scenario.
-- **CW-Former** (`neural_decoder/`): Conformer on mel spectrograms, ~30-40M params, CTC loss. Not yet trained. Must train from audio (no direct event shortcut).
+- **Event-Stream Transformer** (`neural_decoder/`): ~1.2M params, bidirectional transformer with RoPE on 10-dim enhanced features, CTC loss. Trained clean→moderate→full curriculum. Retrained on audio-extracted events after fixing train/inference domain gap (direct-only training produced gibberish on real audio).
+- **CW-Former** (`neural_decoder/`): Conformer on mel spectrograms, ~30-40M params, CTC loss. Not yet trained. Must train from audio (no direct event shortcut). Supports `--narrowband` mode: 32-bin mel filterbank (400–1200 Hz) with `NarrowbandProcessor` preprocessing (frequency detection → bandpass → frequency shift to 800 Hz center).
+- **Hybrid Event Transformer** (`hybrid_decoder/`): Extends the Event Transformer with 7 additional Bayesian timing posterior features from the reference decoder's `BayesianTimingModel`, giving 17-dim total features. Reuses `EventTransformerModel(in_features=17)`. Includes timing dropout (p=0.1) to prevent over-reliance on Bayesian features. Not yet trained.
 
 ### Shared infrastructure
 - `qso_corpus.py` + `build_lm.py` — QSO corpus generator and character trigram language model builder
 - `trigram_lm.json` — pre-built character trigram LM used by beam search decoders
 - `neural_decoder/ctc_decode.py` — CTC beam search with LM shallow fusion
+- `neural_decoder/narrowband_frontend.py` — `NarrowbandProcessor`: detects CW tone frequency, applies bandpass filter (±200 Hz), shifts to fixed 800 Hz center for narrow 32-bin mel filterbank. Used with `--narrowband` flag. **Imports `FrequencyTracker` from `reference_decoder/`** — cross-module dependency.
 - `neural_decoder/enhanced_featurizer.py` — 10-dim feature vectors for event transformer
 - `neural_decoder/dataset_events.py` / `dataset_audio.py` — streaming datasets for event transformer / CW-Former
 - `vocab.py`, `morse_table.py`, `morse_generator.py` — shared across all approaches
 
 ### Key lesson: direct events vs audio training
 **`generate_events_direct()` must not be used as the sole training path for models that will decode real audio.** Direct event generation produces idealized MorseEvent objects with synthetic timing/confidence. Real audio through `MorseEventExtractor` produces noisier events with different confidence distributions, missed dits, merged marks, etc. The Event Transformer was initially trained entirely with `--use-direct` and produced gibberish on real recordings. It is now being retrained with audio-extracted events (`direct_events=False`).
+
+### Key lesson: persistent worker RNG seeding
+**`worker_info.seed` must not be used as the RNG seed when `persistent_workers=True`.** With persistent workers, `worker_info.seed` is constant across epochs — all workers generate the same data every epoch. Fixed in `dataset_events.py` and `dataset_audio.py` by switching to `np.random.default_rng()` (OS entropy) so each epoch gets fresh seeds. Always use OS entropy or a time-based seed when workers are persistent.
 
 ---
 
@@ -217,12 +222,22 @@ and the LSTM processes them one event at a time with persistent hidden state.
 - `mel_frontend.py` — `MelFrontend`: raw audio → STFT (25ms/10ms) → 80-bin mel filterbank (0–4000 Hz) → log compression → SpecAugment (freq + time masking).
 - `conformer.py` — Conformer blocks: feed-forward → multi-head self-attention → convolution module → feed-forward (Macaron style).
 - `dataset_audio.py` — `AudioDataset`: streaming IterableDataset producing raw audio waveforms. Audio generation is CPU-bound bottleneck (~5-15s of 16kHz per sample).
+- `narrowband_frontend.py` — `NarrowbandProcessor`: CPU-side preprocessing for narrowband CW-Former mode. Detects CW tone frequency via `reference_decoder.FrequencyTracker`, applies Butterworth bandpass (±200 Hz), shifts tone to fixed 800 Hz center. Used when `CWFormerConfig.narrowband=True`. Constants: `NARROWBAND_N_MELS=32`, `NARROWBAND_F_MIN=400`, `NARROWBAND_F_MAX=1200`, `NARROWBAND_TARGET_CENTER=800`.
 - `train_cwformer.py` — Training loop. Smaller batches (micro=8, effective=64) due to audio memory. Persistent workers, prefetch_factor=4. 20K samples/epoch (reduced from baseline due to audio generation cost).
 - `inference_cwformer.py` — CW-Former inference.
 
 #### Shared neural decoder infrastructure
 - `ctc_decode.py` — `beam_search_with_lm()`: Graves 2012 prefix beam search with character trigram LM shallow fusion. Scoring: `log_ctc + lm_weight * log_lm + word_bonus`.
 - `eval.py` — Evaluation utilities for neural decoders.
+
+### hybrid_decoder/ — Hybrid Event Transformer
+
+Extends the Event-Stream Transformer with Bayesian timing posteriors from the reference decoder.
+
+- `hybrid_featurizer.py` — `HybridFeaturizer`: 17-dim featurizer extending `EnhancedFeaturizer` with 7 Bayesian timing posteriors. Dims 10–14: P(dit), P(dah), P(IES), P(ICS), P(IWS) from `BayesianTimingModel`. Dim 15: `timing_confidence` (max posterior − second). Dim 16: `rwe_dit_estimate_log` (log of RWE-tracked dit estimate). Mark events have zero at dims 12–14; space events have zero at dims 10–11.
+- `dataset.py` — `HybridTransformerDataset`: streaming IterableDataset, same interface as `EventTransformerDataset`. `timing_dropout=0.1` randomly zeros dims 10–16 during training to prevent over-reliance on Bayesian features.
+- `train.py` — Training loop for Hybrid Event Transformer. Reuses `EventTransformerModel(in_features=17)`. Gradient accumulation, AMP, 3-stage curriculum identical to Event Transformer. Checkpoints saved to `checkpoints_hybrid/`.
+- `inference.py` — `HybridTransformerDecoder`: sliding-window inference (3s window, 1.5s stride). Supports greedy, beam search, and LM-augmented beam search with same interface as `inference_transformer.py`.
 
 ### reference_decoder/ — Advanced probabilistic decoder
 - `iq_frontend.py` — I/Q matched-filter front end

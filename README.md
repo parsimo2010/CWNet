@@ -31,10 +31,11 @@ Audio (16 kHz) → MorseEventExtractor → EnhancedFeaturizer (10-dim)
 
 A Conformer model operating directly on mel spectrograms with convolutional
 subsampling and CTC loss. ~30-40M params. Bypasses the event extraction stage
-entirely.
+entirely. Supports a narrowband mode with a 32-bin filterbank (400–1200 Hz) and
+automatic frequency centering via `NarrowbandProcessor`.
 
 ```
-Audio (16 kHz) → Mel spectrogram (80 bins) → Conv subsampling (4×)
+Audio (16 kHz) → Mel spectrogram (80 bins, or 32 bins narrowband) → Conv subsampling (4×)
   → Conformer (12 layers, d=256) → CTC beam search + LM → text
 ```
 
@@ -43,6 +44,20 @@ Audio (16 kHz) → Mel spectrogram (80 bins) → Conv subsampling (4×)
 A fully probabilistic decoder using I/Q matched-filter front end, Bayesian
 timing classification, beam search with character trigram language model and
 word dictionary. No neural network.
+
+### 5. Hybrid Event Transformer
+
+Extends the Event-Stream Transformer with Bayesian timing posteriors from the reference
+decoder's timing model. Each event gets 17-dim features: 10 base statistics plus explicit
+P(dit), P(dah), P(IES), P(ICS), P(IWS) posteriors and an RWE-tracked dit estimate.
+
+```
+Audio (16 kHz) → MorseEventExtractor → HybridFeaturizer (17-dim)
+  → Transformer (6 layers, d=128) → CTC beam search + LM → text
+```
+
+Timing dropout (p=0.1) during training prevents over-reliance on Bayesian features.
+Reuses the same EventTransformerModel architecture with in_features=17.
 
 ## Key Design Choices
 
@@ -134,6 +149,16 @@ python -m neural_decoder.train_cwformer --scenario full --workers 12 \
     --checkpoint checkpoints_cwformer/best_model.pt
 ```
 
+### Hybrid Event Transformer
+```bash
+# Clean stage
+python -m hybrid_decoder.train --scenario clean --workers 8
+
+# Full stage (resume from clean checkpoint)
+python -m hybrid_decoder.train --scenario full --workers 8 \
+    --checkpoint checkpoints_hybrid/best_model.pt
+```
+
 Training produces CSV logs in the checkpoint directory with train/val loss,
 greedy CER (every epoch), and beam CER (every 50 epochs).
 
@@ -200,10 +225,17 @@ CWNet/
 │   ├── conformer.py           # Conformer encoder blocks
 │   ├── mel_frontend.py        # Mel spectrogram + SpecAugment
 │   ├── dataset_audio.py       # Streaming dataset (audio)
+│   ├── narrowband_frontend.py # Narrowband preprocessing (freq detect → bandpass → shift)
 │   ├── train_cwformer.py
 │   ├── inference_cwformer.py
 │   ├── ctc_decode.py          # CTC beam search with LM fusion
 │   └── eval.py                # Evaluation utilities
+│
+├── hybrid_decoder/            # Hybrid Event Transformer (17-dim features)
+│   ├── hybrid_featurizer.py   # 17-dim: 10 base + 7 Bayesian timing posteriors
+│   ├── dataset.py             # Streaming dataset with timing dropout
+│   ├── train.py               # Training loop (3-stage curriculum)
+│   └── inference.py           # Sliding-window inference decoder + CLI
 │
 ├── reference_decoder/         # Non-neural probabilistic decoder
 │   ├── iq_frontend.py         # I/Q matched-filter front end

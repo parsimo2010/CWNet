@@ -8,7 +8,7 @@ Build the most accurate possible neural CW decoder with no hardware constraints.
 
 ---
 
-## Current Status (2026-03-25)
+## Current Status (2026-04-04)
 
 **All core components are implemented.** ~3,900 lines across 14 Python files. Both training loops are production-ready. The project is now in the **train → benchmark → tune** phase.
 
@@ -27,14 +27,15 @@ Build the most accurate possible neural CW decoder with no hardware constraints.
 | Evaluation framework | Done | `eval.py` (1920-condition test matrix) |
 | CW-Former streaming inference | Done | `inference_cwformer.py` (8s windows, 4s stride, CTC prob stitching) |
 | LM λ tuning | **TODO** | Needs trained models first |
-| Hybrid decoder | **TODO** | Phase 7, depends on both decoders trained |
+| Narrowband CW-Former mode | Done | `narrowband_frontend.py`, `--narrowband` flag in `train_cwformer.py` |
+| Hybrid Event Transformer | Done | `hybrid_decoder/` (17-dim features: 10 base + 7 Bayesian posteriors) |
 
 ### Immediate priorities (in order)
 1. Train Event Transformer through all 3 stages — fastest to iterate on
 2. Train CW-Former through all 3 stages — longer but potentially higher accuracy
-3. Benchmark both against LSTM baseline using eval.py
-4. Tune LM shallow fusion λ on validation set
-5. Build CW-Former streaming inference
+3. Train Hybrid Event Transformer — benefits from Bayesian timing posteriors, similar training cost to Event Transformer
+4. Benchmark all three against LSTM baseline using eval.py
+5. Tune LM shallow fusion λ on validation set
 6. Head-to-head comparison, decide winner for optimization
 
 ---
@@ -589,11 +590,38 @@ class HybridDecoder:
         ...
 ```
 
+### 7.5 Approach C: Bayesian timing posteriors as features (implemented)
+
+This is the approach that was actually implemented. Rather than running two parallel decoders and combining their outputs, the reference decoder's `BayesianTimingModel` is used to augment the Event Transformer's input features.
+
+**Architecture:**
+```
+Audio (16 kHz) → MorseEventExtractor → HybridFeaturizer (17-dim)
+  → EventTransformerModel (in_features=17) → CTC beam search + LM → text
+```
+
+**Feature layout (17 dims):**
+- Indices 0-9: Same as EnhancedFeaturizer (10-dim base features)
+- Index 10: P(dit|duration) — for marks, 0 for spaces
+- Index 11: P(dah|duration) — for marks, 0 for spaces
+- Index 12: P(IES|duration) — for spaces, 0 for marks
+- Index 13: P(ICS|duration) — for spaces, 0 for marks
+- Index 14: P(IWS|duration) — for spaces, 0 for marks
+- Index 15: timing_confidence — max posterior minus second posterior
+- Index 16: rwe_dit_estimate_log — log of RWE-tracked dit estimate
+
+**Timing dropout** (p=0.1): During training, indices 10-16 are randomly zeroed to prevent over-reliance on Bayesian posteriors and maintain robustness when the timing model is wrong.
+
+**Location:** `hybrid_decoder/` (top-level package)
+
 ### Tasks
-- [ ] Analyze complementary failure modes from Phase 6 benchmarking — decide if hybrid is worthwhile
-- [ ] Implement confidence-based output blending (Approach A — simpler, do first)
-- [ ] Implement ROVER combination for low-confidence segments
-- [ ] (If Approach A insufficient) Implement neural emission scores in reference beam search (Approach B)
+- [x] Implement Bayesian timing posterior features (Approach C — implemented as primary hybrid) → `hybrid_decoder/hybrid_featurizer.py`
+- [x] Implement Hybrid Event Transformer training loop → `hybrid_decoder/train.py`
+- [x] Implement Hybrid Event Transformer inference → `hybrid_decoder/inference.py`
+- [x] Implement hybrid dataset with timing dropout → `hybrid_decoder/dataset.py`
+- [ ] Analyze complementary failure modes from Phase 6 benchmarking
+- [ ] (Optional) Implement confidence-based output blending (Approach A) if Approach C underperforms
+- [ ] (Optional) Implement ROVER combination for low-confidence segments
 - [ ] Benchmark hybrid vs. individual approaches on full test matrix
 
 ---
@@ -708,7 +736,14 @@ neural_decoder/
 
   # CW-Former inference (implemented ✓)
   inference_cwformer.py      ✓  ← CW-Former sliding-window inference + CLI (8s window, CTC prob stitching)
-  hybrid_decoder.py             ← Confidence blending + neural beam scores (Phase 7)
+  narrowband_frontend.py     ✓  ← Narrowband preprocessing (freq detect → bandpass → freq shift)
+
+# Hybrid Event Transformer (fully implemented ✓)
+# hybrid_decoder/
+#   hybrid_featurizer.py    ✓  ← 17-dim featurizer (10 base + 7 Bayesian posteriors)
+#   dataset.py              ✓  ← Streaming dataset with timing dropout
+#   train.py                ✓  ← Training loop (3-stage curriculum)
+#   inference.py            ✓  ← Sliding-window inference decoder + CLI
 ```
 
 ---
@@ -725,7 +760,7 @@ No new heavy dependencies required. PyTorch covers everything. `mel_frontend.py`
 
 ## Resolved Decisions
 
-1. **Sample rate for CW-Former**: 8 kHz is the default. Benchmark against 16 kHz but expect 8 kHz to be sufficient for CW bandwidth.
+1. **Sample rate for CW-Former**: 16 kHz throughout. The original plan considered 8 kHz but 16 kHz is used in the actual implementation to match the rest of the pipeline and the narrowband frontend (which targets 400–1200 Hz).
 
 2. **Vocabulary**: Keep the current 6 prosigns (AR/SK/BT/KN/AS/CT). Consider adding BK and HH (error correction) if they appear frequently in real QSOs. For prosigns with more than 6 elements (like SOS), only add if common enough to justify the extra decoding cost.
 
