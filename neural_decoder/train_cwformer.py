@@ -80,6 +80,78 @@ def compute_cer(hypothesis: str, reference: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Buffer pre-generation
+# ---------------------------------------------------------------------------
+
+def generate_epoch_buffer(
+    dataset: "AudioDataset",
+    micro_batch: int,
+    num_workers: int,
+    buffer_epochs: int = 1,
+    cache_dir: Optional[str] = None,
+    buffer_gen: int = 0,
+) -> list:
+    """Pre-generate buffer_epochs × epoch_size samples into a list of batches.
+
+    Each dataset pass uses OS-entropy RNG so all passes generate distinct
+    samples. If cache_dir is given, batches are saved to disk as .pt files
+    and loaded back rather than held in RAM — necessary when buffer_epochs > 1
+    for audio data (which can reach 15-20 GB for 5 passes × 20K samples).
+
+    Args:
+        buffer_epochs: Number of generation passes to accumulate.
+        cache_dir: If set, write batches to this directory instead of RAM.
+            Existing cache from the same buffer_gen index is reused if present.
+        buffer_gen: Cache generation index (used to namespace cache files so
+            old caches are not confused with new ones after a hard restart).
+    """
+    loader = DataLoader(
+        dataset, batch_size=micro_batch, collate_fn=collate_fn,
+        num_workers=num_workers, pin_memory=False,
+        prefetch_factor=4 if num_workers > 0 else None,
+        persistent_workers=False,
+    )
+
+    if cache_dir is not None:
+        cache_path = Path(cache_dir)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        index_file = cache_path / f"gen{buffer_gen}_index.pt"
+
+        if index_file.exists():
+            # Reuse existing cache: load list of file paths
+            file_list = torch.load(index_file, weights_only=False)
+            print(f"  Reusing cached buffer: {len(file_list)} batches from {cache_dir}",
+                  file=sys.stderr)
+            return [torch.load(p, weights_only=False) for p in
+                    tqdm(file_list, desc="Loading cache", file=sys.stderr, leave=False)]
+
+        # Write new cache
+        file_list = []
+        batch_idx = 0
+        for pass_idx in range(buffer_epochs):
+            desc = (f"Caching buffer pass {pass_idx + 1}/{buffer_epochs}"
+                    if buffer_epochs > 1 else "Caching buffer")
+            for batch in tqdm(loader, desc=desc, file=sys.stderr, leave=False):
+                p = cache_path / f"gen{buffer_gen}_batch{batch_idx:06d}.pt"
+                torch.save(batch, p)
+                file_list.append(p)
+                batch_idx += 1
+        torch.save(file_list, index_file)
+        # Load back into RAM list
+        return [torch.load(p, weights_only=False) for p in
+                tqdm(file_list, desc="Loading cache", file=sys.stderr, leave=False)]
+
+    # In-memory path
+    buffer = []
+    for pass_idx in range(buffer_epochs):
+        desc = (f"Filling buffer pass {pass_idx + 1}/{buffer_epochs}"
+                if buffer_epochs > 1 else "Filling buffer")
+        for batch in tqdm(loader, desc=desc, file=sys.stderr, leave=False):
+            buffer.append(batch)
+    return buffer
+
+
+# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -266,18 +338,23 @@ def train(args: argparse.Namespace) -> None:
         narrowband=args.narrowband,
     )
     val_ds = AudioDataset(
-        config, epoch_size=val_samples, seed=12345,
+        config, epoch_size=val_samples, seed=None,  # fresh samples each eval
         qso_text_ratio=0.5, max_audio_sec=args.max_audio_sec,
         narrowband=args.narrowband,
     )
 
     num_workers = args.workers
-    train_loader = DataLoader(
-        train_ds, batch_size=micro_batch, collate_fn=collate_fn,
-        num_workers=num_workers, pin_memory=(device.type == "cuda"),
-        prefetch_factor=4 if num_workers > 0 else None,
-        persistent_workers=num_workers > 0,
-    )
+    reuse_factor = args.reuse_factor
+
+    # For reuse_factor==1 keep the persistent streaming loader (current behaviour).
+    # For reuse_factor>1 we generate batches into RAM and replay them.
+    if reuse_factor <= 1:
+        train_loader = DataLoader(
+            train_ds, batch_size=micro_batch, collate_fn=collate_fn,
+            num_workers=num_workers, pin_memory=(device.type == "cuda"),
+            prefetch_factor=4 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
+        )
     val_loader = DataLoader(
         val_ds, batch_size=micro_batch, collate_fn=collate_fn,
         num_workers=min(num_workers, 4), pin_memory=(device.type == "cuda"),
@@ -292,12 +369,42 @@ def train(args: argparse.Namespace) -> None:
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(log_fields)
 
+    buffer_epochs = args.buffer_epochs
+    cache_dir = args.cache_dir
+
     # ---- Training loop ----
     beam_cer_interval = 50
+    reuse_str = (f", buffer_epochs={buffer_epochs}, reuse_factor={reuse_factor}"
+                 if reuse_factor > 1 else "")
     print(f"\nTraining: {total_epochs} epochs, {samples_per_epoch} samples/epoch, "
           f"micro_batch={micro_batch}, accum={accum_steps} (effective={micro_batch*accum_steps}), "
-          f"workers={num_workers}")
-    print(f"Scenario: {args.scenario}")
+          f"workers={num_workers}{reuse_str}")
+    print(f"Scenario: {args.scenario}"
+          + (f", cache_dir={cache_dir}" if cache_dir else ""))
+
+    # Buffer state for reuse_factor > 1.
+    #
+    # In-memory path (cache_dir=None):
+    #   Fill phase: generate one epoch at a time, train on fresh data only.
+    #   Replay does not start until buffer_epochs fill epochs are done.
+    #   Replay phase: shuffle full buffer, slice to one epoch's worth of batches.
+    #
+    # Disk-cache path (cache_dir set):
+    #   Blocking fill: generates all buffer_epochs passes up front, saves to disk.
+    #   GPU is idle during fill but disk enables buffers too large for RAM.
+    if reuse_factor > 1 and reuse_factor <= buffer_epochs:
+        print(f"WARNING: reuse_factor ({reuse_factor}) <= buffer_epochs "
+              f"({buffer_epochs}). No replay will occur. "
+              f"Increase --reuse-factor above --buffer-epochs.", file=sys.stderr)
+    _buffer: list = []
+    _buffer_rng = np.random.default_rng(99)
+    # In-memory state
+    _phase: str = "fill"
+    _fill_count: int = 0
+    _replay_count: int = 0
+    _batches_per_epoch: int = 0
+    # Disk-cache state
+    _buffer_gen: int = -1
 
     for epoch in range(start_epoch, total_epochs):
         t0 = time.time()
@@ -305,8 +412,82 @@ def train(args: argparse.Namespace) -> None:
         total_train_loss = 0.0
         n_batches = 0
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{total_epochs}",
-                     leave=False, file=sys.stderr)
+        if reuse_factor > 1:
+            if cache_dir is not None:
+                # ---- Disk-cache path: blocking fill ----
+                # GPU idle during fill; use when buffer_epochs > 1 and audio
+                # buffers exceed available RAM (~3-4 GB per pass × buffer_epochs).
+                this_gen = epoch // reuse_factor
+                if this_gen != _buffer_gen:
+                    if _buffer_gen >= 0:
+                        prev_index = Path(cache_dir) / f"gen{_buffer_gen}_index.pt"
+                        if prev_index.exists():
+                            prev_files = torch.load(prev_index, weights_only=False)
+                            for p in prev_files:
+                                try:
+                                    Path(p).unlink()
+                                except OSError:
+                                    pass
+                            prev_index.unlink(missing_ok=True)
+                    _buffer_gen = this_gen
+                    t_buf = time.time()
+                    print(f"\nFilling disk buffer (gen {_buffer_gen + 1}, "
+                          f"epoch {epoch + 1}, "
+                          f"{buffer_epochs} pass(es))...", file=sys.stderr)
+                    _buffer = generate_epoch_buffer(
+                        train_ds, micro_batch, num_workers,
+                        buffer_epochs=buffer_epochs,
+                        cache_dir=cache_dir,
+                        buffer_gen=_buffer_gen,
+                    )
+                    print(f"  {len(_buffer)} batches "
+                          f"({len(_buffer) * micro_batch:,} samples) "
+                          f"in {time.time() - t_buf:.0f}s", file=sys.stderr)
+                shuffled = list(_buffer)
+                _buffer_rng.shuffle(shuffled)
+                train_iter = iter(shuffled)
+                pbar_total = len(shuffled)
+            else:
+                # ---- In-memory path: fill-as-you-go ----
+                if _phase == "fill":
+                    t_buf = time.time()
+                    print(f"\nFill {_fill_count + 1}/{buffer_epochs} "
+                          f"(epoch {epoch + 1})...", file=sys.stderr)
+                    new_batches = generate_epoch_buffer(
+                        train_ds, micro_batch, num_workers, 1)
+                    _buffer.extend(new_batches)
+                    if _batches_per_epoch == 0:
+                        _batches_per_epoch = len(new_batches)
+                    _fill_count += 1
+                    print(f"  {len(new_batches)} batches in {time.time() - t_buf:.0f}s "
+                          f"(buffer: {len(_buffer)} total, "
+                          f"{_fill_count}/{buffer_epochs} passes).", file=sys.stderr)
+                    # Train on freshly generated data only — replay not yet started.
+                    shuffled_new = list(new_batches)
+                    _buffer_rng.shuffle(shuffled_new)
+                    train_iter = iter(shuffled_new)
+                    pbar_total = len(shuffled_new)
+                    if _fill_count >= buffer_epochs:
+                        _phase = "replay"
+                else:
+                    # Replay: shuffle full buffer, slice to one epoch's worth.
+                    shuffled = list(_buffer)
+                    _buffer_rng.shuffle(shuffled)
+                    train_iter = iter(shuffled[:_batches_per_epoch])
+                    pbar_total = _batches_per_epoch
+                    _replay_count += 1
+                    if _replay_count >= reuse_factor - buffer_epochs:
+                        _buffer = []
+                        _fill_count = 0
+                        _replay_count = 0
+                        _batches_per_epoch = 0
+                        _phase = "fill"
+        else:
+            train_iter = iter(train_loader)
+            pbar_total = None
+
+        pbar = tqdm(train_iter, desc=f"Epoch {epoch+1}/{total_epochs}",
+                     leave=False, file=sys.stderr, total=pbar_total)
         optimizer.zero_grad(set_to_none=True)
         micro_step = 0
 
@@ -477,6 +658,22 @@ def main():
                         help="DataLoader workers (default: min(8, cpu_count))")
     parser.add_argument("--max-audio-sec", type=float, default=15.0,
                         help="Max audio duration per sample (seconds)")
+    parser.add_argument("--reuse-factor", type=int, default=1, dest="reuse_factor",
+                        help="Replay each generated data buffer this many times before "
+                             "regenerating. 1=disabled (generate fresh each epoch). "
+                             "Recommended: 10 for moderate/full.")
+    parser.add_argument("--buffer-epochs", type=int, default=1, dest="buffer_epochs",
+                        help="Number of generation passes per buffer fill. Each pass "
+                             "produces epoch_size fresh samples, so buffer holds "
+                             "buffer_epochs * epoch_size unique samples. "
+                             "Recommended: 3 with --cache-dir (audio is ~4 GB/pass). "
+                             "Set reuse-factor >= buffer-epochs for good speedup.")
+    parser.add_argument("--cache-dir", type=str, default=None, dest="cache_dir",
+                        help="Directory for disk-based buffer cache. Required when "
+                             "buffer_epochs > 1 for audio (each pass ~3-4 GB). "
+                             "Batches are written as .pt files and reused across "
+                             "replay passes; cleaned up before each refill. "
+                             "Example: --cache-dir /tmp/cwformer_cache")
 
     args = parser.parse_args()
     train(args)
