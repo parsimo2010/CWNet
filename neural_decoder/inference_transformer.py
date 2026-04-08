@@ -104,24 +104,32 @@ def _load_audio(path: str, target_sr: int) -> np.ndarray:
     return audio
 
 
-def _events_to_features(
+def _extract_all_events_and_features(
     audio: np.ndarray,
     feature_cfg: FeatureConfig,
-) -> Tuple[np.ndarray, str]:
-    """Extract events from audio and featurize.
+) -> Tuple[np.ndarray, List[float]]:
+    """Extract events from full audio with continuous state and featurize.
 
-    Returns (features array (T, 10), empty string placeholder).
+    Runs the MorseEventExtractor and EnhancedFeaturizer once over the entire
+    audio stream so that adaptive thresholds and running statistics build up
+    properly across the full duration.
+
+    Returns:
+        features: (T, 10) float32 feature array.
+        event_times: list of start_sec for each event (length T), used to
+            map features back to time positions for windowing.
     """
     extractor = MorseEventExtractor(feature_cfg)
     events = extractor.process_chunk(audio)
     events += extractor.flush()
 
     if not events:
-        return np.empty((0, 10), dtype=np.float32), ""
+        return np.empty((0, 10), dtype=np.float32), []
 
     featurizer = EnhancedFeaturizer()
     features = featurizer.featurize_sequence(events)
-    return features, ""
+    event_times = [e.start_sec for e in events]
+    return features, event_times
 
 
 # ---------------------------------------------------------------------------
@@ -207,31 +215,46 @@ class TransformerDecoder:
     def decode_audio(self, audio: np.ndarray) -> str:
         """Decode a float32 audio array using sliding windows.
 
+        The feature extractor and featurizer run continuously over the full
+        audio so that adaptive thresholds and running statistics accumulate
+        properly. Only the transformer sees windowed slices of the resulting
+        feature sequence.
+
         Args:
             audio: 1-D float32 array at self.sample_rate.
 
         Returns:
             Decoded text string.
         """
-        win_samples = int(self.window_size * self.sample_rate)
-        stride_samples = int(self.stride * self.sample_rate)
+        # Run extractor + featurizer continuously over full audio
+        features, event_times = _extract_all_events_and_features(
+            audio, self._feature_cfg,
+        )
+        if features.shape[0] == 0:
+            return ""
 
-        # If audio fits in one window, just process it directly
-        if len(audio) <= win_samples:
-            return self._decode_window(audio)
+        # Single window — no need to slice
+        audio_duration = len(audio) / self.sample_rate
+        if audio_duration <= self.window_size:
+            return self._decode_features(features)
 
+        # Slide windows over features using event timestamps
+        event_times_arr = np.array(event_times)
         transcripts: List[str] = []
-        pos = 0
-        while pos < len(audio):
-            chunk = audio[pos: pos + win_samples]
-            if len(chunk) < win_samples // 4:
-                # Too short to be useful
+        win_start = 0.0
+        while win_start < audio_duration:
+            win_end = win_start + self.window_size
+            # Find events within this time window
+            mask = (event_times_arr >= win_start) & (event_times_arr < win_end)
+            win_features = features[mask]
+            if win_features.shape[0] == 0:
+                transcripts.append("")
+            else:
+                transcripts.append(self._decode_features(win_features))
+            win_start += self.stride
+            # Stop if remaining audio is too short
+            if audio_duration - win_start < self.window_size / 4:
                 break
-            if len(chunk) < win_samples:
-                # Pad final window
-                chunk = np.pad(chunk, (0, win_samples - len(chunk)))
-            transcripts.append(self._decode_window(chunk))
-            pos += stride_samples
 
         return _merge_windows(transcripts, self.stride, self.window_size)
 
@@ -246,13 +269,6 @@ class TransformerDecoder:
         Returns:
             Decoded text string.
         """
-        if features.shape[0] == 0:
-            return ""
-        return self._decode_features(features)
-
-    def _decode_window(self, audio: np.ndarray) -> str:
-        """Extract events from audio window and decode."""
-        features, _ = _events_to_features(audio, self._feature_cfg)
         if features.shape[0] == 0:
             return ""
         return self._decode_features(features)

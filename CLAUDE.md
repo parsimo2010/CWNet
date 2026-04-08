@@ -215,7 +215,7 @@ and the LSTM processes them one event at a time with persistent hidden state.
 - `rope.py` — Rotary Position Embeddings for speed-invariant relative positioning.
 - `dataset_events.py` — `EventTransformerDataset`: streaming IterableDataset. Supports both audio path (generate_sample → MorseEventExtractor → EnhancedFeaturizer) and direct path (generate_events_direct → EnhancedFeaturizer). `max_events` parameter controls sequence length cap (default 400, use 600 for full scenario).
 - `train_event_transformer.py` — Training loop with curriculum, gradient accumulation, AMP, cosine LR. Persistent workers, prefetch_factor=4. Resets best_val_loss when scenario changes.
-- `inference_transformer.py` — `TransformerDecoder`: sliding-window bidirectional decoding (default 3s window, 1.5s stride). Supports greedy, beam search, and LM-augmented beam search. Window merging via character-position ratio (crude — known limitation).
+- `inference_transformer.py` — `TransformerDecoder`: sliding-window bidirectional decoding (default 3s window, 1.5s stride). Feature extraction (MorseEventExtractor + EnhancedFeaturizer) runs continuously over the full audio; only the transformer sees windowed feature slices. Supports greedy, beam search, and LM-augmented beam search. Window merging via character-position ratio (crude — known limitation).
 
 #### CW-Former (Conformer)
 - `cwformer.py` — `CWFormer` (~30-40M params): MelFrontend → ConvSubsampling (4× time reduction) → ConformerEncoder → CTC head. Config: d_model=256, n_heads=4, n_layers=12, d_ff=1024, conv_kernel=31.
@@ -237,7 +237,7 @@ Extends the Event-Stream Transformer with Bayesian timing posteriors from the re
 - `hybrid_featurizer.py` — `HybridFeaturizer`: 17-dim featurizer extending `EnhancedFeaturizer` with 7 Bayesian timing posteriors. Dims 10–14: P(dit), P(dah), P(IES), P(ICS), P(IWS) from `BayesianTimingModel`. Dim 15: `timing_confidence` (max posterior − second). Dim 16: `rwe_dit_estimate_log` (log of RWE-tracked dit estimate). Mark events have zero at dims 12–14; space events have zero at dims 10–11.
 - `dataset.py` — `HybridTransformerDataset`: streaming IterableDataset, same interface as `EventTransformerDataset`. `timing_dropout=0.1` randomly zeros dims 10–16 during training to prevent over-reliance on Bayesian features.
 - `train.py` — Training loop for Hybrid Event Transformer. Reuses `EventTransformerModel(in_features=17)`. Gradient accumulation, AMP, 3-stage curriculum identical to Event Transformer. Checkpoints saved to `checkpoints_hybrid/`.
-- `inference.py` — `HybridTransformerDecoder`: sliding-window inference (3s window, 1.5s stride). Supports greedy, beam search, and LM-augmented beam search with same interface as `inference_transformer.py`.
+- `inference.py` — `HybridTransformerDecoder`: sliding-window inference (3s window, 1.5s stride). Feature extraction (MorseEventExtractor + HybridFeaturizer + BayesianTimingModel) runs continuously over the full audio; only the transformer sees windowed feature slices. Supports greedy, beam search, and LM-augmented beam search with same interface as `inference_transformer.py`.
 
 ### reference_decoder/ — Advanced probabilistic decoder
 - `iq_frontend.py` — I/Q matched-filter front end

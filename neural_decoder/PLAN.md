@@ -764,7 +764,7 @@ No new heavy dependencies required. PyTorch covers everything. `mel_frontend.py`
 
 2. **Vocabulary**: Keep the current 6 prosigns (AR/SK/BT/KN/AS/CT). Consider adding BK and HH (error correction) if they appear frequently in real QSOs. For prosigns with more than 6 elements (like SOS), only add if common enough to justify the extra decoding cost.
 
-3. **Inference mode**: Bidirectional transformer on 2-4 second sliding windows. A few seconds of latency is acceptable for the accuracy gain. No need for a separate causal streaming mode.
+3. **Inference mode**: Bidirectional transformer on 2-4 second sliding windows over continuously-extracted features. Feature extraction (MorseEventExtractor + featurizer) runs once over the full audio so adaptive thresholds and running statistics accumulate properly; only the transformer sees windowed slices. A few seconds of latency is acceptable for the accuracy gain. No need for a separate causal streaming mode.
 
 4. **Model size**: Start with the standard size (12 layers x 256 dim, ~30-40M params). Only try a larger variant if the standard model plateaus.
 

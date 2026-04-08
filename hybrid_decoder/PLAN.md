@@ -159,8 +159,9 @@ python -m hybrid_decoder.inference \
     --lm-weight 0.3
 ```
 
-Inference uses `HybridTransformerDecoder` with the same sliding-window approach as `inference_transformer.py`:
-- Default window: 3 seconds, stride: 1.5 seconds
+Inference uses `HybridTransformerDecoder` with continuous feature extraction and windowed transformer decoding:
+- Feature extraction (MorseEventExtractor + HybridFeaturizer/BayesianTimingModel) runs once over the full audio, ensuring adaptive thresholds, running statistics, and Bayesian timing posteriors accumulate properly across the entire stream
+- The transformer sees overlapping slices of the pre-computed feature sequence (default 3s window, 1.5s stride)
 - Window merging via character-position ratio (known limitation — crude boundary handling)
 - Supports greedy, CTC beam search, and LM-augmented beam search
 
