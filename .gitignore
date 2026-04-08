@@ -10,8 +10,15 @@
 !count_3l.txt
 !english_3grams.csv
 
-# model checkpoints
+# Real HF noise recordings for training augmentation (override *.wav above)
+!recordings/noise_*.wav
+
+# model checkpoints and training artifacts
 *.pt
+checkpoints/
+checkpoints_cwformer/
+checkpoints_event_transformer/
+checkpoints_hybrid/
 
 # pre-generated audio-based samples
 *.npz
