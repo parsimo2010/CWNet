@@ -180,6 +180,20 @@ def evaluate(
 
             with autocast("cuda", enabled=use_amp):
                 log_probs, out_lens = model(audio, audio_lens)
+
+                # CTC feasibility: skip samples where output is too short
+                valid = out_lens >= target_lens
+                if not valid.all():
+                    idx = valid.nonzero(as_tuple=True)[0]
+                    if len(idx) == 0:
+                        del audio, targets, audio_lens, target_lens, log_probs, out_lens
+                        continue
+                    log_probs = log_probs[:, idx, :]
+                    targets = targets[idx]
+                    out_lens = out_lens[idx]
+                    target_lens = target_lens[idx]
+                    texts = [texts[i] for i in idx.cpu().tolist()]
+
                 loss = ctc_loss_fn(log_probs, targets, out_lens, target_lens)
 
             total_loss += loss.item()

@@ -1121,9 +1121,10 @@ def generate_sample(
     bandpass_bw = 0.0
     if config.bandpass_probability > 0.0 and rng.random() < config.bandpass_probability:
         bandpass_bw = float(rng.uniform(config.bandpass_bw_min, config.bandpass_bw_max))
+        bandpass_order = int(rng.integers(config.bandpass_order_min, config.bandpass_order_max + 1))
         audio_f32 = _apply_bandpass(
             audio_f32, config.sample_rate, base_freq, bandpass_bw,
-            order=config.bandpass_order,
+            order=bandpass_order,
         )
         has_bandpass = True
 

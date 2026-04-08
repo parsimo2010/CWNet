@@ -57,11 +57,11 @@ def _load_cwformer_checkpoint(
 
     mel_cfg = MelFrontendConfig(
         sample_rate=mc.get("sample_rate", 16000),
-        n_mels=mc.get("n_mels", 80),
+        n_mels=mc.get("n_mels", 40),
         n_fft=mc.get("n_fft", 400),
         hop_length=mc.get("hop_length", 160),
-        f_min=mc.get("f_min", 0.0),
-        f_max=mc.get("f_max", 4000.0),
+        f_min=mc.get("f_min", 200.0),
+        f_max=mc.get("f_max", 1400.0),
         spec_augment=False,  # no augmentation at inference
     )
     conformer_cfg = ConformerConfig(

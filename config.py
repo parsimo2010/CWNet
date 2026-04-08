@@ -146,10 +146,12 @@ class MorseConfig:
 
     # Receiver bandpass filter — simulates a real CW filter (200-500 Hz BW).
     # Applied after all signal mixing, before normalisation.
+    # Real radios always have a filter; probability should be high (0.5-1.0).
     bandpass_probability: float = 0.0     # fraction of samples with bandpass
     bandpass_bw_min: float = 200.0        # min filter bandwidth (Hz)
     bandpass_bw_max: float = 500.0        # max filter bandwidth (Hz)
-    bandpass_order: int = 4               # Butterworth filter order
+    bandpass_order_min: int = 4           # min Butterworth filter order
+    bandpass_order_max: int = 4           # max Butterworth filter order (sampled per sample)
 
     # Real HF noise — mix recorded HF band noise instead of/with AWGN.
     # Bridges the synthetic-to-real gap by using actual band characteristics.
@@ -457,10 +459,12 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.farnsworth_probability = 0.10
         cfg.morse.farnsworth_char_speed_min = 1.2
         cfg.morse.farnsworth_char_speed_max = 1.5
-        # Bandpass filter: mild introduction (20% of samples, wide filter)
-        cfg.morse.bandpass_probability = 0.20
+        # Bandpass filter: half of samples, wide filter, gentle slopes
+        cfg.morse.bandpass_probability = 0.50
         cfg.morse.bandpass_bw_min = 400.0
         cfg.morse.bandpass_bw_max = 500.0
+        cfg.morse.bandpass_order_min = 4
+        cfg.morse.bandpass_order_max = 6
         # Real HF noise: mild introduction (15% of samples)
         cfg.morse.hf_noise_probability = 0.15
         cfg.morse.hf_noise_mix_ratio = 0.5
@@ -509,10 +513,12 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.qrn_probability = 0.15
         cfg.morse.qrn_rate_max = 3.0
         cfg.morse.qrn_amplitude_max = 1.0
-        # Bandpass filter: moderate (40% of samples)
-        cfg.morse.bandpass_probability = 0.40
+        # Bandpass filter: most samples, narrower filters, sharper slopes
+        cfg.morse.bandpass_probability = 0.70
         cfg.morse.bandpass_bw_min = 250.0
         cfg.morse.bandpass_bw_max = 500.0
+        cfg.morse.bandpass_order_min = 4
+        cfg.morse.bandpass_order_max = 8
         # Real HF noise: moderate (30% of samples)
         cfg.morse.hf_noise_probability = 0.30
         cfg.morse.hf_noise_mix_ratio = 0.6
@@ -566,10 +572,12 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.qrn_probability = 0.25
         cfg.morse.qrn_rate_max = 5.0
         cfg.morse.qrn_amplitude_max = 2.0
-        # Bandpass filter: full (60% of samples, narrower filters)
-        cfg.morse.bandpass_probability = 0.60
+        # Bandpass filter: nearly all samples, full range of widths and slopes
+        cfg.morse.bandpass_probability = 0.90
         cfg.morse.bandpass_bw_min = 200.0
         cfg.morse.bandpass_bw_max = 500.0
+        cfg.morse.bandpass_order_min = 4
+        cfg.morse.bandpass_order_max = 8
         # Real HF noise: full (50% of samples)
         cfg.morse.hf_noise_probability = 0.50
         cfg.morse.hf_noise_mix_ratio = 0.7

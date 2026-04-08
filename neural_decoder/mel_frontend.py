@@ -36,14 +36,14 @@ class MelFrontendConfig:
     sample_rate: int = 16000
     n_fft: int = 400             # 25ms at 16kHz
     hop_length: int = 160        # 10ms at 16kHz
-    n_mels: int = 80             # Number of mel bins
-    f_min: float = 0.0           # Min frequency for mel filterbank
-    f_max: float = 4000.0        # Max frequency (CW is narrowband, 4kHz plenty)
+    n_mels: int = 40             # Number of mel bins
+    f_min: float = 200.0         # Min frequency for mel filterbank
+    f_max: float = 1400.0        # Max frequency (covers 500-900 Hz tone + filter skirts)
 
     # SpecAugment parameters (Park et al., 2019)
     spec_augment: bool = True    # Enable during training
     freq_mask_count: int = 2     # Number of frequency masks
-    freq_mask_width: int = 15    # Max width of each frequency mask (bins)
+    freq_mask_width: int = 8     # Max width of each frequency mask (bins)
     time_mask_count: int = 2     # Number of time masks
     time_mask_width: int = 50    # Max width of each time mask (frames)
     time_mask_ratio: float = 0.1 # Max fraction of time steps to mask
@@ -234,8 +234,12 @@ class MelFrontend(nn.Module):
 
         # Compute output lengths
         mel_lengths = None
+        T_actual = mel.shape[1]
         if audio_lengths is not None:
-            mel_lengths = (audio_lengths + pad_amount) // cfg.hop_length
+            # Exact STFT frame count: (padded_len - n_fft) // hop + 1
+            # = (audio_len + 2*pad - n_fft) // hop + 1 = audio_len // hop + 1
+            mel_lengths = audio_lengths // cfg.hop_length + 1
+            mel_lengths = mel_lengths.clamp(max=T_actual)
 
         # SpecAugment (training only)
         if self.spec_augment is not None:

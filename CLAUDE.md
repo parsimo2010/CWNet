@@ -6,7 +6,7 @@ CWNet is an advanced Morse code (CW) decoder project pursuing two parallel appro
 
 1. **Reference Decoder** (`reference_decoder/`): A fully probabilistic, non-neural decoder using I/Q matched-filter front end, Bayesian timing classification with RWE speed tracking, beam search with character trigram language model and word dictionary. No hardware constraints.
 
-2. **Neural Decoder** (`neural_decoder/`): A transformer-based decoder in two variants — CW-Former (Conformer on raw mel spectrograms, ~30-40M params) and Event-Stream Transformer (transformer on MorseEvent features, ~2-5M params). Both use CTC loss with language model integration. No hardware constraints.
+2. **Neural Decoder** (`neural_decoder/`): A transformer-based decoder in two variants — CW-Former (Conformer on raw mel spectrograms, ~19.5M params) and Event-Stream Transformer (transformer on MorseEvent features, ~2-5M params). Both use CTC loss with language model integration. No hardware constraints.
 
 **Design philosophy:** Never make hard decisions — propagate probabilities through every stage. Use the best published ideas from seven decades of CW decoding research (see `morse_decoding_research.md`). Both approaches must handle any key type (straight, bug, paddle, cootie) on human-sent code.
 
@@ -27,7 +27,7 @@ The project has three decoder paths:
 ### Under development
 - **Advanced reference decoder** (`reference_decoder/`): I/Q matched filter, Bayesian classification, RWE speed tracking, language model, QSO structure tracking. See `reference_decoder/PLAN.md`.
 - **Event-Stream Transformer** (`neural_decoder/`): ~1.2M params, bidirectional transformer with RoPE on 10-dim enhanced features, CTC loss. Trained clean→moderate→full curriculum. Retrained on audio-extracted events after fixing train/inference domain gap (direct-only training produced gibberish on real audio).
-- **CW-Former** (`neural_decoder/`): Conformer on mel spectrograms, ~30-40M params, CTC loss. Not yet trained. Must train from audio (no direct event shortcut). Supports `--narrowband` mode: 32-bin mel filterbank (400–1200 Hz) with `NarrowbandProcessor` preprocessing (frequency detection → bandpass → frequency shift to 800 Hz center).
+- **CW-Former** (`neural_decoder/`): Conformer on mel spectrograms, ~19.5M params, CTC loss. Not yet trained. Must train from audio (no direct event shortcut). Wideband mode: 40-bin mel (200–1400 Hz). Supports `--narrowband` mode: 32-bin mel filterbank (400–1200 Hz) with `NarrowbandProcessor` preprocessing (frequency detection → bandpass → frequency shift to 800 Hz center).
 - **Hybrid Event Transformer** (`hybrid_decoder/`): Extends the Event Transformer with 7 additional Bayesian timing posterior features from the reference decoder's `BayesianTimingModel`, giving 17-dim total features. Reuses `EventTransformerModel(in_features=17)`. Includes timing dropout (p=0.1) to prevent over-reliance on Bayesian features. Not yet trained.
 
 ### Shared infrastructure
@@ -218,8 +218,8 @@ and the LSTM processes them one event at a time with persistent hidden state.
 - `inference_transformer.py` — `TransformerDecoder`: sliding-window bidirectional decoding (default 3s window, 1.5s stride). Feature extraction (MorseEventExtractor + EnhancedFeaturizer) runs continuously over the full audio; only the transformer sees windowed feature slices. Supports greedy, beam search, and LM-augmented beam search. Window merging via character-position ratio (crude — known limitation).
 
 #### CW-Former (Conformer)
-- `cwformer.py` — `CWFormer` (~30-40M params): MelFrontend → ConvSubsampling (4× time reduction) → ConformerEncoder → CTC head. Config: d_model=256, n_heads=4, n_layers=12, d_ff=1024, conv_kernel=31.
-- `mel_frontend.py` — `MelFrontend`: raw audio → STFT (25ms/10ms) → 80-bin mel filterbank (0–4000 Hz) → log compression → SpecAugment (freq + time masking).
+- `cwformer.py` — `CWFormer` (~19.5M params): MelFrontend → ConvSubsampling (4× time reduction) → ConformerEncoder → CTC head. Config: d_model=256, n_heads=4, n_layers=12, d_ff=1024, conv_kernel=31.
+- `mel_frontend.py` — `MelFrontend`: raw audio → STFT (25ms/10ms) → 40-bin mel filterbank (200–1400 Hz) → log compression → SpecAugment (freq + time masking).
 - `conformer.py` — Conformer blocks: feed-forward → multi-head self-attention → convolution module → feed-forward (Macaron style).
 - `dataset_audio.py` — `AudioDataset`: streaming IterableDataset producing raw audio waveforms. Audio generation is CPU-bound bottleneck (~5-15s of 16kHz per sample).
 - `narrowband_frontend.py` — `NarrowbandProcessor`: CPU-side preprocessing for narrowband CW-Former mode. Detects CW tone frequency via `reference_decoder.FrequencyTracker`, applies Butterworth bandpass (±200 Hz), shifts tone to fixed 800 Hz center. Used when `CWFormerConfig.narrowband=True`. Constants: `NARROWBAND_N_MELS=32`, `NARROWBAND_F_MIN=400`, `NARROWBAND_F_MAX=1200`, `NARROWBAND_TARGET_CENTER=800`.
@@ -261,9 +261,9 @@ Extends the Event-Stream Transformer with Bayesian timing posteriors from the re
 
 | Stage | SNR | WPM | AGC | QSB | Timing | Key Types | Audio Augmentations |
 |-------|-----|-----|-----|-----|--------|-----------|---------------------|
-| clean | 15–40 dB | 10–40 | 30% | 0% | near-ITU (dah/dit 2.5–3.5, ics 0.8–1.2, iws 0.8–1.5) | 20/20/60/0 S/B/P/C | 10% Farnsworth, 20% bandpass (400–500 Hz), 15% HF noise |
-| moderate | 8–35 dB | 8–45 | 50%, depth 6–18 dB | 25%, depth 3–12 dB | moderate bad-fist (dah/dit 1.8–3.8, ics 0.6–1.6, iws 0.6–2.0, jitter 0–15%) | 25/25/35/15 S/B/P/C | 20% Farnsworth, 15% QRM (1–2), 15% QRN, 40% bandpass (250–500 Hz), 30% HF noise, 10% multi-op |
-| full  | 3–30 dB  | 5–50  | 70%, depth 6–22 dB | 50%, depth 3–18 dB | bad-fist (dah/dit 1.3–4.0, ics 0.5–2.0, iws 0.5–2.5, jitter 0–25%) | 30/30/20/20 S/B/P/C | 25% Farnsworth, 30% QRM (1–3), 25% QRN, 60% bandpass (200–500 Hz), 50% HF noise, 15% multi-op |
+| clean | 15–40 dB | 10–40 | 30% | 0% | near-ITU (dah/dit 2.5–3.5, ics 0.8–1.2, iws 0.8–1.5) | 20/20/60/0 S/B/P/C | 10% Farnsworth, 50% bandpass (400–500 Hz, order 4–6), 15% HF noise |
+| moderate | 8–35 dB | 8–45 | 50%, depth 6–18 dB | 25%, depth 3–12 dB | moderate bad-fist (dah/dit 1.8–3.8, ics 0.6–1.6, iws 0.6–2.0, jitter 0–15%) | 25/25/35/15 S/B/P/C | 20% Farnsworth, 15% QRM (1–2), 15% QRN, 70% bandpass (250–500 Hz, order 4–8), 30% HF noise, 10% multi-op |
+| full  | 3–30 dB  | 5–50  | 70%, depth 6–22 dB | 50%, depth 3–18 dB | bad-fist (dah/dit 1.3–4.0, ics 0.5–2.0, iws 0.5–2.5, jitter 0–25%) | 30/30/20/20 S/B/P/C | 25% Farnsworth, 30% QRM (1–3), 25% QRN, 90% bandpass (200–500 Hz, order 4–8), 50% HF noise, 15% multi-op |
 
 Timing params (dah_dit_ratio, ics_factor, iws_factor) are **sampled independently per sample** — this is critical for robustness.
 

@@ -22,8 +22,8 @@ For CW (OOK), the image carries redundant information, not noise.
 
 With narrowband mode, the mel filterbank uses:
   f_min=400, f_max=1200, n_mels=32
-instead of the default f_min=0, f_max=4000, n_mels=80, reducing the conv
-subsampling linear layer from channels*20 to channels*8.
+instead of the default f_min=200, f_max=1400, n_mels=40, further reducing the conv
+subsampling linear layer from channels*10 to channels*8.
 """
 
 from __future__ import annotations

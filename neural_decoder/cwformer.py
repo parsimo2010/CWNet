@@ -3,7 +3,7 @@ cwformer.py — CW-Former: Conformer-based CW decoder operating on raw audio.
 
 Full pipeline:
   Audio (16 kHz mono, float32)
-  → MelFrontend: log-mel spectrogram (80 bins, 25ms/10ms; or 32 bins in narrowband) + SpecAugment
+  → MelFrontend: log-mel spectrogram (40 bins 200-1400 Hz, 25ms/10ms; or 32 bins 400-1200 Hz in narrowband) + SpecAugment
   → Conv subsampling: 2 layers with stride 2 → 4× time reduction
   → Linear projection to d_model + dropout
   → ConformerEncoder: 12 Conformer blocks (d=256, 4 heads, conv kernel=31)
@@ -14,7 +14,7 @@ The conv subsampling reduces the frame rate from 100 fps (10ms hop) to
 longer sequences while preserving enough temporal resolution for
 Morse timing patterns.
 
-Total parameters: ~30-40M depending on configuration.
+Total parameters: ~19.5M (wideband) or ~19.4M (narrowband).
 
 Reference: Gulati et al., "Conformer: Convolution-augmented Transformer
 for Speech Recognition", 2020.
@@ -187,6 +187,8 @@ class CWFormer(nn.Module):
         mask = None
         if out_lengths is not None:
             B, T, _ = x.shape
+            # Clamp to actual tensor length (guards against length formula rounding)
+            out_lengths = out_lengths.clamp(max=T)
             mask = torch.arange(T, device=x.device).unsqueeze(0) >= out_lengths.unsqueeze(1)
 
         # Conformer encoder
