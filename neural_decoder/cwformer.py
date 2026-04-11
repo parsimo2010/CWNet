@@ -4,15 +4,14 @@ cwformer.py — CW-Former: Conformer-based CW decoder operating on raw audio.
 Full pipeline:
   Audio (16 kHz mono, float32)
   → MelFrontend: log-mel spectrogram (40 bins 200-1400 Hz, 25ms/10ms; or 32 bins 400-1200 Hz in narrowband) + SpecAugment
-  → Conv subsampling: 2 layers with stride 2 → 4× time reduction
+  → Conv subsampling: 2× time reduction (default) or 4× (legacy)
   → Linear projection to d_model + dropout
   → ConformerEncoder: 12 Conformer blocks (d=256, 4 heads, conv kernel=31)
   → Linear CTC head → log_softmax over vocabulary
 
-The conv subsampling reduces the frame rate from 100 fps (10ms hop) to
-25 fps (40ms effective hop), making the self-attention tractable for
-longer sequences while preserving enough temporal resolution for
-Morse timing patterns.
+Default 2× subsampling: 100 fps → 50 fps (20ms per frame). Resolves
+Morse dits up to 40+ WPM. At 4× (40ms), dits become sub-frame above
+~20 WPM, causing an irrecoverable CER plateau around 39%.
 
 Total parameters: ~19.5M (wideband) or ~19.4M (narrowband).
 
@@ -49,7 +48,7 @@ class CWFormerConfig:
     # Conformer encoder
     conformer: ConformerConfig = field(default_factory=ConformerConfig)
 
-    # Conv subsampling
+    # Conv subsampling (2× time, 4× freq → 20ms per output frame)
     subsample_channels: int = 256    # Channels in subsampling conv layers
     subsample_dropout: float = 0.1
 
@@ -64,25 +63,28 @@ class CWFormerConfig:
 
 
 # ---------------------------------------------------------------------------
-# Conv subsampling (2 layers, stride 2 each → 4× reduction)
+# Conv subsampling (2× time, 4× freq → 20ms per output frame)
 # ---------------------------------------------------------------------------
 
 class ConvSubsampling(nn.Module):
-    """2-layer convolutional subsampling.
+    """2-layer convolutional subsampling: 2× time reduction, 4× freq reduction.
 
-    Conv2d(1→C, 3×3, stride 2) → ReLU → Conv2d(C→C, 3×3, stride 2) → ReLU
+    Conv2d(1→C, 3×3, stride 2) → ReLU → Conv2d(C→C, 3×3, stride (1,2)) → ReLU
     → Reshape → Linear(C × n_mels//4 → d_model)
 
-    Reduces time by 4× and projects mel features to d_model dimension.
+    At 10ms STFT hop, 2× time reduction gives 20ms per output frame,
+    which resolves Morse dits up to 40+ WPM.
     """
 
     def __init__(self, n_mels: int, d_model: int, channels: int = 256,
                  dropout: float = 0.1):
         super().__init__()
         self.conv1 = nn.Conv2d(1, channels, kernel_size=3, stride=2, padding=1)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
+        # stride (1,2): no time reduction, 2× freq reduction
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3,
+                               stride=(1, 2), padding=1)
 
-        # After 2× stride twice on the mel dim: n_mels → ceil(ceil(n_mels/2)/2)
+        # Freq dimension after 2× stride twice: n_mels → ceil(ceil(n_mels/2)/2)
         mel_out = math.ceil(math.ceil(n_mels / 2) / 2)
         self.linear = nn.Linear(channels * mel_out, d_model)
         self.dropout = nn.Dropout(dropout)
@@ -100,28 +102,23 @@ class ConvSubsampling(nn.Module):
 
         Returns
         -------
-        out : Tensor, shape (B, T//4, d_model)
+        out : Tensor, shape (B, T//2, d_model)
         out_lengths : Tensor, shape (B,) — frame counts after subsampling
         """
-        # Reshape to (B, 1, T, n_mels) for Conv2d
-        x = x.unsqueeze(1)
-
-        x = F.relu(self.conv1(x))   # (B, C, T//2, n_mels//2)
-        x = F.relu(self.conv2(x))   # (B, C, T//4, n_mels//4)
+        x = x.unsqueeze(1)                # (B, 1, T, n_mels)
+        x = F.relu(self.conv1(x))          # (B, C, T//2, n_mels//2)
+        x = F.relu(self.conv2(x))          # (B, C, T//2, n_mels//4)
 
         B, C, T, F_ = x.shape
-        # Reshape: (B, C, T, F) → (B, T, C*F)
         x = x.permute(0, 2, 1, 3).reshape(B, T, C * F_)
 
-        x = self.linear(x)          # (B, T, d_model)
+        x = self.linear(x)                # (B, T, d_model)
         x = self.dropout(x)
 
-        # Compute output lengths
         out_lengths = None
         if lengths is not None:
-            # Each conv with stride 2 and padding 1: ceil(L / 2)
+            # Only conv1 reduces time (stride 2): ceil(L / 2)
             out_lengths = torch.div(lengths + 1, 2, rounding_mode="floor")
-            out_lengths = torch.div(out_lengths + 1, 2, rounding_mode="floor")
 
         return x, out_lengths
 
@@ -180,7 +177,7 @@ class CWFormer(nn.Module):
         # Mel spectrogram
         mel, mel_lengths = self.mel_frontend(audio, audio_lengths)
 
-        # Conv subsampling (4× time reduction)
+        # Conv subsampling
         x, out_lengths = self.subsampling(mel, mel_lengths)
 
         # Create padding mask from lengths

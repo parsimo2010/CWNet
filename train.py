@@ -306,8 +306,14 @@ def train(args: argparse.Namespace) -> None:
     print(f"Vocabulary   : {vocab_module.num_classes} tokens  (blank=0)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    scaler = GradScaler(device="cuda") if device.type == "cuda" else None
-    print(f"Device       : {device}  (AMP {'enabled' if scaler else 'disabled'})")
+    is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+    no_amp = getattr(args, 'no_amp', False) or is_rocm
+    scaler = GradScaler(device="cuda") if (device.type == "cuda" and not no_amp) else None
+    use_pin_memory = device.type == "cuda" and not is_rocm
+    if is_rocm:
+        print(f"Device       : {device} (ROCm {torch.version.hip})  AMP disabled, pin_memory disabled")
+    else:
+        print(f"Device       : {device}  (AMP {'enabled' if scaler else 'disabled'})")
 
     # ---- Debug samples ---------------------------------------------------
     save_debug_samples(config, ckpt_dir / "debug_samples", n=5)
@@ -359,7 +365,7 @@ def train(args: argparse.Namespace) -> None:
                 batch_size=config.training.batch_size,
                 collate_fn=collate_fn,
                 num_workers=0,  # map-style, data already in RAM
-                pin_memory=(device.type == "cuda"),
+                pin_memory=use_pin_memory,
             )
         else:
             ds = StreamingMorseDataset(
@@ -371,7 +377,7 @@ def train(args: argparse.Namespace) -> None:
                 batch_size=config.training.batch_size,
                 collate_fn=collate_fn,
                 num_workers=config.training.num_workers,
-                pin_memory=(device.type == "cuda"),
+                pin_memory=use_pin_memory,
                 prefetch_factor=4 if config.training.num_workers > 0 else None,
                 persistent_workers=(config.training.num_workers > 0),
             )
@@ -388,7 +394,7 @@ def train(args: argparse.Namespace) -> None:
             batch_size=config.training.batch_size,
             collate_fn=collate_fn,
             num_workers=0,
-            pin_memory=(device.type == "cuda"),
+            pin_memory=use_pin_memory,
         )
     else:
         val_direct = use_direct if pregen_files is None else True
@@ -403,7 +409,7 @@ def train(args: argparse.Namespace) -> None:
             batch_size=config.training.batch_size,
             collate_fn=collate_fn,
             num_workers=config.training.num_workers,
-            pin_memory=(device.type == "cuda"),
+            pin_memory=use_pin_memory,
             prefetch_factor=4 if config.training.num_workers > 0 else None,
             persistent_workers=(config.training.num_workers > 0),
         )
@@ -663,6 +669,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pregenerated-val", type=str, default=None, metavar="PATH",
                    help="Pre-generated validation features (.npz). "
                         "If omitted with --pregenerated, falls back to direct events.")
+    p.add_argument("--no-amp", action="store_true", dest="no_amp",
+                   help="Disable AMP (mixed precision). Auto-disabled on ROCm.")
     return p
 
 

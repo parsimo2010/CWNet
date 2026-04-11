@@ -83,27 +83,19 @@ def compute_cer(hypothesis: str, reference: str) -> float:
 # Buffer pre-generation
 # ---------------------------------------------------------------------------
 
-def generate_epoch_buffer(
+def generate_disk_cache(
     dataset: "AudioDataset",
     micro_batch: int,
     num_workers: int,
     buffer_epochs: int = 1,
-    cache_dir: Optional[str] = None,
+    cache_dir: str = "",
     buffer_gen: int = 0,
 ) -> list:
-    """Pre-generate buffer_epochs × epoch_size samples into a list of batches.
+    """Pre-generate buffer_epochs × epoch_size samples and save to disk.
 
-    Each dataset pass uses OS-entropy RNG so all passes generate distinct
-    samples. If cache_dir is given, batches are saved to disk as .pt files
-    and loaded back rather than held in RAM — necessary when buffer_epochs > 1
-    for audio data (which can reach 15-20 GB for 5 passes × 20K samples).
-
-    Args:
-        buffer_epochs: Number of generation passes to accumulate.
-        cache_dir: If set, write batches to this directory instead of RAM.
-            Existing cache from the same buffer_gen index is reused if present.
-        buffer_gen: Cache generation index (used to namespace cache files so
-            old caches are not confused with new ones after a hard restart).
+    Returns a list of Path objects (file paths to .pt batch files), NOT
+    loaded tensors.  The training loop loads batches lazily during iteration
+    to keep RAM usage constant regardless of buffer size.
     """
     loader = DataLoader(
         dataset, batch_size=micro_batch, collate_fn=collate_fn,
@@ -112,36 +104,50 @@ def generate_epoch_buffer(
         persistent_workers=False,
     )
 
-    if cache_dir is not None:
-        cache_path = Path(cache_dir)
-        cache_path.mkdir(parents=True, exist_ok=True)
-        index_file = cache_path / f"gen{buffer_gen}_index.pt"
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    index_file = cache_path / f"gen{buffer_gen}_index.pt"
 
-        if index_file.exists():
-            # Reuse existing cache: load list of file paths
-            file_list = torch.load(index_file, weights_only=False)
-            print(f"  Reusing cached buffer: {len(file_list)} batches from {cache_dir}",
-                  file=sys.stderr)
-            return [torch.load(p, weights_only=False) for p in
-                    tqdm(file_list, desc="Loading cache", file=sys.stderr, leave=False)]
+    if index_file.exists():
+        file_list = torch.load(index_file, weights_only=False)
+        print(f"  Reusing cached buffer: {len(file_list)} batches from {cache_dir}",
+              file=sys.stderr)
+        return file_list
 
-        # Write new cache
-        file_list = []
-        batch_idx = 0
-        for pass_idx in range(buffer_epochs):
-            desc = (f"Caching buffer pass {pass_idx + 1}/{buffer_epochs}"
-                    if buffer_epochs > 1 else "Caching buffer")
-            for batch in tqdm(loader, desc=desc, file=sys.stderr, leave=False):
-                p = cache_path / f"gen{buffer_gen}_batch{batch_idx:06d}.pt"
-                torch.save(batch, p)
-                file_list.append(p)
-                batch_idx += 1
-        torch.save(file_list, index_file)
-        # Load back into RAM list
-        return [torch.load(p, weights_only=False) for p in
-                tqdm(file_list, desc="Loading cache", file=sys.stderr, leave=False)]
+    file_list = []
+    batch_idx = 0
+    for pass_idx in range(buffer_epochs):
+        desc = (f"Caching buffer pass {pass_idx + 1}/{buffer_epochs}"
+                if buffer_epochs > 1 else "Caching buffer")
+        for batch in tqdm(loader, desc=desc, file=sys.stderr, leave=False):
+            p = cache_path / f"gen{buffer_gen}_batch{batch_idx:06d}.pt"
+            torch.save(batch, p)
+            file_list.append(p)
+            batch_idx += 1
+    torch.save(file_list, index_file)
+    return file_list
 
-    # In-memory path
+
+def _lazy_disk_iter(file_paths: list):
+    """Yield batches by loading one .pt file at a time from disk."""
+    for p in file_paths:
+        yield torch.load(p, weights_only=False)
+
+
+def generate_epoch_buffer(
+    dataset: "AudioDataset",
+    micro_batch: int,
+    num_workers: int,
+    buffer_epochs: int = 1,
+) -> list:
+    """Pre-generate buffer_epochs × epoch_size samples into a list of batches (in-memory)."""
+    loader = DataLoader(
+        dataset, batch_size=micro_batch, collate_fn=collate_fn,
+        num_workers=num_workers, pin_memory=False,
+        prefetch_factor=4 if num_workers > 0 else None,
+        persistent_workers=False,
+    )
+
     buffer = []
     for pass_idx in range(buffer_epochs):
         desc = (f"Filling buffer pass {pass_idx + 1}/{buffer_epochs}"
@@ -235,8 +241,17 @@ def evaluate(
 
 def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = device.type == "cuda"
-    print(f"Device: {device}, AMP: {use_amp}")
+    is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+    if args.no_amp or is_rocm:
+        use_amp = False
+    else:
+        use_amp = device.type == "cuda"
+    # pin_memory is counter-productive on unified memory (e.g. AMD APU / iGPU)
+    use_pin_memory = device.type == "cuda" and not is_rocm
+    if is_rocm:
+        print(f"Device: {device} (ROCm {torch.version.hip}), AMP disabled, pin_memory disabled")
+    else:
+        print(f"Device: {device}, AMP: {use_amp}")
 
     # ---- Config ----
     config = create_default_config(args.scenario)
@@ -291,10 +306,12 @@ def train(args: argparse.Namespace) -> None:
     print(f"  d_model={conformer_cfg.d_model}, n_heads={conformer_cfg.n_heads}, "
           f"n_layers={conformer_cfg.n_layers}, d_ff={conformer_cfg.d_ff}, "
           f"conv_kernel={conformer_cfg.conv_kernel}")
+    print(f"  subsample=2x (20ms/frame)")
 
     # ---- Load checkpoint if resuming ----
     start_epoch = 0
     best_val_loss = float("inf")
+    ckpt = None
     if args.checkpoint and Path(args.checkpoint).exists():
         print(f"Loading checkpoint: {args.checkpoint}")
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -322,15 +339,53 @@ def train(args: argparse.Namespace) -> None:
         eps=1e-9,
     )
     total_epochs = config.training.num_epochs
-    warmup_epochs = min(5, max(1, total_epochs // 40))
 
-    def lr_lambda(epoch: int) -> float:
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    if args.lr_resume and ckpt is not None:
+        # ---- Continue LR schedule from checkpoint ----
+        # Restore optimizer state first (momentum buffers + saved LR)
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        warmup_epochs = min(5, max(1, total_epochs // 40))
+
+        def lr_lambda(epoch: int) -> float:
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        # Restore scheduler position on the cosine curve
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+        print(f"  LR resumed at {optimizer.param_groups[0]['lr']:.2e} "
+              f"(epoch {start_epoch}/{total_epochs})")
+    else:
+        # ---- Fresh LR schedule over remaining epochs ----
+        # Restore optimizer momentum buffers but reset LR to args.lr
+        if ckpt is not None and "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            for pg in optimizer.param_groups:
+                pg["lr"] = args.lr
+                pg.pop("initial_lr", None)
+
+        remaining_epochs = total_epochs - start_epoch
+        warmup_epochs = min(5, max(1, remaining_epochs // 40))
+
+        def lr_lambda(epoch: int) -> float:
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            progress = (epoch - warmup_epochs) / max(1, remaining_epochs - warmup_epochs)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        if start_epoch > 0:
+            print(f"  Fresh LR schedule: {remaining_epochs} remaining epochs, "
+                  f"peak lr={args.lr:.2e}")
+
     scaler = GradScaler("cuda", enabled=use_amp)
 
     # ---- Loss ----
@@ -365,13 +420,13 @@ def train(args: argparse.Namespace) -> None:
     if reuse_factor <= 1:
         train_loader = DataLoader(
             train_ds, batch_size=micro_batch, collate_fn=collate_fn,
-            num_workers=num_workers, pin_memory=(device.type == "cuda"),
+            num_workers=num_workers, pin_memory=use_pin_memory,
             prefetch_factor=4 if num_workers > 0 else None,
             persistent_workers=num_workers > 0,
         )
     val_loader = DataLoader(
         val_ds, batch_size=micro_batch, collate_fn=collate_fn,
-        num_workers=min(num_workers, 4), pin_memory=(device.type == "cuda"),
+        num_workers=min(num_workers, 4), pin_memory=use_pin_memory,
         prefetch_factor=4 if num_workers > 0 else None,
         persistent_workers=min(num_workers, 4) > 0,
     )
@@ -428,9 +483,9 @@ def train(args: argparse.Namespace) -> None:
 
         if reuse_factor > 1:
             if cache_dir is not None:
-                # ---- Disk-cache path: blocking fill ----
-                # GPU idle during fill; use when buffer_epochs > 1 and audio
-                # buffers exceed available RAM (~3-4 GB per pass × buffer_epochs).
+                # ---- Disk-cache path: lazy loading ----
+                # Batches stay on disk; loaded one at a time during iteration.
+                # RAM usage is O(1) regardless of buffer size.
                 this_gen = epoch // reuse_factor
                 if this_gen != _buffer_gen:
                     if _buffer_gen >= 0:
@@ -448,7 +503,7 @@ def train(args: argparse.Namespace) -> None:
                     print(f"\nFilling disk buffer (gen {_buffer_gen + 1}, "
                           f"epoch {epoch + 1}, "
                           f"{buffer_epochs} pass(es))...", file=sys.stderr)
-                    _buffer = generate_epoch_buffer(
+                    _buffer = generate_disk_cache(
                         train_ds, micro_batch, num_workers,
                         buffer_epochs=buffer_epochs,
                         cache_dir=cache_dir,
@@ -457,9 +512,10 @@ def train(args: argparse.Namespace) -> None:
                     print(f"  {len(_buffer)} batches "
                           f"({len(_buffer) * micro_batch:,} samples) "
                           f"in {time.time() - t_buf:.0f}s", file=sys.stderr)
+                # Shuffle file paths, then load lazily during iteration
                 shuffled = list(_buffer)
                 _buffer_rng.shuffle(shuffled)
-                train_iter = iter(shuffled)
+                train_iter = _lazy_disk_iter(shuffled)
                 pbar_total = len(shuffled)
             else:
                 # ---- In-memory path: fill-as-you-go ----
@@ -570,6 +626,8 @@ def train(args: argparse.Namespace) -> None:
         current_lr = optimizer.param_groups[0]["lr"]
 
         # ---- Validation ----
+        if is_rocm:
+            torch.cuda.empty_cache()
         do_beam = (epoch + 1) % beam_cer_interval == 0 or epoch == total_epochs - 1
         val_results = evaluate(
             model, val_loader, device, use_amp,
@@ -605,6 +663,7 @@ def train(args: argparse.Namespace) -> None:
             "best_val_loss": min(best_val_loss, val_loss),
             "greedy_cer": greedy_cer,
             "scenario": args.scenario,
+            "total_epochs": total_epochs,
             "model_config": {
                 "d_model": conformer_cfg.d_model,
                 "n_heads": conformer_cfg.n_heads,
@@ -654,6 +713,12 @@ def main():
     parser.add_argument("--narrowband", action="store_true",
                         help="Enable narrowband mode: freq detection + bandpass + "
                              "32-bin mel (400-1200 Hz) instead of 80-bin (0-4000 Hz)")
+    parser.add_argument("--no-amp", action="store_true", dest="no_amp",
+                        help="Disable AMP (mixed precision). Auto-disabled on ROCm.")
+    parser.add_argument("--lr-resume", action="store_true", dest="lr_resume",
+                        help="Resume LR schedule from checkpoint state. Without "
+                             "this, a fresh cosine schedule spans the remaining "
+                             "epochs.")
 
     # Model architecture
     parser.add_argument("--d-model", type=int, default=256)

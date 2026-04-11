@@ -197,8 +197,16 @@ def evaluate(
 
 def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = device.type == "cuda"
-    print(f"Device: {device}, AMP: {use_amp}")
+    is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
+    if args.no_amp or is_rocm:
+        use_amp = False
+    else:
+        use_amp = device.type == "cuda"
+    use_pin_memory = device.type == "cuda" and not is_rocm
+    if is_rocm:
+        print(f"Device: {device} (ROCm {torch.version.hip}), AMP disabled, pin_memory disabled")
+    else:
+        print(f"Device: {device}, AMP: {use_amp}")
 
     # ---- Config ----
     config = create_default_config(args.scenario)
@@ -307,13 +315,13 @@ def train(args: argparse.Namespace) -> None:
     if reuse_factor <= 1:
         train_loader = DataLoader(
             train_ds, batch_size=micro_batch, collate_fn=collate_fn,
-            num_workers=num_workers, pin_memory=(device.type == "cuda"),
+            num_workers=num_workers, pin_memory=use_pin_memory,
             prefetch_factor=4 if num_workers > 0 else None,
             persistent_workers=num_workers > 0,
         )
     val_loader = DataLoader(
         val_ds, batch_size=micro_batch, collate_fn=collate_fn,
-        num_workers=min(num_workers, 4), pin_memory=(device.type == "cuda"),
+        num_workers=min(num_workers, 4), pin_memory=use_pin_memory,
         prefetch_factor=4 if num_workers > 0 else None,
         persistent_workers=min(num_workers, 4) > 0,
     )
@@ -542,6 +550,8 @@ def main():
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints_hybrid",
                         dest="ckpt_dir",
                         help="Checkpoint output directory")
+    parser.add_argument("--no-amp", action="store_true", dest="no_amp",
+                        help="Disable AMP (mixed precision). Auto-disabled on ROCm.")
 
     # Model architecture
     parser.add_argument("--d-model", type=int, default=128, dest="d_model",

@@ -16,7 +16,7 @@
 # model checkpoints and training artifacts
 *.pt
 checkpoints/
-checkpoints_cwformer/
+checkpoints_cwformer*/
 checkpoints_event_transformer/
 checkpoints_hybrid/
 
@@ -160,7 +160,7 @@ celerybeat.pid
 
 # Environments
 .env
-.venv
+.venv*/
 env/
 venv/
 ENV/
