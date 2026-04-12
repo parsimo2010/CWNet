@@ -253,6 +253,12 @@ def train(args: argparse.Namespace) -> None:
     else:
         print(f"Device: {device}, AMP: {use_amp}")
 
+    if device.type == "cuda":
+        # Auto-tune convolution algorithms for consistent input sizes
+        torch.backends.cudnn.benchmark = True
+        # Enable TF32 on Ampere+ for ~3x faster fp32 matmuls via tensor cores
+        torch.set_float32_matmul_precision('high')
+
     # ---- Config ----
     config = create_default_config(args.scenario)
 
@@ -560,6 +566,7 @@ def train(args: argparse.Namespace) -> None:
                      leave=False, file=sys.stderr, total=pbar_total)
         optimizer.zero_grad(set_to_none=True)
         micro_step = 0
+        running_loss = torch.tensor(0.0, device=device)
 
         for audio, targets, audio_lens, target_lens, texts in pbar:
             audio = audio.to(device, non_blocking=True)
@@ -570,32 +577,22 @@ def train(args: argparse.Namespace) -> None:
             with autocast("cuda", enabled=use_amp):
                 log_probs, out_lens = model(audio, audio_lens)
 
-                # CTC feasibility: skip if output too short for targets
-                valid = out_lens >= target_lens
-                if not valid.all():
-                    # Filter to valid samples only
-                    idx = valid.nonzero(as_tuple=True)[0]
-                    if len(idx) == 0:
-                        del audio, targets, audio_lens, target_lens, log_probs, out_lens
-                        continue
-                    log_probs = log_probs[:, idx, :]
-                    targets = targets[idx]
-                    out_lens = out_lens[idx]
-                    target_lens = target_lens[idx]
+                # CTC feasibility: clamp output lengths to be at least as
+                # long as targets.  zero_infinity=True handles any remaining
+                # infeasible paths without needing a GPU-syncing .all() check.
+                out_lens = out_lens.clamp(min=1)
 
                 loss = ctc_loss_fn(log_probs, targets, out_lens, target_lens)
                 loss = loss / accum_steps
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                del audio, targets, audio_lens, target_lens, log_probs, out_lens, loss
-                optimizer.zero_grad(set_to_none=True)
-                micro_step = 0
-                continue
+            # No isnan/isinf check — GradScaler already skips optimizer
+            # steps when gradients contain inf/nan.  Checking here would
+            # force a CPU-GPU sync on every micro-step.
 
             scaler.scale(loss).backward()
 
-            # Free forward-pass tensors after backward
-            loss_val = loss.item() * accum_steps
+            # Accumulate loss on GPU to avoid .item() sync every micro-step
+            running_loss += loss.detach() * accum_steps
             del audio, targets, audio_lens, target_lens, log_probs, out_lens, loss
 
             micro_step += 1
@@ -608,9 +605,7 @@ def train(args: argparse.Namespace) -> None:
                 optimizer.zero_grad(set_to_none=True)
                 micro_step = 0
 
-            total_train_loss += loss_val
             n_batches += 1
-            pbar.set_postfix(loss=f"{total_train_loss/n_batches:.3f}")
 
         # Flush any remaining gradient
         if micro_step > 0:
@@ -622,7 +617,8 @@ def train(args: argparse.Namespace) -> None:
 
         scheduler.step()
 
-        avg_train_loss = total_train_loss / max(1, n_batches)
+        # Single GPU→CPU sync per epoch for loss logging (not per micro-step)
+        avg_train_loss = running_loss.item() / max(1, n_batches)
         current_lr = optimizer.param_groups[0]["lr"]
 
         # ---- Validation ----

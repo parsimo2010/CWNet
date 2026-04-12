@@ -17,6 +17,7 @@ Narrowband output is (B, T, 32) when used with NarrowbandProcessor.
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from typing import Optional
 
@@ -142,16 +143,16 @@ class SpecAugment(nn.Module):
         for b in range(B):
             # Frequency masks
             for _ in range(self.freq_mask_count):
-                f_width = torch.randint(0, self.freq_mask_width + 1, (1,)).item()
-                f_start = torch.randint(0, max(1, F - f_width), (1,)).item()
+                f_width = random.randint(0, self.freq_mask_width)
+                f_start = random.randint(0, max(0, F - f_width - 1))
                 x[b, :, f_start:f_start + f_width] = 0.0
 
             # Time masks
             for _ in range(self.time_mask_count):
                 if max_time_mask <= 0:
                     continue
-                t_width = torch.randint(0, max_time_mask + 1, (1,)).item()
-                t_start = torch.randint(0, max(1, T - t_width), (1,)).item()
+                t_width = random.randint(0, max_time_mask)
+                t_start = random.randint(0, max(0, T - t_width - 1))
                 x[b, t_start:t_start + t_width, :] = 0.0
 
         return x
