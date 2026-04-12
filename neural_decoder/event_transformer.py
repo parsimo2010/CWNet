@@ -97,17 +97,14 @@ class RoPEMultiHeadAttention(nn.Module):
         # Apply RoPE to Q and K
         q, k = self.rope(q, k)
 
-        # Scaled dot-product attention
-        scale = math.sqrt(self.d_k)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / scale  # (B, H, T, T)
+        # No attention mask — padding positions are zero-filled features,
+        # harmless to attend to. CTC loss ignores padding via output_lengths.
+        # Omitting the mask enables the Flash Attention backend on both GPUs.
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=dropout_p,
+        )  # (B, H, T, d_k)
 
-        if mask is not None:
-            scores = scores.masked_fill(mask, float("-inf"))
-
-        attn = F.softmax(scores, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        out = torch.matmul(attn, v)  # (B, H, T, d_k)
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
 
         return self.W_o(out)

@@ -132,18 +132,15 @@ class ConformerMHA(nn.Module):
         # Apply RoPE to Q and K
         q, k = self.rope(q, k)
 
-        # Scaled dot-product attention
-        scale = math.sqrt(self.d_k)
-        attn = torch.matmul(q, k.transpose(-2, -1)) / scale  # (B, H, T, T)
+        # No attention mask — padding positions are zero-filled mel frames,
+        # harmless to attend to. CTC loss ignores output at padding positions
+        # via output_lengths. Omitting the mask enables the Flash Attention
+        # backend (fastest path) on both NVIDIA and AMD GPUs.
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=dropout_p,
+        )  # (B, H, T, d_k)
 
-        if mask is not None:
-            # mask: (B, T) → (B, 1, 1, T) for broadcasting
-            attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2), float("-inf"))
-
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        out = torch.matmul(attn, v)  # (B, H, T, d_k)
         out = out.transpose(1, 2).reshape(B, T, D)  # (B, T, D)
         out = self.W_o(out)
         out = self.out_dropout(out)
