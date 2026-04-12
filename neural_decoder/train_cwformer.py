@@ -256,8 +256,9 @@ def train(args: argparse.Namespace) -> None:
     if device.type == "cuda":
         # Auto-tune convolution algorithms for consistent input sizes
         torch.backends.cudnn.benchmark = True
-        # Enable TF32 on Ampere+ for ~3x faster fp32 matmuls via tensor cores
-        torch.set_float32_matmul_precision('high')
+        # Enable TF32 on Ampere+ for faster fp32 matmuls via tensor cores
+        if not is_rocm:
+            torch.set_float32_matmul_precision('high')
 
     # ---- Config ----
     config = create_default_config(args.scenario)
