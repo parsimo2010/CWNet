@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -169,9 +170,9 @@ class CWFormerDecoder:
         self._win_samples = int(window_sec * self.sample_rate)
         self._stride_samples = int(stride_sec * self.sample_rate)
 
-        # CTC frame rate: mel hop → conv subsampling (4×)
+        # CTC frame rate: mel hop → conv subsampling (2× time)
         hop = self._model_cfg.mel.hop_length
-        self._frames_per_sample = 1.0 / (hop * 4)  # frames per audio sample
+        self._frames_per_sample = 1.0 / (hop * 2)  # frames per audio sample
 
         # Load LM if provided
         self._lm = None
@@ -202,8 +203,12 @@ class CWFormerDecoder:
         return self.decode_audio(audio)
 
     def decode_audio(self, audio: np.ndarray) -> str:
-        """Decode a float32 audio array using sliding windows with CTC
-        probability stitching.
+        """Decode a float32 audio array using sliding windows.
+
+        Each window is decoded independently, then consecutive decoded
+        texts are merged by finding the longest overlapping suffix/prefix.
+        This avoids the CTC alignment mismatch that occurs when averaging
+        log-probabilities from windows with different internal alignments.
 
         Args:
             audio: 1-D float32 array at self.sample_rate.
@@ -222,8 +227,8 @@ class CWFormerDecoder:
                 return ""
             return self._decode_log_probs(log_probs)
 
-        # Collect per-window CTC log_probs and their time offsets (in frames)
-        windows: List[Tuple[int, Tensor]] = []  # (frame_offset, log_probs)
+        # Decode each window independently
+        decoded: List[str] = []
         pos = 0
         while pos < len(audio):
             chunk = audio[pos: pos + self._win_samples]
@@ -236,17 +241,96 @@ class CWFormerDecoder:
 
             lp = self._forward_window(chunk, actual_len)
             if lp is not None and lp.shape[0] > 0:
-                frame_offset = self._samples_to_frames(pos)
-                windows.append((frame_offset, lp))
+                text = self._decode_log_probs(lp).strip()
+                decoded.append(text)
 
             pos += self._stride_samples
 
-        if not windows:
+        if not decoded:
             return ""
 
-        # Stitch by averaging log-probs in overlap regions
-        stitched = self._stitch_windows(windows)
-        return self._decode_log_probs(stitched)
+        # Merge windows by finding overlapping text between consecutive decodes
+        result = decoded[0]
+        for i in range(1, len(decoded)):
+            if decoded[i]:
+                result = self._merge_two_texts(result, decoded[i])
+
+        return result.strip()
+
+    @staticmethod
+    def _merge_two_texts(text_a: str, text_b: str) -> str:
+        """Merge two overlapping decoded texts from consecutive windows.
+
+        Uses word-level matching inspired by HuggingFace's ASR pipeline:
+        for each candidate overlap length *i* (in words), computes the
+        match ratio between the last *i* words of *text_a* and the first
+        *i* words of *text_b*.  A tiny epsilon ``i/10000`` biases toward
+        longer overlaps, preventing short coincidental matches from
+        winning.  The later window's version of the overlap is always
+        preferred because the overlap content sits at the beginning of
+        that window, where the model has full forward context.
+
+        Falls back to character-level longest-common-substring matching
+        when word boundaries differ between windows (e.g. "TX5EU" vs
+        "TX 5 EU").
+        """
+        if not text_a:
+            return text_b
+        if not text_b:
+            return text_a
+
+        # ---- Word-level overlap (primary) ----
+        words_a = text_a.split()
+        words_b = text_b.split()
+        max_overlap = min(len(words_a), len(words_b))
+
+        best_i = 0
+        best_score = 0.0
+        for i in range(1, max_overlap + 1):
+            matches = sum(
+                a == b for a, b in zip(words_a[-i:], words_b[:i]))
+            if matches < 1:
+                continue
+            ratio = matches / i
+            # Epsilon favours longer overlaps (HuggingFace trick)
+            score = ratio + i / 10000.0
+            if score > best_score and ratio >= 0.6:
+                best_score = score
+                best_i = i
+
+        if best_i >= 1:
+            # For each overlapping word, keep the longer (more complete)
+            # form.  Partial words at window edges ("EAR" for "HEAR")
+            # lose to the complete version from the other window.
+            # Equal-length ties go to text_b (more forward context).
+            overlap_a = words_a[-best_i:]
+            overlap_b = words_b[:best_i]
+            merged_overlap: List[str] = []
+            for wa, wb in zip(overlap_a, overlap_b):
+                if wa == wb:
+                    merged_overlap.append(wb)
+                elif len(wa) > len(wb):
+                    merged_overlap.append(wa)
+                else:
+                    merged_overlap.append(wb)
+            merged = words_a[:-best_i] + merged_overlap + words_b[best_i:]
+            return " ".join(merged)
+
+        # ---- Character-level fallback (handles spacing differences) ----
+        max_k = min(len(text_a), len(text_b))
+        tail = text_a[-max_k:]
+        head = text_b[:max_k]
+
+        match = SequenceMatcher(
+            None, tail, head, autojunk=False,
+        ).find_longest_match(0, len(tail), 0, len(head))
+
+        if match.size >= 3:
+            cut_a = len(text_a) - len(tail) + match.a
+            return text_a[:cut_a] + text_b[match.b:]
+
+        # ---- No overlap found — concatenate with space ----
+        return text_a + " " + text_b
 
     def _forward_window(
         self,
@@ -276,16 +360,19 @@ class CWFormerDecoder:
         """Convert audio sample offset to CTC frame offset."""
         hop = self._model_cfg.mel.hop_length
         mel_frames = n_samples // hop
-        # Conv subsampling: 2 layers stride 2 → 4× reduction
-        return mel_frames // 4
+        # Conv subsampling: conv1 stride 2 (time+freq), conv2 stride (1,2) (freq only) → 2× time
+        return mel_frames // 2
 
     def _stitch_windows(
         self, windows: List[Tuple[int, Tensor]],
     ) -> Tensor:
-        """Average CTC log-probabilities across overlapping windows.
+        """Stitch CTC log-probabilities from overlapping windows.
 
-        Uses logaddexp accumulation for numerically stable averaging in
-        log-probability space.
+        For each output frame, selects log-probs from the window whose
+        center is closest — i.e., the window with the most bidirectional
+        context for that frame.  This avoids the CTC alignment mismatch
+        that destroys content when averaging log-probs from windows with
+        different internal alignments.
 
         Args:
             windows: List of (frame_offset, log_probs) tuples.
@@ -296,28 +383,28 @@ class CWFormerDecoder:
         max_frame = max(offset + lp.shape[0] for offset, lp in windows)
         C = windows[0][1].shape[1]
 
-        # Accumulate using logaddexp (vectorized per window)
-        acc = torch.full((max_frame, C), float("-inf"), dtype=torch.float32)
-        counts = torch.zeros(max_frame, dtype=torch.float32)
+        result = torch.zeros((max_frame, C), dtype=torch.float32)
+        best_dist = torch.full((max_frame,), float("inf"), dtype=torch.float32)
 
         for offset, lp in windows:
             T = lp.shape[0]
-            end = offset + T
-            acc[offset:end] = torch.logaddexp(acc[offset:end], lp)
-            counts[offset:end] += 1
+            center = T / 2.0
+            dists = (torch.arange(T, dtype=torch.float32) - center).abs()
 
-        # Normalize: log-mean = logaddexp - log(count)
-        multi = counts > 1
-        if multi.any():
-            acc[multi] -= torch.log(counts[multi]).unsqueeze(1)
+            # Update frames where this window is closer to center
+            mask = dists < best_dist[offset: offset + T]
+            idx = mask.nonzero(as_tuple=True)[0]
+            if len(idx) > 0:
+                result[offset + idx] = lp[idx]
+                best_dist[offset + idx] = dists[idx]
 
         # Trim to valid frames
-        valid = counts > 0
+        valid = best_dist < float("inf")
         if not valid.any():
             return torch.empty((0, C))
         first = int(valid.nonzero(as_tuple=True)[0][0].item())
         last = int(valid.nonzero(as_tuple=True)[0][-1].item())
-        return acc[first:last + 1]
+        return result[first:last + 1]
 
     def _decode_log_probs(self, log_probs: Tensor) -> str:
         """Decode CTC log_probs to text."""
