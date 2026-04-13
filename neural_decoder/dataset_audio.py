@@ -29,8 +29,19 @@ from torch.utils.data import IterableDataset
 
 import vocab as vocab_module
 from config import Config
-from morse_generator import generate_sample, load_wordlist
+from morse_generator import generate_sample, generate_text, load_wordlist
 from qso_corpus import QSOCorpusGenerator
+
+
+def _max_chars_for_wpm(wpm: float, max_audio_sec: float) -> int:
+    """Estimate max text length that fits within max_audio_sec at given WPM.
+
+    PARIS standard: 50 units per word, ~6 chars per word-slot (incl. space),
+    so ~10/WPM seconds per character.  A 25% safety margin accounts for
+    leading/trailing silence, dah/dit ratio variance, and ICS/IWS factors.
+    """
+    chars_per_sec = wpm / 10.0
+    return max(8, int(max_audio_sec * chars_per_sec * 0.75))
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +78,7 @@ class AudioDataset(IterableDataset):
         self.epoch_size = epoch_size
         self.seed = seed
         self.qso_text_ratio = qso_text_ratio
+        self.max_audio_sec = max_audio_sec
         self.max_audio_samples = int(max_audio_sec * config.morse.sample_rate)
         self.wordlist = load_wordlist()
         self._space_idx = vocab_module.char_to_idx[" "]
@@ -94,28 +106,42 @@ class AudioDataset(IterableDataset):
         yielded = 0
         while yielded < per_worker:
             try:
-                # Decide text source
-                use_qso = float(rng.random()) < self.qso_text_ratio
+                # Sample WPM first so we can constrain text length to
+                # what will actually fit within max_audio_sec.  Without
+                # this, most low-WPM + long-text combinations are rejected,
+                # wasting worker time even with the early bail-out.
+                wpm = float(rng.uniform(
+                    self.morse_cfg.min_wpm, self.morse_cfg.max_wpm))
+                max_chars = _max_chars_for_wpm(wpm, self.max_audio_sec)
 
+                use_qso = float(rng.random()) < self.qso_text_ratio
                 if use_qso:
-                    text = qso_gen.generate(min_len=8, max_len=80)
-                    audio_f32, text, _ = generate_sample(
-                        self.morse_cfg, rng=rng, wordlist=self.wordlist,
-                        text=text,
-                    )
+                    text = qso_gen.generate(
+                        min_len=min(8, max_chars), max_len=max_chars)
                 else:
-                    audio_f32, text, _ = generate_sample(
-                        self.morse_cfg, rng=rng, wordlist=self.wordlist,
+                    text = generate_text(
+                        rng,
+                        min_chars=min(self.morse_cfg.min_chars, max_chars),
+                        max_chars=max_chars,
+                        wordlist=self.wordlist,
                     )
+
+                audio_f32, text, _ = generate_sample(
+                    self.morse_cfg, rng=rng, wordlist=self.wordlist,
+                    text=text, wpm=wpm,
+                    max_duration_sec=self.max_audio_sec,
+                )
             except Exception:
                 continue
 
             if len(audio_f32) < 1600:  # less than 100ms
                 continue
 
-            # Truncate if too long
+            # Skip samples that exceed max duration — truncating audio
+            # while keeping the full text target creates mismatched labels
+            # that corrupt CTC gradients.
             if len(audio_f32) > self.max_audio_samples:
-                audio_f32 = audio_f32[:self.max_audio_samples]
+                continue
 
             # Narrowband preprocessing: detect freq, bandpass, shift
             if nb_processor is not None:

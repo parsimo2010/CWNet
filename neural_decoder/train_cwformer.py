@@ -74,9 +74,13 @@ def levenshtein(a: str, b: str) -> int:
 
 
 def compute_cer(hypothesis: str, reference: str) -> float:
-    if not reference:
-        return 0.0 if not hypothesis else 1.0
-    return levenshtein(hypothesis.upper(), reference.upper()) / len(reference)
+    # Strip boundary spaces — the model is trained with [space]+text+[space]
+    # targets but the reference text does not include boundary tokens.
+    h = hypothesis.strip().upper()
+    r = reference.strip().upper()
+    if not r:
+        return 0.0 if not h else 1.0
+    return levenshtein(h, r) / len(r)
 
 
 # ---------------------------------------------------------------------------

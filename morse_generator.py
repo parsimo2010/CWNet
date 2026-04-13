@@ -907,6 +907,7 @@ def generate_sample(
     rng: Optional[np.random.Generator] = None,
     wordlist: Optional[List[str]] = None,
     text: Optional[str] = None,
+    max_duration_sec: Optional[float] = None,
 ) -> Tuple[np.ndarray, str, Dict]:
     """Generate a single synthetic Morse code audio sample.
 
@@ -1041,6 +1042,12 @@ def generate_sample(
     max_silence_sec = 2.0 * 7.0 * iws_factor * unit_dur     # two word gaps
     leading_sec  = float(rng.uniform(min_silence_sec, max_silence_sec))
     trailing_sec = float(rng.uniform(min_silence_sec, max_silence_sec))
+
+    # ---- Early duration check (bail out before expensive synthesis) ------
+    if max_duration_sec is not None:
+        element_dur = sum(dur for _, dur in elements)
+        if leading_sec + element_dur + trailing_sec > max_duration_sec:
+            raise ValueError("sample exceeds max_duration_sec")
 
     # ---- Per-sample keying waveform shaping --------------------------------
     rise_time_ms = float(rng.uniform(config.rise_time_ms_min, config.rise_time_ms_max))
