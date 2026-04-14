@@ -17,18 +17,26 @@ jobs:
       - name: Run License Compliance Checker
         uses: soheilbr82/automated-license-check@v1
         with:
-          # Adjust this list to match licenses compatible with YOUR project's license.
-          # Common permissive licenses that are generally safe to include:
+          # Includes both SPDX identifiers and ScanCode-style names to avoid
+          # false positives from naming mismatches.
           allowed_licenses: >-
             MIT,
+            mit,
             Apache-2.0,
+            apache-2.0,
             BSD-2-Clause,
+            bsd-simplified,
             BSD-3-Clause,
+            bsd-new,
             ISC,
+            isc,
             0BSD,
+            bsd-zero,
             Unlicense,
+            unlicense,
             CC0-1.0,
+            cc0-1.0,
             Python-2.0,
             PSF-2.0,
+            python,
             BlueOak-1.0.0
- 
