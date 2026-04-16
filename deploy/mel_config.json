@@ -1,0 +1,9 @@
+{
+  "sample_rate": 16000,
+  "n_fft": 400,
+  "hop_length": 160,
+  "n_mels": 40,
+  "f_min": 200.0,
+  "f_max": 1400.0,
+  "narrowband": false
+}

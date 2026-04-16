@@ -23,14 +23,12 @@ Usage (CLI):
 from __future__ import annotations
 
 import argparse
-import re
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 import vocab as vocab_module
@@ -114,13 +112,24 @@ class CWFormerDecoder:
     """Sliding-window decoder for the CW-Former.
 
     Processes audio in overlapping windows, runs the full CW-Former
-    (mel → Conformer → CTC) on each window, averages CTC log-probabilities
-    in overlap regions, then decodes the stitched output.
+    (mel -> Conformer -> CTC) on each window, then stitches results
+    across windows using one of several strategies.
+
+    Stitch modes:
+        "prob"    — (default) Content-aware log-prob stitching.  Each
+                    window is greedy-decoded to find character boundaries;
+                    trailing space-padding is trimmed; text overlap
+                    between consecutive windows is detected and skipped;
+                    non-redundant content segments are concatenated with
+                    blank-frame transitions; a single CTC decode (with
+                    optional LM) runs over the full stitched sequence.
+        "text"    — Decode each window independently, merge decoded
+                    texts via word-level overlap matching.
 
     Args:
         checkpoint: Path to CW-Former checkpoint.
-        window_sec: Window length in seconds (default 8.0).
-        stride_sec: Hop between windows in seconds (default 4.0).
+        window_sec: Window length in seconds (default 16).
+        stride_sec: Hop between windows in seconds (default 3).
         device: PyTorch device string.
         beam_width: CTC beam search width (1 = greedy).
         lm_path: Path to trigram_lm.json for LM-augmented beam search.
@@ -129,13 +138,14 @@ class CWFormerDecoder:
         callsign_bonus: Callsign pattern bonus at word boundaries.
         non_dict_penalty: Penalty for non-dictionary words at word boundaries.
         use_dict: Whether to load and use the CW dictionary.
+        stitch_mode: Window stitching strategy ("prob" or "text").
     """
 
     def __init__(
         self,
         checkpoint: str,
-        window_sec: float = 8.0,
-        stride_sec: float = 4.0,
+        window_sec: float = 16.0,
+        stride_sec: float = 3.0,
         device: str = "cpu",
         beam_width: int = 1,
         lm_path: Optional[str] = None,
@@ -144,6 +154,7 @@ class CWFormerDecoder:
         callsign_bonus: float = 1.8,
         non_dict_penalty: float = -0.5,
         use_dict: bool = True,
+        stitch_mode: str = "prob",
     ) -> None:
         self.device = torch.device(device)
         self.window_sec = window_sec
@@ -153,6 +164,7 @@ class CWFormerDecoder:
         self.dict_bonus = dict_bonus
         self.callsign_bonus = callsign_bonus
         self.non_dict_penalty = non_dict_penalty
+        self._stitch_mode = stitch_mode
 
         self._model, self._model_cfg, self.sample_rate, self._narrowband = (
             _load_cwformer_checkpoint(checkpoint, self.device)
@@ -190,6 +202,14 @@ class CWFormerDecoder:
             except Exception:
                 pass
 
+        # Validate stitch_mode
+        if stitch_mode not in ("prob", "text"):
+            import warnings
+            warnings.warn(
+                f"Unknown stitch_mode={stitch_mode!r}, falling back to 'prob'",
+            )
+            self._stitch_mode = "prob"
+
     def decode_file(self, path: str) -> str:
         """Decode an entire audio file.
 
@@ -205,10 +225,14 @@ class CWFormerDecoder:
     def decode_audio(self, audio: np.ndarray) -> str:
         """Decode a float32 audio array using sliding windows.
 
-        Each window is decoded independently, then consecutive decoded
-        texts are merged by finding the longest overlapping suffix/prefix.
-        This avoids the CTC alignment mismatch that occurs when averaging
-        log-probabilities from windows with different internal alignments.
+        Stitching strategy is controlled by ``self._stitch_mode``:
+
+        * **prob** — Content-aware log-prob stitching.  Each window is
+          greedy-decoded to find character/content boundaries, then
+          non-redundant log-prob segments are concatenated and decoded
+          once with CTC (optionally with LM beam search).
+        * **text** — Decode each window independently, merge decoded
+          texts via word-level overlap matching.
 
         Args:
             audio: 1-D float32 array at self.sample_rate.
@@ -220,14 +244,23 @@ class CWFormerDecoder:
         if self._nb_processor is not None:
             audio, _ = self._nb_processor.process(audio)
 
-        # Short audio — single pass
+        # Short audio — single pass (all modes)
         if len(audio) <= self._win_samples:
             log_probs = self._forward_window(audio)
             if log_probs is None:
                 return ""
             return self._decode_log_probs(log_probs)
 
-        # Decode each window independently
+        if self._stitch_mode == "text":
+            return self._decode_text_stitch(audio)
+        return self._decode_prob_stitch(audio)
+
+    # ------------------------------------------------------------------
+    # Stitch mode: text (legacy)
+    # ------------------------------------------------------------------
+
+    def _decode_text_stitch(self, audio: np.ndarray) -> str:
+        """Decode using per-window text decoding and text-level merging."""
         decoded: List[str] = []
         pos = 0
         while pos < len(audio):
@@ -249,13 +282,231 @@ class CWFormerDecoder:
         if not decoded:
             return ""
 
-        # Merge windows by finding overlapping text between consecutive decodes
         result = decoded[0]
         for i in range(1, len(decoded)):
             if decoded[i]:
                 result = self._merge_two_texts(result, decoded[i])
 
         return result.strip()
+
+    # ------------------------------------------------------------------
+    # Stitch mode: prob (content-aware log-prob stitching)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _greedy_with_positions(lp: Tensor) -> Tuple[str, List[int]]:
+        """Greedy CTC decode returning text and per-character frame indices.
+
+        Returns:
+            (text, char_start_frames) where char_start_frames[i] is the
+            frame index where the i-th decoded character's CTC run begins.
+        """
+        argmax = lp.argmax(dim=-1).tolist()
+        chars: List[str] = []
+        frames: List[int] = []
+        prev = -1
+        for t, tok in enumerate(argmax):
+            if tok == prev:
+                continue
+            prev = tok
+            if tok == 0:  # CTC blank
+                continue
+            ch = vocab_module.idx_to_char.get(tok, "")
+            if ch:
+                chars.append(ch)
+                frames.append(t)
+        return "".join(chars), frames
+
+    @staticmethod
+    def _find_content_end(lp: Tensor, space_idx: int = 1) -> int:
+        """Last frame where argmax is not a space character.
+
+        The CW-Former front-loads all content into the first portion of
+        each window and pads the rest with space tokens.  This finds the
+        boundary so we can trim the padding.
+        """
+        argmax = lp.argmax(dim=-1)
+        non_space = ((argmax != space_idx) & (argmax != 0)).nonzero(as_tuple=True)[0]
+        if len(non_space) == 0:
+            return lp.shape[0] - 1
+        return int(non_space[-1].item())
+
+    @staticmethod
+    def _find_text_overlap(
+        text_a: str,
+        text_b: str,
+        est_overlap: Optional[int] = None,
+    ) -> int:
+        """Find the text overlap between consecutive window decodes.
+
+        Returns the number of characters at the start of *text_b* that
+        overlap with the end of *text_a*.
+
+        When *est_overlap* is provided (from the stride/window time
+        ratio), the fuzzy search is constrained to a narrow range around
+        the estimate.  Exact matching is always unconstrained so that
+        perfect matches at any length are found.
+
+        Args:
+            text_a: Stripped decoded text from the previous window.
+            text_b: Stripped decoded text from the current window.
+            est_overlap: Estimated overlap in characters from timing.
+        """
+        a = text_a.rstrip()
+        b = text_b.lstrip()
+        if not a or not b:
+            return 0
+        max_k = min(len(a), len(b))
+
+        # Exact match — always unconstrained, longest first.
+        for k in range(max_k, 0, -1):
+            if a[-k:] == b[:k]:
+                return k
+
+        # Fuzzy match — constrained to near est_overlap when available,
+        # preventing wrong long matches with very large overlaps.
+        if est_overlap is not None:
+            margin = max(5, len(b) // 3)
+            lo = max(2, est_overlap - margin)
+            hi = min(max_k, est_overlap + margin)
+        else:
+            lo = 2
+            hi = max_k
+
+        for k in range(hi, lo - 1, -1):
+            suffix = a[-k:]
+            prefix = b[:k]
+            mismatches = sum(c1 != c2 for c1, c2 in zip(suffix, prefix))
+            if mismatches <= max(1, k // 8):
+                return k
+
+        # If fuzzy also failed, use the time estimate as last resort.
+        if est_overlap is not None:
+            return max(0, min(est_overlap, max_k))
+
+        return 0
+
+    def _decode_prob_stitch(self, audio: np.ndarray) -> str:
+        """Content-aware log-prob stitching.
+
+        The CW-Former's CTC output is front-loaded: character content is
+        emitted in roughly the first portion of each window's output,
+        with the remainder filled by space-token padding.  Frame-level
+        probability crossfade is therefore destructive — it averages
+        real content from one window with space-padding from another.
+
+        Instead, this method works at the **character level**:
+
+        1. Decode each window greedily to locate character boundaries.
+        2. Trim trailing space-padding from each window's log-probs.
+        3. Find the text overlap between consecutive windows.
+        4. Skip redundant (overlapping) characters in the next window.
+        5. Concatenate non-redundant content segments with blank-frame
+           transitions at the seams.
+        6. Run a single CTC decode (optionally with LM) over the full
+           stitched log-prob sequence.
+        """
+        # Collect per-window data
+        win_data: List[dict] = []
+        pos = 0
+        while pos < len(audio):
+            chunk = audio[pos: pos + self._win_samples]
+            if len(chunk) < self._win_samples // 4:
+                break
+
+            actual_len = len(chunk)
+            if len(chunk) < self._win_samples:
+                chunk = np.pad(chunk, (0, self._win_samples - len(chunk)))
+
+            lp = self._forward_window(chunk, actual_len)
+            if lp is not None and lp.shape[0] > 0:
+                text_raw, char_frames = self._greedy_with_positions(lp)
+                # char_frames indices correspond to the raw (unstripped)
+                # decode.  Record the leading-space offset so overlap_len
+                # (computed on the stripped text) maps to the correct
+                # char_frames index.
+                n_leading = len(text_raw) - len(text_raw.lstrip())
+                content_end = self._find_content_end(lp)
+                win_data.append({
+                    "lp": lp,
+                    "text": text_raw.strip(),
+                    "char_frames": char_frames,
+                    "content_end": content_end,
+                    "n_leading": n_leading,
+                })
+
+            pos += self._stride_samples
+
+        if not win_data:
+            return ""
+        if len(win_data) == 1:
+            ce = win_data[0]["content_end"]
+            return self._decode_log_probs(win_data[0]["lp"][:ce + 1])
+
+        # Blank separator: CTC blank with probability ~1.  Inserted at
+        # seams so that identical characters on either side of the cut
+        # are not collapsed by the CTC duplicate-removal rule.
+        C = win_data[0]["lp"].shape[1]
+        blank_frame = torch.full((1, C), -20.0, dtype=torch.float32)
+        blank_frame[0, 0] = 0.0  # blank token = index 0
+
+        segments: List[Tensor] = []
+        for i, wd in enumerate(win_data):
+            ce = wd["content_end"]
+
+            if i == 0:
+                # First window — keep all content
+                segments.append(wd["lp"][:ce + 1])
+                segments.append(blank_frame)
+                continue
+
+            # Determine how many characters to skip in this window.
+            # The audio overlap between consecutive windows is
+            # (window - stride) seconds.  Since the CTC output is
+            # front-loaded (characters emitted in temporal order,
+            # compressed into early frames), the first ~overlap_frac
+            # of decoded characters duplicate the previous window.
+            prev_text = win_data[i - 1]["text"]
+            curr_text = wd["text"]
+            overlap_frac = 1.0 - self.stride_sec / self.window_sec
+            est_overlap = round(len(curr_text) * overlap_frac)
+
+            # Text matching near the time estimate
+            overlap_len = self._find_text_overlap(
+                prev_text, curr_text, est_overlap=est_overlap,
+            )
+            # Sanity-check against the time estimate
+            if abs(overlap_len - est_overlap) > max(4, len(curr_text) // 4):
+                overlap_len = est_overlap
+
+            # Adjust for leading spaces that were stripped from the text
+            # but are still present in char_frames.
+            adj_idx = overlap_len + wd["n_leading"]
+
+            if 0 < overlap_len and adj_idx < len(wd["char_frames"]):
+                # Start from the first NEW (non-overlapping) character.
+                # The blank separator inserted at the seam provides the
+                # CTC transition, so no need to back up into the overlap.
+                start_frame = wd["char_frames"][adj_idx]
+            elif overlap_len == 0:
+                # No overlap detected — include all content.  This may
+                # duplicate a few characters but avoids losing content.
+                start_frame = 0
+            else:
+                # Entire window's content is redundant — skip it.
+                continue
+
+            segment = wd["lp"][start_frame:ce + 1]
+            if segment.shape[0] > 0:
+                segments.append(segment)
+                if i < len(win_data) - 1:
+                    segments.append(blank_frame)
+
+        if not segments:
+            return ""
+
+        stitched = torch.cat(segments, dim=0)
+        return self._decode_log_probs(stitched)
 
     @staticmethod
     def _merge_two_texts(text_a: str, text_b: str) -> str:
@@ -273,6 +524,12 @@ class CWFormerDecoder:
         Falls back to character-level longest-common-substring matching
         when word boundaries differ between windows (e.g. "TX5EU" vs
         "TX 5 EU").
+
+        Final fallback uses time-proportional trimming: since we know
+        the overlap fraction from window/stride geometry, we trim the
+        estimated overlap characters from each side and join.  This
+        avoids the blind concatenation that causes duplication on slow
+        CW where text matching fails due to very few characters.
         """
         if not text_a:
             return text_b
@@ -363,49 +620,6 @@ class CWFormerDecoder:
         # Conv subsampling: conv1 stride 2 (time+freq), conv2 stride (1,2) (freq only) → 2× time
         return mel_frames // 2
 
-    def _stitch_windows(
-        self, windows: List[Tuple[int, Tensor]],
-    ) -> Tensor:
-        """Stitch CTC log-probabilities from overlapping windows.
-
-        For each output frame, selects log-probs from the window whose
-        center is closest — i.e., the window with the most bidirectional
-        context for that frame.  This avoids the CTC alignment mismatch
-        that destroys content when averaging log-probs from windows with
-        different internal alignments.
-
-        Args:
-            windows: List of (frame_offset, log_probs) tuples.
-
-        Returns:
-            Stitched log_probs tensor (T_total, C).
-        """
-        max_frame = max(offset + lp.shape[0] for offset, lp in windows)
-        C = windows[0][1].shape[1]
-
-        result = torch.zeros((max_frame, C), dtype=torch.float32)
-        best_dist = torch.full((max_frame,), float("inf"), dtype=torch.float32)
-
-        for offset, lp in windows:
-            T = lp.shape[0]
-            center = T / 2.0
-            dists = (torch.arange(T, dtype=torch.float32) - center).abs()
-
-            # Update frames where this window is closer to center
-            mask = dists < best_dist[offset: offset + T]
-            idx = mask.nonzero(as_tuple=True)[0]
-            if len(idx) > 0:
-                result[offset + idx] = lp[idx]
-                best_dist[offset + idx] = dists[idx]
-
-        # Trim to valid frames
-        valid = best_dist < float("inf")
-        if not valid.any():
-            return torch.empty((0, C))
-        first = int(valid.nonzero(as_tuple=True)[0][0].item())
-        last = int(valid.nonzero(as_tuple=True)[0][-1].item())
-        return result[first:last + 1]
-
     def _decode_log_probs(self, log_probs: Tensor) -> str:
         """Decode CTC log_probs to text."""
         if log_probs.shape[0] == 0:
@@ -441,9 +655,9 @@ def main():
                         help="Path to CW-Former checkpoint")
     parser.add_argument("--input", required=True, metavar="PATH",
                         help="Input audio file (WAV, FLAC, etc.)")
-    parser.add_argument("--window", type=float, default=8.0, metavar="SEC",
+    parser.add_argument("--window", type=float, default=16.0, metavar="SEC",
                         help="Window size in seconds")
-    parser.add_argument("--stride", type=float, default=4.0, metavar="SEC",
+    parser.add_argument("--stride", type=float, default=3.0, metavar="SEC",
                         help="Stride between windows in seconds")
     parser.add_argument("--beam-width", type=int, default=1, metavar="N",
                         dest="beam_width",
@@ -464,6 +678,9 @@ def main():
                         help="Penalty for non-dictionary words (0=off)")
     parser.add_argument("--no-dict", action="store_true", dest="no_dict",
                         help="Disable dictionary scoring")
+    parser.add_argument("--stitch-mode", default="prob", dest="stitch_mode",
+                        choices=["prob", "text"],
+                        help="Window stitching strategy")
     parser.add_argument("--device", default="cpu",
                         help="Device (cpu or cuda)")
 
@@ -481,9 +698,11 @@ def main():
         callsign_bonus=args.callsign_bonus,
         non_dict_penalty=args.non_dict_penalty,
         use_dict=not args.no_dict,
+        stitch_mode=args.stitch_mode,
     )
 
     print(f"[cwformer] window={dec.window_sec}s stride={dec.stride_sec}s "
+          f"stitch={dec._stitch_mode} "
           f"beam={dec.beam_width} lm={'yes' if dec._lm else 'no'} "
           f"dict={'yes' if dec._dictionary else 'no'} "
           f"narrowband={'yes' if dec._narrowband else 'no'} "
