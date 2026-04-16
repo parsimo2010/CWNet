@@ -1,5 +1,5 @@
 """
-rope.py — Rotary Position Embeddings (RoPE) for the Event Transformer.
+rope.py — Rotary Position Embeddings (RoPE) for the Conformer encoder.
 
 RoPE encodes relative position by rotating query and key vectors in pairs.
 This gives the attention mechanism awareness of relative distance between

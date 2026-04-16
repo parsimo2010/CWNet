@@ -1,8 +1,8 @@
 """
 inference_cwformer.py — Inference for the CW-Former (Conformer) decoder.
 
-Provides sliding-window bidirectional decoding on raw audio. Supports
-greedy CTC, beam search, and LM-augmented beam search.
+Provides sliding-window bidirectional decoding on raw audio using greedy
+CTC decoding.
 
 The CW-Former operates on mel spectrograms internally, so this module
 handles audio windowing and CTC probability stitching across overlapping
@@ -17,14 +17,13 @@ Usage (Python API):
 Usage (CLI):
     python -m neural_decoder.inference_cwformer \\
         --checkpoint checkpoints_cwformer/best_model.pt \\
-        --input morse.wav --beam-width 32 --lm trigram_lm.json
+        --input morse.wav
 """
 
 from __future__ import annotations
 
 import argparse
 from difflib import SequenceMatcher
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -44,15 +43,14 @@ from neural_decoder.mel_frontend import MelFrontendConfig
 def _load_cwformer_checkpoint(
     checkpoint: str,
     device: torch.device,
-) -> Tuple[CWFormer, CWFormerConfig, int, bool]:
+) -> Tuple[CWFormer, CWFormerConfig, int]:
     """Load CW-Former checkpoint.
 
-    Returns (model, config, sample_rate, narrowband).
+    Returns (model, config, sample_rate).
     """
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
 
     mc = ckpt.get("model_config", {})
-    narrowband = mc.get("narrowband", False)
 
     mel_cfg = MelFrontendConfig(
         sample_rate=mc.get("sample_rate", 16000),
@@ -72,7 +70,7 @@ def _load_cwformer_checkpoint(
         dropout=0.0,  # no dropout at inference
     )
     model_cfg = CWFormerConfig(
-        mel=mel_cfg, conformer=conformer_cfg, narrowband=narrowband,
+        mel=mel_cfg, conformer=conformer_cfg,
     )
 
     model = CWFormer(model_cfg).to(device)
@@ -82,7 +80,7 @@ def _load_cwformer_checkpoint(
         model.load_state_dict(ckpt, strict=False)
     model.eval()
 
-    return model, model_cfg, mel_cfg.sample_rate, narrowband
+    return model, model_cfg, mel_cfg.sample_rate
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +119,8 @@ class CWFormerDecoder:
                     trailing space-padding is trimmed; text overlap
                     between consecutive windows is detected and skipped;
                     non-redundant content segments are concatenated with
-                    blank-frame transitions; a single CTC decode (with
-                    optional LM) runs over the full stitched sequence.
+                    blank-frame transitions; a single greedy CTC decode
+                    runs over the full stitched sequence.
         "text"    — Decode each window independently, merge decoded
                     texts via word-level overlap matching.
 
@@ -131,13 +129,6 @@ class CWFormerDecoder:
         window_sec: Window length in seconds (default 16).
         stride_sec: Hop between windows in seconds (default 3).
         device: PyTorch device string.
-        beam_width: CTC beam search width (1 = greedy).
-        lm_path: Path to trigram_lm.json for LM-augmented beam search.
-        lm_weight: LM shallow fusion weight.
-        dict_bonus: Dictionary word bonus at word boundaries.
-        callsign_bonus: Callsign pattern bonus at word boundaries.
-        non_dict_penalty: Penalty for non-dictionary words at word boundaries.
-        use_dict: Whether to load and use the CW dictionary.
         stitch_mode: Window stitching strategy ("prob" or "text").
     """
 
@@ -147,36 +138,16 @@ class CWFormerDecoder:
         window_sec: float = 16.0,
         stride_sec: float = 3.0,
         device: str = "cpu",
-        beam_width: int = 1,
-        lm_path: Optional[str] = None,
-        lm_weight: float = 0.3,
-        dict_bonus: float = 3.0,
-        callsign_bonus: float = 1.8,
-        non_dict_penalty: float = -0.5,
-        use_dict: bool = True,
         stitch_mode: str = "prob",
     ) -> None:
         self.device = torch.device(device)
         self.window_sec = window_sec
         self.stride_sec = stride_sec
-        self.beam_width = beam_width
-        self.lm_weight = lm_weight
-        self.dict_bonus = dict_bonus
-        self.callsign_bonus = callsign_bonus
-        self.non_dict_penalty = non_dict_penalty
         self._stitch_mode = stitch_mode
 
-        self._model, self._model_cfg, self.sample_rate, self._narrowband = (
+        self._model, self._model_cfg, self.sample_rate = (
             _load_cwformer_checkpoint(checkpoint, self.device)
         )
-
-        # Narrowband processor for frequency detection + bandpass + shift
-        self._nb_processor = None
-        if self._narrowband:
-            from neural_decoder.narrowband_frontend import NarrowbandProcessor
-            self._nb_processor = NarrowbandProcessor(
-                sample_rate=self.sample_rate,
-            )
 
         # Pre-compute window/stride in samples
         self._win_samples = int(window_sec * self.sample_rate)
@@ -185,22 +156,6 @@ class CWFormerDecoder:
         # CTC frame rate: mel hop → conv subsampling (2× time)
         hop = self._model_cfg.mel.hop_length
         self._frames_per_sample = 1.0 / (hop * 2)  # frames per audio sample
-
-        # Load LM if provided
-        self._lm = None
-        if lm_path and Path(lm_path).exists():
-            from qso_corpus import CharTrigramLM
-            self._lm = CharTrigramLM.load(lm_path)
-
-        # Load dictionary
-        self._dictionary = None
-        if use_dict:
-            try:
-                from qso_corpus import CWDictionary
-                self._dictionary = CWDictionary()
-                self._dictionary.build_default()
-            except Exception:
-                pass
 
         # Validate stitch_mode
         if stitch_mode not in ("prob", "text"):
@@ -230,7 +185,7 @@ class CWFormerDecoder:
         * **prob** — Content-aware log-prob stitching.  Each window is
           greedy-decoded to find character/content boundaries, then
           non-redundant log-prob segments are concatenated and decoded
-          once with CTC (optionally with LM beam search).
+          once with greedy CTC decode.
         * **text** — Decode each window independently, merge decoded
           texts via word-level overlap matching.
 
@@ -240,10 +195,6 @@ class CWFormerDecoder:
         Returns:
             Decoded text string.
         """
-        # Apply narrowband preprocessing if model was trained with it
-        if self._nb_processor is not None:
-            audio, _ = self._nb_processor.process(audio)
-
         # Short audio — single pass (all modes)
         if len(audio) <= self._win_samples:
             log_probs = self._forward_window(audio)
@@ -256,7 +207,7 @@ class CWFormerDecoder:
         return self._decode_prob_stitch(audio)
 
     # ------------------------------------------------------------------
-    # Stitch mode: text (legacy)
+    # Stitch mode: text
     # ------------------------------------------------------------------
 
     def _decode_text_stitch(self, audio: np.ndarray) -> str:
@@ -621,24 +572,9 @@ class CWFormerDecoder:
         return mel_frames // 2
 
     def _decode_log_probs(self, log_probs: Tensor) -> str:
-        """Decode CTC log_probs to text."""
+        """Decode CTC log_probs to text using greedy decoding."""
         if log_probs.shape[0] == 0:
             return ""
-
-        if self.beam_width > 1:
-            from neural_decoder.ctc_decode import beam_search_with_lm
-            return beam_search_with_lm(
-                log_probs,
-                lm=self._lm,
-                dictionary=self._dictionary,
-                lm_weight=self.lm_weight,
-                dict_bonus=self.dict_bonus,
-                callsign_bonus=self.callsign_bonus,
-                non_dict_penalty=self.non_dict_penalty,
-                beam_width=self.beam_width,
-                strip_trailing_space=True,
-            )
-
         return vocab_module.decode_ctc(log_probs, strip_trailing_space=True)
 
 
@@ -659,25 +595,6 @@ def main():
                         help="Window size in seconds")
     parser.add_argument("--stride", type=float, default=3.0, metavar="SEC",
                         help="Stride between windows in seconds")
-    parser.add_argument("--beam-width", type=int, default=1, metavar="N",
-                        dest="beam_width",
-                        help="CTC beam width (1=greedy, 32=recommended with LM)")
-    parser.add_argument("--lm", type=str, default=None, metavar="PATH",
-                        help="Path to trigram_lm.json for LM beam search")
-    parser.add_argument("--lm-weight", type=float, default=0.3,
-                        dest="lm_weight",
-                        help="LM shallow fusion weight")
-    parser.add_argument("--dict-bonus", type=float, default=3.0,
-                        dest="dict_bonus",
-                        help="Dictionary word bonus at word boundaries")
-    parser.add_argument("--callsign-bonus", type=float, default=1.8,
-                        dest="callsign_bonus",
-                        help="Callsign pattern bonus at word boundaries")
-    parser.add_argument("--non-dict-penalty", type=float, default=-0.5,
-                        dest="non_dict_penalty",
-                        help="Penalty for non-dictionary words (0=off)")
-    parser.add_argument("--no-dict", action="store_true", dest="no_dict",
-                        help="Disable dictionary scoring")
     parser.add_argument("--stitch-mode", default="prob", dest="stitch_mode",
                         choices=["prob", "text"],
                         help="Window stitching strategy")
@@ -691,21 +608,11 @@ def main():
         window_sec=args.window,
         stride_sec=args.stride,
         device=args.device,
-        beam_width=args.beam_width,
-        lm_path=args.lm,
-        lm_weight=args.lm_weight,
-        dict_bonus=args.dict_bonus,
-        callsign_bonus=args.callsign_bonus,
-        non_dict_penalty=args.non_dict_penalty,
-        use_dict=not args.no_dict,
         stitch_mode=args.stitch_mode,
     )
 
     print(f"[cwformer] window={dec.window_sec}s stride={dec.stride_sec}s "
           f"stitch={dec._stitch_mode} "
-          f"beam={dec.beam_width} lm={'yes' if dec._lm else 'no'} "
-          f"dict={'yes' if dec._dictionary else 'no'} "
-          f"narrowband={'yes' if dec._narrowband else 'no'} "
           f"params={dec._model.num_params:,}")
 
     transcript = dec.decode_file(args.input)

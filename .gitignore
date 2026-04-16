@@ -1,33 +1,24 @@
+# archived files (pre-cleanup snapshot)
+archive/
+
 # analysis outputs
 *.png
 *.txt
 *.wav
 *.csv
 
-# LM/dictionary source data (override *.txt and *.csv above)
+# Word list for QSO text generation (override *.txt above)
 !google-10000-english-usa.txt
-!google-10000-english.txt
-!count_3l.txt
-!english_3grams.csv
 
 # Real HF noise recordings for training augmentation (override *.wav above)
 !recordings/noise_*.wav
 
 # model checkpoints and training artifacts
 *.pt
-checkpoints/
 checkpoints_cwformer*/
-checkpoints_event_transformer/
-checkpoints_hybrid/
 
 # pre-generated audio-based samples
 *.npz
-
-# debug files
-checkpoints/debug_samples
-
-# plan documents from Roo
-plans/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

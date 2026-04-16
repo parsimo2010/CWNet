@@ -3,17 +3,16 @@ cwformer.py — CW-Former: Conformer-based CW decoder operating on raw audio.
 
 Full pipeline:
   Audio (16 kHz mono, float32)
-  → MelFrontend: log-mel spectrogram (40 bins 200-1400 Hz, 25ms/10ms; or 32 bins 400-1200 Hz in narrowband) + SpecAugment
-  → Conv subsampling: 2× time reduction (default) or 4× (legacy)
+  → MelFrontend: log-mel spectrogram (40 bins 200-1400 Hz, 25ms/10ms) + SpecAugment
+  → Conv subsampling: 2× time reduction
   → Linear projection to d_model + dropout
   → ConformerEncoder: 12 Conformer blocks (d=256, 4 heads, conv kernel=31)
   → Linear CTC head → log_softmax over vocabulary
 
-Default 2× subsampling: 100 fps → 50 fps (20ms per frame). Resolves
-Morse dits up to 40+ WPM. At 4× (40ms), dits become sub-frame above
-~20 WPM, causing an irrecoverable CER plateau around 39%.
+2× subsampling: 100 fps → 50 fps (20ms per frame). Resolves
+Morse dits up to 40+ WPM.
 
-Total parameters: ~19.5M (wideband) or ~19.4M (narrowband).
+Total parameters: ~19.5M.
 
 Reference: Gulati et al., "Conformer: Convolution-augmented Transformer
 for Speech Recognition", 2020.
@@ -54,12 +53,6 @@ class CWFormerConfig:
 
     # CTC output
     num_classes: int = vocab.num_classes  # 52 (CTC blank + space + chars + prosigns)
-
-    # Narrowband mode: when True, the model expects audio preprocessed by
-    # NarrowbandProcessor (bandpass + freq shift) and uses a smaller mel
-    # filterbank (32 bins, 400-1200 Hz). The NarrowbandProcessor is NOT
-    # part of the model — it runs on CPU in the dataset pipeline / inference.
-    narrowband: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -214,14 +207,9 @@ class CWFormer(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from neural_decoder.narrowband_frontend import (
-        NARROWBAND_F_MIN, NARROWBAND_F_MAX, NARROWBAND_N_MELS,
-    )
-
-    # Wideband (default)
     config = CWFormerConfig()
     model = CWFormer(config)
-    print(f"CW-Former (wideband) parameters: {model.num_params:,}")
+    print(f"CW-Former parameters: {model.num_params:,}")
     print(f"  Encoder: {model.encoder_params:,}")
     print(f"  Mel frontend: {sum(p.numel() for p in model.mel_frontend.parameters()):,}")
     print(f"  Subsampling: {sum(p.numel() for p in model.subsampling.parameters()):,}")
@@ -236,21 +224,3 @@ if __name__ == "__main__":
         log_probs, out_lengths = model(audio, lengths)
     print(f"\nInput: audio ({B}, {N})")
     print(f"Output: log_probs {log_probs.shape}, lengths {out_lengths}")
-
-    # Narrowband
-    nb_mel_cfg = MelFrontendConfig(
-        n_mels=NARROWBAND_N_MELS,
-        f_min=NARROWBAND_F_MIN,
-        f_max=NARROWBAND_F_MAX,
-    )
-    nb_config = CWFormerConfig(mel=nb_mel_cfg, narrowband=True)
-    nb_model = CWFormer(nb_config)
-    print(f"\nCW-Former (narrowband) parameters: {nb_model.num_params:,}")
-    print(f"  Encoder: {nb_model.encoder_params:,}")
-    print(f"  Subsampling: {sum(p.numel() for p in nb_model.subsampling.parameters()):,}")
-
-    nb_model.eval()
-    with torch.no_grad():
-        lp, ol = nb_model(audio, lengths)
-    print(f"Input: audio ({B}, {N})")
-    print(f"Output: log_probs {lp.shape}, lengths {ol}")

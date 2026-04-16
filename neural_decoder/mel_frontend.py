@@ -5,14 +5,13 @@ Computes log-mel spectrograms from raw audio and applies SpecAugment
 (Park et al., 2019) data augmentation during training.
 
 Pipeline:
-  Audio (16 kHz or 8 kHz, float32)
+  Audio (16 kHz, float32)
   → STFT (25ms window, 10ms hop)
-  → Mel filterbank (80 bins, 0-4000 Hz; or 32 bins, 400-1200 Hz in narrowband mode)
+  → Mel filterbank (40 bins, 200-1400 Hz)
   → Log compression (log(mel + 1e-6))
   → SpecAugment (training only): frequency masking + time masking
 
-Default (wideband) output is (B, T, 80).
-Narrowband output is (B, T, 32) when used with NarrowbandProcessor.
+Output shape: (B, T, 40).
 """
 
 from __future__ import annotations

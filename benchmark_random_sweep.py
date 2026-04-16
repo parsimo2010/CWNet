@@ -104,13 +104,9 @@ def main():
     mc.min_chars = 40
     mc.max_chars = 150
 
-    # Greedy decoder
     dec = CWFormerDecoder(
         checkpoint=args.checkpoint,
         device=args.device,
-        beam_width=1,
-        lm_path=None,
-        use_dict=False,
         window_sec=args.window_sec,
         stride_sec=args.stride_sec,
     )

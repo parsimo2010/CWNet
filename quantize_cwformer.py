@@ -96,7 +96,7 @@ def export_and_quantize(
 
     # ---- Load model ----
     device = torch.device("cpu")
-    model, model_cfg, sample_rate, narrowband = _load_cwformer_checkpoint(
+    model, model_cfg, sample_rate = _load_cwformer_checkpoint(
         checkpoint, device)
 
     n_mels = model_cfg.mel.n_mels
@@ -236,7 +236,6 @@ def export_and_quantize(
         "n_mels": n_mels,
         "f_min": model_cfg.mel.f_min,
         "f_max": model_cfg.mel.f_max,
-        "narrowband": narrowband,
     }
     config_path = str(out / "mel_config.json")
     with open(config_path, "w") as f:

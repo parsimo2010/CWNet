@@ -1,89 +1,32 @@
-# CWNet — Neural & Probabilistic Morse Code Decoders
+# CWNet — CW-Former: Neural Morse Code Decoder
 
-CWNet is an advanced Morse code (CW) decoding project pursuing multiple
-approaches to achieve maximum accuracy on human-sent CW. All training data
-is synthesised on the fly — no recorded audio is required.
+CWNet is a neural Morse code (CW) decoder built on the Conformer architecture.
+It operates directly on mel spectrograms, bypassing traditional event-detection
+pipelines entirely. All training data is synthesised on the fly — no recorded
+audio is required.
 
-## Decoder Approaches
-
-### 1. Event-Stream LSTM (baseline)
-
-A compact causal decoder combining a DSP-based mark/space event detector
-with an LSTM neural network trained end-to-end with CTC loss. ~400K params.
+## Architecture
 
 ```
-Audio (16 kHz) → MorseEventExtractor → MorseEventFeaturizer (5-dim)
-  → LSTM (3×128) → CTC decode → text
+Audio (16 kHz mono, float32)
+  → Mel spectrogram (40 bins, 200-1400 Hz, 25ms/10ms)
+  → SpecAugment (training only)
+  → Conv subsampling (2× time reduction → 50 fps)
+  → Conformer encoder (12 layers, d=256, 4 heads, conv kernel=31)
+  → CTC head → greedy decode → text
 ```
 
-### 2. Event-Stream Transformer
-
-A bidirectional transformer encoder on 10-dimensional enhanced event features
-with RoPE positional embeddings and CTC loss. ~1.2M params. Uses sliding-window
-inference with optional trigram language model beam search.
-
-```
-Audio (16 kHz) → MorseEventExtractor → EnhancedFeaturizer (10-dim)
-  → Transformer (6 layers, d=128) → CTC beam search + LM → text
-```
-
-### 3. CW-Former (Conformer)
-
-A Conformer model operating directly on mel spectrograms with convolutional
-subsampling and CTC loss. ~30-40M params. Bypasses the event extraction stage
-entirely. Supports a narrowband mode with a 32-bin filterbank (400–1200 Hz) and
-automatic frequency centering via `NarrowbandProcessor`.
-
-```
-Audio (16 kHz) → Mel spectrogram (80 bins, or 32 bins narrowband) → Conv subsampling (4×)
-  → Conformer (12 layers, d=256) → CTC beam search + LM → text
-```
-
-### 4. Reference Decoder (non-neural)
-
-A fully probabilistic decoder using I/Q matched-filter front end, Bayesian
-timing classification, beam search with character trigram language model and
-word dictionary. No neural network.
-
-### 5. Hybrid Event Transformer
-
-Extends the Event-Stream Transformer with Bayesian timing posteriors from the reference
-decoder's timing model. Each event gets 17-dim features: 10 base statistics plus explicit
-P(dit), P(dah), P(IES), P(ICS), P(IWS) posteriors and an RWE-tracked dit estimate.
-
-```
-Audio (16 kHz) → MorseEventExtractor → HybridFeaturizer (17-dim)
-  → Transformer (6 layers, d=128) → CTC beam search + LM → text
-```
-
-Timing dropout (p=0.1) during training prevents over-reliance on Bayesian features.
-Reuses the same EventTransformerModel architecture with in_features=17.
+~19.5M parameters. Reference: Gulati et al., "Conformer: Convolution-augmented
+Transformer for Speech Recognition", 2020.
 
 ## Key Design Choices
 
 | Aspect | Decision | Rationale |
 |---|---|---|
-| **Feature extraction** | Asymmetric EMA adaptive threshold, AGC-immune | Adapts in 1-2 frames; no noise floor estimation needed |
-| **Event features** | Log-scale ratios (5-dim baseline, 10-dim enhanced) | Speed-invariant: same timing patterns at any WPM |
+| **Input** | Raw mel spectrograms (no event extraction) | Avoids information loss from hard mark/space decisions |
 | **Training data** | Synthesised on the fly with extensive augmentations | AGC, QSB, QRM, QRN, bandpass, HF noise, 4 key types |
 | **Loss** | CTC (connectionist temporal classification) | Variable-rate alignment without forced segmentation |
-| **Language model** | Character trigram LM with beam search shallow fusion | Provides significant accuracy improvement post-CTC |
-| **Hardware** | Desktop CPU/GPU | No edge deployment constraint — accuracy over speed |
-
-## Feature Extraction (feature.py)
-
-The STFT (20 ms window, 5 ms hop) is computed at 16 kHz over a configurable
-frequency range (default 300-1200 Hz). Two asymmetric EMAs track mark and space
-levels independently:
-
-- **mark_ema**: fast upward, slow downward — captures signal onset in 1-2 frames
-- **space_ema**: fast downward, slow upward
-
-The adaptive threshold with 3-frame delay produces clean mark/space events
-even at signal onset. A blip filter suppresses noise pops shorter than the
-configurable threshold (default 15 ms).
-
-Output is a variable-rate list of `MorseEvent` objects (type, start, duration, confidence).
+| **Decoding** | Greedy CTC | Sufficient accuracy without the complexity of beam search |
 
 ## Training Data
 
@@ -115,48 +58,22 @@ realistic amateur radio exchanges (callsigns, signal reports, QSO patterns).
 pip install torch torchaudio numpy scipy soundfile tqdm
 ```
 
-Optional (for live audio):
-```bash
-pip install sounddevice
-```
-
 ## Training
 
-### LSTM baseline
 ```bash
-python train.py --scenario clean
-python train.py --scenario full --checkpoint_file checkpoints/best_model_clean.pt
-```
+# Quick test (verify pipeline)
+python -m neural_decoder.train_cwformer --scenario test --workers 2
 
-### Event Transformer
-```bash
-# Clean stage
-python -m neural_decoder.train_event_transformer --scenario clean --workers 8
+# Stage 1: Clean conditions
+python -m neural_decoder.train_cwformer --scenario clean --workers 12
 
-# Full stage (resume from clean checkpoint)
-python -m neural_decoder.train_event_transformer --scenario full --workers 8 \
-    --batch-size 64 --max-events 600 \
-    --checkpoint checkpoints_transformer/best_model.pt
-```
+# Stage 2: Moderate augmentations (resume from clean)
+python -m neural_decoder.train_cwformer --scenario moderate --workers 12 \
+    --checkpoint checkpoints_cwformer_clean/best_model.pt
 
-### CW-Former
-```bash
-# Clean stage
-python -m neural_decoder.train_cwformer --scenario clean --workers 12 --batch-size 8
-
-# Full stage (resume)
+# Stage 3: Full augmentations (resume from moderate)
 python -m neural_decoder.train_cwformer --scenario full --workers 12 \
-    --checkpoint checkpoints_cwformer/best_model.pt
-```
-
-### Hybrid Event Transformer
-```bash
-# Clean stage
-python -m hybrid_decoder.train --scenario clean --workers 8
-
-# Full stage (resume from clean checkpoint)
-python -m hybrid_decoder.train --scenario full --workers 8 \
-    --checkpoint checkpoints_hybrid/best_model.pt
+    --checkpoint checkpoints_cwformer_moderate/best_model.pt
 ```
 
 Training produces CSV logs in the checkpoint directory with train/val loss,
@@ -164,27 +81,36 @@ greedy CER (every epoch), and beam CER (every 50 epochs).
 
 ## Inference
 
-### LSTM baseline
 ```bash
-python inference.py --checkpoint checkpoints/best_model.pt --input morse.wav
-python inference.py --checkpoint checkpoints/best_model.pt --input morse.wav --beam-width 10
+# Decode a WAV file
+python -m neural_decoder.inference_cwformer \
+    --checkpoint checkpoints_cwformer_full/best_model.pt \
+    --input morse.wav
 ```
 
-### Event Transformer
+## Benchmarking
+
 ```bash
-python -m neural_decoder.inference_transformer \
-    --checkpoint checkpoints_transformer/best_model.pt \
-    --input morse.wav --beam-width 15 --lm trigram_lm.json --lm-weight 0.1
+# Structured benchmark across SNR, WPM, and key types
+python benchmark_cwformer.py \
+    --checkpoint checkpoints_cwformer_full/best_model.pt
+
+# Random parameter sweep
+python benchmark_random_sweep.py \
+    --checkpoint checkpoints_cwformer_full/best_model.pt
 ```
 
-### Live decoding (LSTM)
-```bash
-python listen.py --checkpoint checkpoints/best_model.pt --device
-python listen.py --checkpoint checkpoints/best_model.pt --device --freq-min 600 --freq-max 900
+## Deployment (ONNX)
 
-# Pipe from SDR
-rtl_fm -f 7.040M -M usb -s 44100 | \
-    python listen.py --checkpoint checkpoints/best_model.pt --stdin --sample-rate 44100
+```bash
+# Export to INT8 ONNX
+python quantize_cwformer.py \
+    --checkpoint checkpoints_cwformer_full/best_model.pt
+
+# Run ONNX inference
+python deploy/inference_onnx.py \
+    --model deploy/cwformer_int8.onnx \
+    --input morse.wav
 ```
 
 ## Vocabulary
@@ -196,59 +122,35 @@ punctuation `.,?/(&=+`, and prosigns AR, SK, BT, KN, AS, CT.
 
 ```
 CWNet/
-├── config.py                  # All configuration (MorseConfig, FeatureConfig, etc.)
+├── config.py                  # All configuration (MorseConfig, etc.)
 ├── vocab.py                   # 52-class CTC vocabulary + decode utilities
 ├── morse_table.py             # ITU Morse code table + binary trie
-├── feature.py                 # STFT → adaptive threshold → MorseEvent extractor
-├── fast_feature.py            # Numba-accelerated feature extraction
-├── model.py                   # LSTM baseline (MorseEventFeaturizer + MorseEventModel)
-├── morse_generator.py         # Synthetic Morse audio/event generator
-├── dataset.py                 # Streaming dataset for LSTM baseline
-├── train.py                   # LSTM training loop
-├── inference.py               # LSTM inference (causal + sliding-window)
-├── source.py                  # Audio source abstraction (file/device/stdin)
-├── listen.py                  # Live decode CLI
-├── analyze.py                 # Debug visualization (waveform/energy/events)
-├── quantize.py                # INT8 quantization + ONNX export
-├── qso_corpus.py              # QSO corpus generator + CharTrigramLM
-├── build_lm.py                # Build trigram LM → trigram_lm.json
-├── trigram_lm.json            # Pre-built character trigram language model
+├── morse_generator.py         # Synthetic Morse audio generator with augmentations
+├── qso_corpus.py              # QSO corpus generator for training text
 │
-├── neural_decoder/            # Transformer-based decoders
-│   ├── event_transformer.py   # Event Transformer model (RoPE + CTC)
-│   ├── enhanced_featurizer.py # 10-dim enhanced event features
-│   ├── rope.py                # Rotary Position Embeddings
-│   ├── dataset_events.py      # Streaming dataset (events)
-│   ├── train_event_transformer.py
-│   ├── inference_transformer.py
+├── neural_decoder/            # CW-Former model and training
 │   ├── cwformer.py            # CW-Former model (Conformer + CTC)
 │   ├── conformer.py           # Conformer encoder blocks
+│   ├── rope.py                # Rotary Position Embeddings
 │   ├── mel_frontend.py        # Mel spectrogram + SpecAugment
 │   ├── dataset_audio.py       # Streaming dataset (audio)
-│   ├── narrowband_frontend.py # Narrowband preprocessing (freq detect → bandpass → shift)
-│   ├── train_cwformer.py
-│   ├── inference_cwformer.py
-│   ├── ctc_decode.py          # CTC beam search with LM fusion
-│   └── eval.py                # Evaluation utilities
+│   ├── train_cwformer.py      # Training loop (3-stage curriculum)
+│   └── inference_cwformer.py  # Sliding-window inference decoder + CLI
 │
-├── hybrid_decoder/            # Hybrid Event Transformer (17-dim features)
-│   ├── hybrid_featurizer.py   # 17-dim: 10 base + 7 Bayesian timing posteriors
-│   ├── dataset.py             # Streaming dataset with timing dropout
-│   ├── train.py               # Training loop (3-stage curriculum)
-│   └── inference.py           # Sliding-window inference decoder + CLI
+├── benchmark_cwformer.py      # Structured performance benchmark
+├── benchmark_random_sweep.py  # Random parameter sweep benchmark
+├── quantize_cwformer.py       # INT8 ONNX export
 │
-├── reference_decoder/         # Non-neural probabilistic decoder
-│   ├── iq_frontend.py         # I/Q matched-filter front end
-│   ├── freq_tracker.py        # Frequency tracking
-│   ├── timing_model.py        # Bayesian timing classification
-│   ├── key_detector.py        # Key type detection
-│   ├── beam_decoder.py        # Beam search with language model
-│   ├── language_model.py      # LM integration
-│   ├── qso_tracker.py         # QSO structure tracking
-│   ├── decoder.py             # Main decoder pipeline
-│   └── cli.py                 # CLI entry point
+├── deploy/                    # ONNX deployment runtime
+│   ├── inference_onnx.py      # Standalone ONNX inference (no PyTorch needed)
+│   ├── ctc_decode.py          # CTC decode for ONNX runtime
+│   ├── cwformer_fp32.onnx     # FP32 ONNX model
+│   ├── cwformer_int8.onnx     # INT8 quantized ONNX model
+│   └── mel_config.json        # Mel spectrogram parameters
 │
-└── morse_decoding_research.md # Research survey & design rationale
+├── recordings/                # Test audio recordings
+├── checkpoints_cwformer_*/    # Trained model checkpoints (clean/moderate/full)
+└── google-10000-english-usa.txt  # Word list for QSO text generation
 ```
 
 ## Performance Targets

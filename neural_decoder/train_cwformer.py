@@ -271,23 +271,10 @@ def train(args: argparse.Namespace) -> None:
         config.training.num_epochs = args.epochs
 
     # ---- Model config ----
-    if args.narrowband:
-        from neural_decoder.narrowband_frontend import (
-            NARROWBAND_F_MIN, NARROWBAND_F_MAX, NARROWBAND_N_MELS,
-        )
-        mel_cfg = MelFrontendConfig(
-            sample_rate=config.morse.sample_rate,
-            n_mels=NARROWBAND_N_MELS,
-            f_min=NARROWBAND_F_MIN,
-            f_max=NARROWBAND_F_MAX,
-            spec_augment=True,
-            freq_mask_width=8,   # fewer bins → narrower masks
-        )
-    else:
-        mel_cfg = MelFrontendConfig(
-            sample_rate=config.morse.sample_rate,
-            spec_augment=True,
-        )
+    mel_cfg = MelFrontendConfig(
+        sample_rate=config.morse.sample_rate,
+        spec_augment=True,
+    )
     conformer_cfg = ConformerConfig(
         d_model=args.d_model,
         n_heads=args.n_heads,
@@ -299,7 +286,6 @@ def train(args: argparse.Namespace) -> None:
     model_cfg = CWFormerConfig(
         mel=mel_cfg,
         conformer=conformer_cfg,
-        narrowband=args.narrowband,
     )
 
     # ---- Checkpoint directory ----
@@ -312,8 +298,7 @@ def train(args: argparse.Namespace) -> None:
 
     # ---- Model ----
     model = CWFormer(model_cfg).to(device)
-    nb_str = f", narrowband (n_mels={mel_cfg.n_mels}, f={mel_cfg.f_min}-{mel_cfg.f_max} Hz)" if args.narrowband else ""
-    print(f"CW-Former: {model.num_params:,} parameters{nb_str}")
+    print(f"CW-Former: {model.num_params:,} parameters")
     print(f"  d_model={conformer_cfg.d_model}, n_heads={conformer_cfg.n_heads}, "
           f"n_layers={conformer_cfg.n_layers}, d_ff={conformer_cfg.d_ff}, "
           f"conv_kernel={conformer_cfg.conv_kernel}")
@@ -403,8 +388,7 @@ def train(args: argparse.Namespace) -> None:
     ctc_loss_fn = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
 
     # ---- Datasets ----
-    # CW-Former on audio is much heavier — use smaller batches and fewer samples
-    # Audio generation is slower than direct events, so reduce epoch size
+    # Audio generation is CPU-bound — use smaller batches and fewer samples
     samples_per_epoch = min(config.training.samples_per_epoch, 20000)
     val_samples = min(config.training.val_samples, 2000)
 
@@ -415,12 +399,10 @@ def train(args: argparse.Namespace) -> None:
     train_ds = AudioDataset(
         config, epoch_size=samples_per_epoch, seed=None,
         qso_text_ratio=0.5, max_audio_sec=args.max_audio_sec,
-        narrowband=args.narrowband,
     )
     val_ds = AudioDataset(
         config, epoch_size=val_samples, seed=None,  # fresh samples each eval
         qso_text_ratio=0.5, max_audio_sec=args.max_audio_sec,
-        narrowband=args.narrowband,
     )
 
     num_workers = args.workers
@@ -677,7 +659,6 @@ def train(args: argparse.Namespace) -> None:
                 "sample_rate": mel_cfg.sample_rate,
                 "n_fft": mel_cfg.n_fft,
                 "hop_length": mel_cfg.hop_length,
-                "narrowband": args.narrowband,
             },
         }
 
@@ -689,7 +670,7 @@ def train(args: argparse.Namespace) -> None:
             best_val_loss = val_loss
             ckpt_data["best_val_loss"] = best_val_loss
             torch.save(ckpt_data, ckpt_dir / "best_model.pt")
-            print(f"  → New best model (val_loss={val_loss:.4f})")
+            print(f"  * New best model (val_loss={val_loss:.4f})")
 
         # Periodic checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
@@ -711,9 +692,6 @@ def main():
     parser.add_argument("--ckpt-dir", type=str, default="checkpoints_cwformer")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override number of epochs")
-    parser.add_argument("--narrowband", action="store_true",
-                        help="Enable narrowband mode: freq detection + bandpass + "
-                             "32-bin mel (400-1200 Hz) instead of 80-bin (0-4000 Hz)")
     parser.add_argument("--no-amp", action="store_true", dest="no_amp",
                         help="Disable AMP (mixed precision). Auto-disabled on ROCm.")
     parser.add_argument("--lr-resume", action="store_true", dest="lr_resume",

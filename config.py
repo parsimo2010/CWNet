@@ -1,16 +1,15 @@
 """
-config.py — Configuration for CWNet: event-stream LSTM Morse decoder.
+config.py — Configuration for CWNet Morse code decoder.
 
-Four dataclasses cover the full pipeline:
+Dataclasses covering audio generation and training:
   MorseConfig    — synthetic audio generation parameters
-  FeatureConfig  — STFT → asymmetric EMA adaptive threshold → MorseEvent stream
-  ModelConfig    — LSTM event-stream CTC architecture
   TrainingConfig — training hyperparameters and curriculum settings
 
 Use create_default_config(scenario) to get pre-built configs for:
-  "test"  — tiny run (~5 epochs) to verify the pipeline end-to-end
-  "clean" — curriculum stage 1: high SNR, standard timing (300 epochs)
-  "full"  — curriculum stage 2: noisy, bad-fist timing (500 epochs)
+  "test"     — tiny run (~5 epochs) to verify the pipeline end-to-end
+  "clean"    — curriculum stage 1: high SNR, standard timing (200 epochs)
+  "moderate" — curriculum stage 2: mid SNR, moderate bad-fist (300 epochs)
+  "full"     — curriculum stage 3: low SNR, extreme bad-fist (500 epochs)
 """
 
 from __future__ import annotations
@@ -259,36 +258,16 @@ class FeatureConfig:
 
 
 # ---------------------------------------------------------------------------
-# ModelConfig — LSTM event-stream architecture
+# ModelConfig
 # ---------------------------------------------------------------------------
 
 @dataclass
 class ModelConfig:
-    """LSTM model architecture parameters for MorseEvent-stream CTC decoding.
+    """Model architecture parameters (retained for config serialization)."""
 
-    The model consumes a variable-rate sequence of MorseEvent feature vectors
-    (one per detected mark or space interval) rather than a fixed-rate frame
-    array.  There is no CNN frontend and no time-axis downsampling.
-
-    Default (~400 K parameters):
-      in_features = 5   — [is_mark, log_duration, confidence,
-                            log_ratio_prev_mark, log_ratio_prev_space]
-      hidden_size  = 128
-      n_rnn_layers = 3
-      dropout      = 0.1
-    """
-
-    # Feature vector dimension produced by MorseEventFeaturizer.
-    # Change only if the featurizer is extended.
     in_features: int = 5
-
-    # LSTM hidden size
     hidden_size: int = 128
-
-    # Number of stacked LSTM layers
     n_rnn_layers: int = 3
-
-    # Dropout between LSTM layers (0 disables; auto-disabled for n_rnn_layers=1)
     dropout: float = 0.1
 
     def to_dict(self) -> dict:
@@ -386,17 +365,6 @@ def create_default_config(scenario: str = "clean") -> Config:
     clean    — 200 epochs; high SNR, near-standard timing (curriculum stage 1)
     moderate — 300 epochs; mid SNR, moderate bad-fist (curriculum stage 2)
     full     — 500 epochs; low SNR, extreme bad-fist (curriculum stage 3)
-
-    Recommended curriculum workflow::
-
-        python train.py --scenario clean
-        python train.py --scenario moderate \\
-            --checkpoint_file checkpoints/best_model.pt \\
-            --additional_epochs 300
-        python train.py --scenario full \\
-            --checkpoint_file checkpoints/best_model_moderate.pt \\
-            --additional_epochs 500
-
     """
     cfg = Config()
 
@@ -440,9 +408,6 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.timing_jitter = 0.0
         cfg.morse.timing_jitter_max = 0.05
         cfg.morse.tone_drift = 3.0
-        # Direct event gen is ~74x faster than audio: data gen no longer
-        # bottlenecks, so we increase batch/samples and scale LR accordingly.
-        # sqrt(512/256) * 8e-4 ~ 1e-3.
         cfg.training.batch_size = 512
         cfg.training.learning_rate = 1e-3
         cfg.training.num_epochs = 200
@@ -551,7 +516,7 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.val_samples = 5000
         cfg.training.num_workers = 4
         cfg.training.beam_cer_interval = 50
-        # Real-world augmentations (full strength for curriculum stage 2)
+        # Real-world augmentations (full strength for curriculum stage 3)
         cfg.morse.agc_probability = 0.7
         cfg.morse.agc_depth_db_max = 22.0
         cfg.morse.qsb_probability = 0.50
@@ -599,12 +564,11 @@ def create_default_config(scenario: str = "clean") -> Config:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    for s in ("test", "clean", "full"):
+    for s in ("test", "clean", "moderate", "full"):
         cfg = create_default_config(s)
         print(
-            f"[{s:5s}]  SNR={cfg.morse.min_snr_db:.0f}–{cfg.morse.max_snr_db:.0f} dB  "
+            f"[{s:8s}]  SNR={cfg.morse.min_snr_db:.0f}–{cfg.morse.max_snr_db:.0f} dB  "
             f"WPM={cfg.morse.min_wpm:.0f}–{cfg.morse.max_wpm:.0f}  "
             f"dah/dit={cfg.morse.dah_dit_ratio_min:.1f}–{cfg.morse.dah_dit_ratio_max:.1f}  "
-            f"hidden={cfg.model.hidden_size}  layers={cfg.model.n_rnn_layers}"
+            f"epochs={cfg.training.num_epochs}"
         )
-    print(f"Vocab size: import vocab; print(vocab.num_classes)")

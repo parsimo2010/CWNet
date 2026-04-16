@@ -5,16 +5,9 @@ Generates (audio, text) pairs on-the-fly using morse_generator.py.
 The CW-Former model handles mel spectrogram computation internally,
 so this dataset outputs raw audio waveforms.
 
-Key differences from dataset_events.py:
-  - Outputs raw audio (float32 waveforms) instead of event features
-  - Pads audio along the sample dimension, not the event dimension
-  - Collate function produces (B, N) audio tensors
-  - QSO corpus text mixed with random text (configurable ratio)
-
-When ``narrowband=True``, each audio sample is preprocessed by
-NarrowbandProcessor (frequency detection → bandpass filter → frequency
-shift) before yielding, so the model receives audio centered at a fixed
-frequency suitable for a narrowband mel filterbank.
+Outputs raw audio (float32 waveforms), pads along the sample dimension,
+and the collate function produces (B, N) audio tensors. QSO corpus text
+is mixed with random text (configurable ratio).
 """
 
 from __future__ import annotations
@@ -60,8 +53,6 @@ class AudioDataset(IterableDataset):
         seed: Fixed seed for reproducibility (None = random per worker).
         qso_text_ratio: Fraction of samples using QSO corpus text (0-1).
         max_audio_sec: Maximum audio duration in seconds (longer samples truncated).
-        narrowband: If True, apply NarrowbandProcessor to each sample
-            (frequency detection, bandpass filter, frequency shift to fixed center).
     """
 
     def __init__(
@@ -71,7 +62,6 @@ class AudioDataset(IterableDataset):
         seed: Optional[int] = None,
         qso_text_ratio: float = 0.5,
         max_audio_sec: float = 15.0,
-        narrowband: bool = False,
     ) -> None:
         super().__init__()
         self.morse_cfg = config.morse
@@ -82,19 +72,10 @@ class AudioDataset(IterableDataset):
         self.max_audio_samples = int(max_audio_sec * config.morse.sample_rate)
         self.wordlist = load_wordlist()
         self._space_idx = vocab_module.char_to_idx[" "]
-        self.narrowband = narrowband
 
     def __iter__(self) -> Iterator[Tuple[Tensor, Tensor, str]]:
         rng = self._make_rng()
         qso_gen = QSOCorpusGenerator(seed=int(rng.integers(0, 2**31)))
-
-        # Create per-worker NarrowbandProcessor if needed
-        nb_processor = None
-        if self.narrowband:
-            from neural_decoder.narrowband_frontend import NarrowbandProcessor
-            nb_processor = NarrowbandProcessor(
-                sample_rate=self.morse_cfg.sample_rate,
-            )
 
         worker_info = torch.utils.data.get_worker_info()
         per_worker = (
@@ -142,10 +123,6 @@ class AudioDataset(IterableDataset):
             # that corrupt CTC gradients.
             if len(audio_f32) > self.max_audio_samples:
                 continue
-
-            # Narrowband preprocessing: detect freq, bandpass, shift
-            if nb_processor is not None:
-                audio_f32, _ = nb_processor.process(audio_f32)
 
             # Target with boundary space tokens
             inner = vocab_module.encode(text)

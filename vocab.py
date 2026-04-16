@@ -104,7 +104,7 @@ def save_vocab(path: str = "vocab.json") -> None:
 
 
 def load_vocab(path: str = "vocab.json") -> Tuple[Dict[str, int], Dict[int, str]]:
-    """Load a previously saved vocabulary from *path*.
+    """Load a saved vocabulary from *path*.
 
     Returns ``(char_to_idx, idx_to_char)`` with integer keys in the second dict.
     """

@@ -284,13 +284,9 @@ def main():
     writer = csv.DictWriter(csv_fh, fieldnames=CSV_FIELDS)
     writer.writeheader()
 
-    # Greedy decoder (no beam search, no LM)
     dec = CWFormerDecoder(
         checkpoint=args.checkpoint,
         device=args.device,
-        beam_width=1,
-        lm_path=None,
-        use_dict=False,
     )
     n = args.samples
 

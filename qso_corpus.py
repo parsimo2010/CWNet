@@ -1,9 +1,8 @@
 """
 qso_corpus.py — Realistic amateur radio QSO text generator.
 
-Shared by both the reference decoder (language model training) and the neural
-decoder (training data text source).  Generates text that reflects actual
-amateur radio communication patterns including:
+Generates text that reflects actual amateur radio communication patterns
+for use as training data. Patterns include:
 
   - CQ calls with callsigns
   - Standard QSO exchanges (RST, name, QTH)
@@ -20,7 +19,6 @@ Usage:
     text = gen.generate()           # random QSO-style text
     text = gen.generate_qso()       # full QSO exchange
     text = gen.generate_cq()        # CQ call only
-    corpus = gen.generate_corpus(n=10000)  # large corpus for LM training
 """
 
 from __future__ import annotations
@@ -653,8 +651,7 @@ class QSOCorpusGenerator:
 class CharTrigramLM:
     """Character-level trigram language model with Kneser-Ney smoothing.
 
-    Trained on QSO corpus text. Used for beam search scoring in both
-    the reference decoder and neural decoder CTC beam search.
+    Trained on QSO corpus text.
 
     Usage:
         lm = CharTrigramLM()
@@ -851,7 +848,7 @@ class CharTrigramLM:
 
 
 # ---------------------------------------------------------------------------
-# Word dictionary for beam search
+# Word dictionary
 # ---------------------------------------------------------------------------
 
 class CWDictionary:
